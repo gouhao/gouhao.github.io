@@ -1,0 +1,25 @@
+
+# Kernel源码笔记
+
+## 目录
+[调度：1.PELT](sched/pelt.md)  
+[调度：2.负载均衡](sched/load_balance.md)  
+[调度：3.CFS](sched/cfs.md)  
+[调度：4.Fork系统调用](sched/fork.md)  
+[调试：Ftrace](trace/trace.md)  
+[调试：Kprobe](trace/kprobe.md)  
+[VFS：1.数据结构](vfs/struct.md)  
+[VFS：2.遍历路径](vfs/pathwalk.md)  
+[VFS：3.挂载](vfs/mount.md)  
+[VFS：4.打开文件](vfs/open.md)  
+[VFS：5.关闭文件](vfs/close.md)  
+[VFS：6.读文件](vfs/read.md)  
+[VFS：7.写文件](vfs/write.md)  
+[文件系统：1. 管道](fs/pipe.md)  
+[文件系统：2. fuse——初始化](fs/fuse_init.md)  
+[文件系统：2. fuse——挂载](fs/fuse_mount.md)  
+[文件系统：2. fuse——发送消息](fs/fuse_send.md)  
+[文件系统：2. fuse——接收应答](fs/fuse_recv.md)  
+[文件系统：2. fuse——打开文件](fs/fuse_open.md)  
+[文件系统：2. fuse——查找文件](fs/fuse_lookup.md)  
+[系统调用：1. splice](syscall/splice.md)  
