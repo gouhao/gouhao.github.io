@@ -3,4 +3,4 @@
 ### [Kernel源码笔记](kernel/index.md)  
 ### [Linux应用开发](linux/index.md)  
 ### [Kotlin学习笔记](kotlin/index.md)  
-### [Android应用开发](andoird/index.md)  
+### [Android应用开发](android/index.md)  
