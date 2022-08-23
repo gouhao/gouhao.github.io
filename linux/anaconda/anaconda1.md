@@ -7,7 +7,7 @@
 ## 基础组件
 基础组件代码位于widgets/src中，样式文件位于resources中。基础组件分为两类：窗口和控件。
 
-![Anaconda](anaconda-1-1.png,t_70#pic_center)
+![Anaconda](anaconda-1-1.png)
 
 
 上面是窗口的类图。
@@ -18,7 +18,7 @@ StandaloneWindow：一个独立窗口的实现类，只有第一个界面选择�
 HubWindow：也是一个独立窗口。在这些窗口中集成了SpokeWindow的入口按钮
 
 先看一下BaseWindow窗口的组成部分。如下图：
-![BaseWindow](anaconda-1-2.png,t_70#pic_center)
+![BaseWindow](anaconda-1-2.png)
 
 一个BaseWindow分为3个部分：
 
@@ -29,7 +29,7 @@ HubWindow：也是一个独立窗口。在这些窗口中集成了SpokeWindow的
 最后是信息区info_bar（黄色的那个条）：这里显示警告，错误，信息等提示；
 
 下图是BaseStandalone窗口：
-![BaseStandalone](anaconda-1-3.png,t_70#pic_center)
+![BaseStandalone](anaconda-1-3.png)
 
 BaseStandalone窗口，只是在左边加了个sidebar，主要显示CENTOS图标和名称； 
 
@@ -85,7 +85,7 @@ StandaloneWindow在BaseStandalone的基础上增加了退出和确定按钮，�
 HubWindow在BaseStandalone的基础中在中间的action_area中增加了一个可滚动的控件，因为Hub中的内容有可能超过一屏显示。
 
 SpokeWindow在BaseWindow的基础上，在左上角窗口名称的下面增加了一个确定按钮，如下：
-![SpokeWindow](anaconda-1-4.png,t_70#pic_center)
+![SpokeWindow](anaconda-1-4.png)
 
 
 widget中还有一些其他的控件：
