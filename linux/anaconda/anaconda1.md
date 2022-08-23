@@ -1,4 +1,3 @@
-[CentOS安装程序Anaconda源码分析（二）：运行流程与调试](https://blog.csdn.net/jakelylll/article/details/109016526)
 ## 简介
 本文主要介绍CentOS安装程序Anaconda界面结构及运行流程。
 

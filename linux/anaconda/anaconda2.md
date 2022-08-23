@@ -1,5 +1,3 @@
-[CentOS安装程序Anaconda源码分析（一）：界面结构](https://blog.csdn.net/jakelylll/article/details/108309501)
-
 ## 简介
 本次介绍anaconda的运行流程及一些调试方法，源码基于anaconda-21.48.22.158。
 
