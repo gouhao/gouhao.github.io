@@ -1,3 +1,6 @@
 # 欢迎来到苟浩的网站
 
-### [kernel源码笔记](kernel/index.md)
+### [Kernel源码笔记](kernel/index.md)  
+### [Linux应用开发](linux/index.md)  
+### [Kotlin学习笔记](kotlin/index.md)  
+### [Android应用开发](andoird/index.md)  
