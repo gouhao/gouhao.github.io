@@ -22,4 +22,5 @@
 [文件系统：2. fuse——接收应答](fs/fuse/recv.md)  
 [文件系统：2. fuse——打开文件](fs/fuse/open.md)  
 [文件系统：2. fuse——查找文件](fs/fuse/lookup.md)  
+[文件系统：3. io_uring](fs/io_uring/index.md)  
 [系统调用：1. splice](syscall/splice.md)  
