@@ -235,16 +235,21 @@ struct zone {
 	/* Read-mostly fields */
 
 	/* zone watermarks, access with *_wmark_pages(zone) macros */
+	/*
+	enum zone_watermarks {
+		WMARK_MIN,	// zone保留的最小数目
+		WMARK_LOW,	// 回收页框的下界
+		WMARK_HIGH,	// 回收页框的上界
+		NR_WMARK
+	};
+	*/
 	unsigned long watermark[NR_WMARK];
 
 	unsigned long nr_reserved_highatomic;
 
 	/*
-	 * We don't know if the memory that we're going to allocate will be
-	 * freeable or/and it will be released eventually, so to avoid totally
-	 * wasting several GB of ram we must reserve some of the lower zone
-	 * memory (otherwise we risk to run OOM on the lower zones despite
-	 * there being tons of freeable ram on the higher zones).  This array is
+	 * 保留的内存 
+	 This array is
 	 * recalculated at runtime if the sysctl_lowmem_reserve_ratio sysctl
 	 * changes.
 	 */
@@ -253,8 +258,8 @@ struct zone {
 #ifdef CONFIG_NUMA
 	int node;
 #endif
-	struct pglist_data	*zone_pgdat;
-	struct per_cpu_pageset __percpu *pageset;
+	struct pglist_data	*zone_pgdat;	// 指向节点的指针
+	struct per_cpu_pageset __percpu *pageset;	// 单个页的per-cpu缓存
 
 #ifndef CONFIG_SPARSEMEM
 	/*
@@ -265,7 +270,7 @@ struct zone {
 #endif /* CONFIG_SPARSEMEM */
 
 	/* zone_start_pfn == zone_start_paddr >> PAGE_SHIFT */
-	unsigned long		zone_start_pfn;
+	unsigned long		zone_start_pfn;	// 管理区第一个页框下标
 
 	/*
 	 * spanned_pages is the total pages spanned by the zone, including
@@ -308,11 +313,11 @@ struct zone {
 	 * adjust_managed_page_count() should be used instead of directly
 	 * touching zone->managed_pages and totalram_pages.
 	 */
-	unsigned long		managed_pages;
-	unsigned long		spanned_pages;
-	unsigned long		present_pages;
+	unsigned long		managed_pages;	// buddy管理的页
+	unsigned long		spanned_pages;	// 所有页，包括洞
+	unsigned long		present_pages;	// 所有页不包括洞
 
-	const char		*name;
+	const char		*name;	// 区域名
 
 #ifdef CONFIG_MEMORY_ISOLATION
 	/*
@@ -324,7 +329,7 @@ struct zone {
 #endif
 
 #ifdef CONFIG_MEMORY_HOTPLUG
-	/* see spanned/present_pages for more description */
+	/* 保护 spanned/present_pages 页 */
 	seqlock_t		span_seqlock;
 #endif
 
@@ -333,13 +338,13 @@ struct zone {
 	/* Write-intensive fields used from the page allocator */
 	ZONE_PADDING(_pad1_)
 
-	/* free areas of different sizes */
+	/* 不同阶数的空闲页 */
 	struct free_area	free_area[MAX_ORDER];
 
-	/* zone flags, see below */
+	/* zone 标志 */
 	unsigned long		flags;
 
-	/* Primarily protects free_area */
+	/* 主要保护 free_area */
 	spinlock_t		lock;
 
 	/* Write-intensive fields used by compaction and vmstats. */
@@ -378,7 +383,7 @@ struct zone {
 	bool			contiguous;
 
 	ZONE_PADDING(_pad3_)
-	/* Zone statistics */
+	/* Zone 统计相关 */
 	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
 	atomic_long_t		vm_numa_stat[NR_VM_NUMA_STAT_ITEMS];
 } ____cacheline_internodealigned_in_smp;
