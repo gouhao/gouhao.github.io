@@ -496,7 +496,7 @@ struct page *alloc_pages_current(gfp_t gfp, unsigned order)
 	// 内存策略。default_policy是默认分配策略
     /**
     static struct mempolicy default_policy = {
-        .refcnt = ATOMIC_INIT(1), /* never free it */
+        .refcnt = ATOMIC_INIT(1), // never free it
         .mode = MPOL_LOCAL,
     };
     **/
