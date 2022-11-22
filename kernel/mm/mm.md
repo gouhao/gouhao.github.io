@@ -10,8 +10,7 @@
 // include/linux/mm_types.h
 // 页
 struct page {
-	unsigned long flags;		/* Atomic flags, some possibly
-					 * updated asynchronously */
+	unsigned long flags; // 一组标志，也对页框的管理区进行编号
 	/*
 	 * Five words (20/40 bytes) are available in this union.
 	 * WARNING: bit 0 of the first word is used for PageTail(). That
@@ -19,21 +18,23 @@ struct page {
 	 * avoid collision and false-positive PageTail().
 	 */
 	union {
-		struct {	/* Page cache and anonymous pages */
+		struct {	/* 页高速缓存和匿名页使用 */
 			/**
 			 * @lru: Pageout list, eg. active_list protected by
 			 * zone_lru_lock.  Sometimes used as a generic list
 			 * by the page owner.
+
+			 * lru 链表指针
 			 */
 			struct list_head lru;
 			/* See page-flags.h for PAGE_MAPPING_FLAGS */
-			struct address_space *mapping;
-			pgoff_t index;		/* Our offset within mapping. */
+			struct address_space *mapping; // 属于页高速缓存或者匿名页时使用
+			pgoff_t index;	// 在映射中的偏移量
 			/**
-			 * @private: Mapping-private opaque data.
-			 * Usually used for buffer_heads if PagePrivate.
-			 * Used for swp_entry_t if PageSwapCache.
-			 * Indicates order in the buddy system if PageBuddy.
+			 * @private: 映射私有数据
+			 * 在PagePrivate时用做buffer_head
+			 * 在PageSwapCache时用做swp_entry_t
+			 * 在PageBuddy时指向buddy的阶数
 			 */
 			unsigned long private;
 		};
@@ -107,7 +108,7 @@ struct page {
 		 * If the page can be mapped to userspace, encodes the number
 		 * of times this page is referenced by a page table.
 		 */
-		atomic_t _mapcount;
+		atomic_t _mapcount; // 页框中页表项的数目
 
 		/*
 		 * If the page is neither PageSlab nor mappable to userspace,
@@ -121,7 +122,11 @@ struct page {
 		int units;			/* SLOB */
 	};
 
-	/* Usage count. *DO NOT USE DIRECTLY*. See page_ref.h */
+	/* Usage count. *DO NOT USE DIRECTLY*. See page_ref.h 
+	 * 页框的引用计数
+	 * 如果该字段为1，则页框空闲
+	 * 如果大于或等于0，则说明该页已分配
+	*/
 	atomic_t _refcount;
 
 #ifdef CONFIG_MEMCG
@@ -148,6 +153,81 @@ struct page {
 #endif
 } _struct_page_alignment;
 
+
+enum pageflags {
+	PG_locked,		/* 页被锁定 */
+	PG_referenced,		/* 刚刚访问过的页 */
+	PG_uptodate,		/* 页里的数据与磁盘保持一致 */
+	PG_dirty,		/* 页已被修改 */
+	PG_lru,			/* 页在活动或非活动链表中 */
+	PG_active,		/* 页在活动页链表中 */
+	PG_workingset,
+	PG_waiters,		/* Page has waiters, check its waitqueue. Must be bit #7 and in the same byte as "PG_locked" */
+	PG_error,		/* 在传输页时发生io错误 */
+	PG_slab,		/* 页被slab使用 */
+	PG_owner_priv_1,	/* Owner use. If pagecache, fs may use*/
+	PG_arch_1,
+	PG_reserved,		/* 页留给内核代码或没有使用 */
+	PG_private,		/* page->private存放了数据。If pagecache, has fs-private data */
+	PG_private_2,		/* 同上，If pagecache, has fs aux data */
+	PG_writeback,		/* 正在使用将页写加磁盘 */
+	PG_head,		/* A head page */
+	PG_mappedtodisk,	/* Has blocks allocated on-disk */
+	PG_reclaim,		/* 页正在被回收 */
+	PG_swapbacked,		/* Page is backed by RAM/swap */
+	PG_unevictable,		/* Page is "unevictable"  */
+#ifdef CONFIG_MMU
+	PG_mlocked,		/* Page is vma mlocked */
+#endif
+#ifdef CONFIG_ARCH_USES_PG_UNCACHED
+	PG_uncached,		/* Page has been mapped as uncached */
+#endif
+#ifdef CONFIG_MEMORY_FAILURE
+	PG_hwpoison,		/* hardware poisoned page. Don't touch */
+#endif
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
+	PG_young,
+	PG_idle,
+#endif
+#ifdef CONFIG_64BIT
+	PG_arch_2,
+#endif
+	__NR_PAGEFLAGS,
+
+	/* Filesystems */
+	PG_checked = PG_owner_priv_1,	/* 由一些文件系统（ext2/3）使用 */
+
+	/* 页属于页交换缓存 */
+	PG_swapcache = PG_owner_priv_1,	/* Swap page: swp_entry_t in private */
+
+	/* Two page bits are conscripted by FS-Cache to maintain local caching
+	 * state.  These bits are set on pages belonging to the netfs's inodes
+	 * when those inodes are being locally cached.
+	 */
+	PG_fscache = PG_private_2,	/* page backed by cache */
+
+	/* XEN */
+	/* Pinned in Xen as a read-only pagetable page. */
+	PG_pinned = PG_owner_priv_1,
+	/* Pinned as part of domain save (see xen_mm_pin_all()). */
+	PG_savepinned = PG_dirty,
+	/* Has a grant mapping of another (foreign) domain's page. */
+	PG_foreign = PG_owner_priv_1,
+	/* Remapped by swiotlb-xen. */
+	PG_xen_remapped = PG_owner_priv_1,
+
+	/* SLOB */
+	PG_slob_free = PG_private,
+
+	/* Compound pages. Stored in first tail page's flags */
+	PG_double_map = PG_workingset,
+
+	/* non-lru isolated movable page */
+	PG_isolated = PG_reclaim,
+
+	/* Only valid for buddy pages. Used to track pages that are reported */
+	PG_reported = PG_uptodate,
+};
 
 // include/linux/mmzone.h
 // 区域。页被分在不同的区
@@ -305,17 +385,17 @@ struct zone {
 
 // node节点。一个node节点里有多个区
 typedef struct pglist_data {
-	struct zone node_zones[MAX_NR_ZONES];
-	struct zonelist node_zonelists[MAX_ZONELISTS];
-	int nr_zones;
+	struct zone node_zones[MAX_NR_ZONES]; // 节点中的管理区数组
+	struct zonelist node_zonelists[MAX_ZONELISTS]; // 页分配器使用
+	int nr_zones; // node_zones的大小
 #ifdef CONFIG_FLAT_NODE_MEM_MAP	/* means !SPARSEMEM */
-	struct page *node_mem_map;
+	struct page *node_mem_map; // 页描述符数组
 #ifdef CONFIG_PAGE_EXTENSION
 	struct page_ext *node_page_ext;
 #endif
 #endif
 #ifndef CONFIG_NO_BOOTMEM
-	struct bootmem_data *bdata;
+	struct bootmem_data *bdata; // 内核初始化阶段使用
 #endif
 #if defined(CONFIG_MEMORY_HOTPLUG) || defined(CONFIG_DEFERRED_STRUCT_PAGE_INIT)
 	/*
@@ -331,16 +411,14 @@ typedef struct pglist_data {
 	 */
 	spinlock_t node_size_lock;
 #endif
-	unsigned long node_start_pfn;
-	unsigned long node_present_pages; /* total number of physical pages */
-	unsigned long node_spanned_pages; /* total size of physical page
-					     range, including holes */
-	int node_id;
-	wait_queue_head_t kswapd_wait;
+	unsigned long node_start_pfn; // 第一个页框的序号
+	unsigned long node_present_pages; /* 可用物理页的数量，不包括洞 */
+	unsigned long node_spanned_pages; /* 可用物理页的数量，包括洞 */
+	int node_id; // 节点id
+	wait_queue_head_t kswapd_wait; // kswapd使用的等待队列
 	wait_queue_head_t pfmemalloc_wait;
-	struct task_struct *kswapd;	/* Protected by
-					   mem_hotplug_begin/end() */
-	int kswapd_order;
+	struct task_struct *kswapd;	/* 内存回收线程 Protected by mem_hotplug_begin/end() */
+	int kswapd_order; // kswapd要创建的空闲块大小的阶数
 	enum zone_type kswapd_classzone_idx;
 
 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
