@@ -1,6 +1,6 @@
 # 内存管理
 
-源码基于4.19
+源码基于5.10
 
 假设CONFIG_NUMA打开
 
@@ -582,11 +582,16 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 		struct alloc_context *ac, gfp_t *alloc_mask,
 		unsigned int *alloc_flags)
 {
+	// 取出zone
 	ac->high_zoneidx = gfp_zone(gfp_mask);
+	// 对应的zone_list，从node->zone_list的第0个或第1个开始
 	ac->zonelist = node_zonelist(preferred_nid, gfp_mask);
+	// 允许的node
 	ac->nodemask = nodemask;
+	// 迁移类型
 	ac->migratetype = gfpflags_to_migratetype(gfp_mask);
 
+	// todo:?
 	if (cpusets_enabled()) {
 		*alloc_mask |= __GFP_HARDWALL;
 		if (!ac->nodemask)
@@ -598,14 +603,31 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 	fs_reclaim_acquire(gfp_mask);
 	fs_reclaim_release(gfp_mask);
 
+	// 有直接回收标志，则可能睡眠？
 	might_sleep_if(gfp_mask & __GFP_DIRECT_RECLAIM);
 
+	// 这个需要打开 CONFIG_FAIL_PAGE_ALLOC
 	if (should_fail_alloc_page(gfp_mask, order))
 		return false;
 
+	// 如果cma打开，且页可以迁移，则给标志里加cma标志
 	if (IS_ENABLED(CONFIG_CMA) && ac->migratetype == MIGRATE_MOVABLE)
 		*alloc_flags |= ALLOC_CMA;
 
 	return true;
+}
+
+static inline void finalise_ac(gfp_t gfp_mask, struct alloc_context *ac)
+{
+	/* Dirty zone balancing only done in the fast path */
+	ac->spread_dirty_pages = (gfp_mask & __GFP_WRITE);
+
+	/*
+	 * The preferred zone is used for statistics but crucially it is
+	 * also used as the starting point for the zonelist iterator. It
+	 * may get reset for allocations that ignore memory policies.
+	 */
+	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
+					ac->high_zoneidx, ac->nodemask);
 }
 ```
