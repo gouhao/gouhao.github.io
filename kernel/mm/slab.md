@@ -110,4 +110,12 @@ struct kmem_cache_node {
 #endif
 
 };
+
+struct array_cache {
+	unsigned int avail; // 本地高速缓存可用个数，同时也指向第一个可用下标
+	unsigned int limit; // 本地高速缓存大小
+	unsigned int batchcount; // 重新填充或腾空时使用的块大小
+	unsigned int touched; // 如果本地高速缓存最近使用过，标为1
+	void *entry[];
+};
 ```
