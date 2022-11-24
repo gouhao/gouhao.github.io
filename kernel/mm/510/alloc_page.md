@@ -360,8 +360,12 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
 		}
 	}
 retry:
+	// 从空闲链表里分配页
 	page = __rmqueue_smallest(zone, order, migratetype);
+
+	// 分配失败
 	if (unlikely(!page)) {
+		// todo: fallback机制后面再看
 		if (alloc_flags & ALLOC_CMA)
 			page = __rmqueue_cma_fallback(zone, order);
 
