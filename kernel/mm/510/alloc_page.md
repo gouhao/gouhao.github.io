@@ -176,7 +176,7 @@ retry:
 		// 取出限制水印的值
 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
 
-		// 这个函数里会对水印进行判断，返回false表示出错
+		// 这个函数里会对水印进行判断，返回false表示已经达到水印
 		// todo: 这里后面再看
 		if (!zone_watermark_fast(zone, order, mark,
 				       ac->highest_zoneidx, alloc_flags,
@@ -260,6 +260,95 @@ try_this_zone:
 	return NULL;
 }
 
+static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
+							unsigned int alloc_flags)
+{
+	// 这个里面主要设置了private为0， _refcount=1
+	post_alloc_hook(page, order, gfp_flags);
+
+	// kasan相关
+	if (!free_pages_prezeroed() && want_init_on_alloc(gfp_flags))
+		kernel_init_free_pages(page, 1 << order);
+
+	// 设置组合页
+	if (order && (gfp_flags & __GFP_COMP))
+		prep_compound_page(page, order);
+
+	/*
+	 * page is set pfmemalloc when ALLOC_NO_WATERMARKS was necessary to
+	 * allocate the page. The expectation is that the caller is taking
+	 * steps that will free more memory. The caller should avoid the page
+	 * being used for !PFMEMALLOC purposes.
+	 */
+	if (alloc_flags & ALLOC_NO_WATERMARKS)
+		set_page_pfmemalloc(page);
+	else
+		clear_page_pfmemalloc(page);
+}
+
+inline void post_alloc_hook(struct page *page, unsigned int order,
+				gfp_t gfp_flags)
+{
+	// 设置page->private = 0
+	set_page_private(page, 0);
+	// 设置 page->_refcount = 1
+	set_page_refcounted(page);
+
+	// 下面都是一些调试或构架处理
+
+	// 各个架构的处理
+	arch_alloc_page(page, order);
+
+	if (debug_pagealloc_enabled_static())
+		kernel_map_pages(page, 1 << order, 1);
+	// kasan 相关
+	kasan_alloc_pages(page, order);
+	// posion 相关
+	kernel_poison_pages(page, 1 << order, 1);
+	// page_owner 相关
+	set_page_owner(page, order, gfp_flags);
+}
+
+void prep_compound_page(struct page *page, unsigned int order)
+{
+	int i;
+	// 组合页里页面的数量
+	int nr_pages = 1 << order;
+
+	// 设置页面头标志
+	__SetPageHead(page);
+
+	// 因为第一个页面已经在post_alloc_hook里处理了，
+	// 所以这里从第1个页面开始
+	for (i = 1; i < nr_pages; i++) {
+		struct page *p = page + i;
+		// 设置_refcount=0
+		set_page_count(p, 0);
+		// todo: ? 
+		p->mapping = TAIL_MAPPING;
+		// 设置compound_head为(unsigned long)page+1
+		// todo: 这里为什么要加1
+		set_compound_head(p, page);
+	}
+
+	// 设置page[1]的compound_dtor析构函数id
+	set_compound_page_dtor(page, COMPOUND_PAGE_DTOR);
+	// 在page[1]上保存compound_order和compound_nr（页面数量）
+	set_compound_order(page, order);
+	// page[1].compound_mapcount = -1
+	atomic_set(compound_mapcount_ptr(page), -1);
+
+	// 这个条件在order > 1时成立
+	if (hpage_pincount_available(page))
+		// page[2].hpage_pinned_refcount = 0
+		atomic_set(compound_pincount_ptr(page), 0);
+	
+	// todo: 为什么上面有的在page[1], 有的在page[2]上保存数据
+}
+```
+
+## buddy系统
+```c
 static inline
 struct page *rmqueue(struct zone *preferred_zone,
 			struct zone *zone, unsigned int order,
@@ -291,7 +380,7 @@ struct page *rmqueue(struct zone *preferred_zone,
 
 	do {
 		page = NULL;
-		// todo: ? 
+		// 有HARDER标志，直接从空闲列表里分配分配。todo: ? 
 		if (order > 0 && alloc_flags & ALLOC_HARDER) {
 			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
 			if (page)
