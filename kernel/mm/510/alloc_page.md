@@ -680,6 +680,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 						struct alloc_context *ac)
 {
 	bool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
+	// PAGE_ALLOC_COSTLY_ORDER 
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
@@ -716,10 +717,10 @@ retry_cpuset:
 	if (alloc_flags & ALLOC_KSWAPD)
 		wake_all_kswapds(order, gfp_mask, ac);
 
-	// 原文注释：调整了分配标志，说不定能成功，再试一次
+	// 原文注释：调整了分配标志，说不定能成功，再试一次    
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
 	if (page)
-		goto got_pg;
+		goto got_pg;   
 
 	// todo: 没太看懂
 	if (can_direct_reclaim &&
