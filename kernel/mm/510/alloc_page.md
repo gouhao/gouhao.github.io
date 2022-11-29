@@ -1,5 +1,5 @@
 # alloc_pages
-源码基于5.10， CONFIG_NUMA 打开
+源码基于5.10， CONFIG_NUMA 打开，x86_64平台
 
 ```c
 // 申请一页内存，order传的是0，对alloc_pages的包装
