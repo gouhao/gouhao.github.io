@@ -512,9 +512,9 @@ done_merging:
 		to_tail = shuffle_pick_tail();
 	else // 大多数情况走这个分支
 		
-		// 这个函数判断要合并的页和比它更高一级的页是不是buddy，则返回true，
+		// 这个函数判断要合并的页和比它更高一级的页是不是buddy，如果是则返回true，
 		// 这里返回true，意味着把页加到列表尾，
-		// 之所以加到列表尾，在下一次会被继续合并，如果放在列表头，很可能被分配出去。（这个是我猜的）
+		// 之所以加到列表尾，在下一次会被继续合并，如果放在列表头，很可能被分配出去。（这个原因是我猜的）
 		to_tail = buddy_merge_likely(pfn, buddy_pfn, page, order);
 
 	if (to_tail)
