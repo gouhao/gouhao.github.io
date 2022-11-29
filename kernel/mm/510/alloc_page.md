@@ -1,25 +1,44 @@
-# alloc_page
+# alloc_pages
 源码基于5.10， CONFIG_NUMA 打开
 
 ```c
+// 申请一页内存，order传的是0，对alloc_pages的包装
 #define alloc_page(gfp_mask) alloc_pages(gfp_mask, 0)
 
 static inline struct page *
 alloc_pages(gfp_t gfp_mask, unsigned int order)
 {
+	// 默认在当前node上分配内存
 	return alloc_pages_current(gfp_mask, order);
 }
+// mm/mempolicy.c
+
+/**
+各种分配策略：
+	MPOL_DEFAULT 默认策略。
+        MPOL_PREFERRED 首先在进程的preferred节点上分配内存，如果失败再在别的节点上分配
+        MPOL_BIND 在指定的节点上进行分配
+        MPOL_INTERLEAVE 在指定的几个可选节点集上，进行分配
+        MPOL_LOCAL 在当前运行的节点上进行分配
+**/
+// NUMA分配的默认策略
+static struct mempolicy default_policy = {
+        .refcnt = ATOMIC_INIT(1), /* never free it */
+        .mode = MPOL_PREFERRED,
+        .flags = MPOL_F_LOCAL, // MPOL_F_LOCAL更愿意在本地分配
+};
+
 
 /**
  * 	alloc_pages_current - Allocate pages.
  *
  *	@gfp:
- *		%GFP_USER   user allocation,
- *      	%GFP_KERNEL kernel allocation,
- *      	%GFP_HIGHMEM highmem allocation,
- *      	%GFP_FS     don't call back into a file system.
- *      	%GFP_ATOMIC don't sleep.
- *	@order: Power of two of allocation size in pages. 0 is a single page.
+ *		%GFP_USER   用户分配,
+ *      	%GFP_KERNEL 内核分配,
+ *      	%GFP_HIGHMEM 高端内存分配,
+ *      	%GFP_FS     文件系统分配，不允许在分配过程中做文件系统的操作.
+ *      	%GFP_ATOMIC 原子分配不允许睡眠.
+ *	@order: order是2的幂
  *
  *	Allocate a page from the kernel page pool.  When not in
  *	interrupt context and apply the current process NUMA policy.
@@ -31,36 +50,136 @@ struct page *alloc_pages_current(gfp_t gfp, unsigned order)
 	struct page *page;
 
 	// 如果不在中断上下文，而且分配标志没有指定__GFP_THISNODE
-    	// __GFP_THISNODE的意思是只在当前cpu的节点分配
+    	// __GFP_THISNODE：用户指定了分配的node，必须在用户指定的node上分配
 	if (!in_interrupt() && !(gfp & __GFP_THISNODE))
+		// 一般情况都没有指定__GFP_THISNODE，所以都会进到这里
 		// get_task_policy先获取进程的策略，如果进程没有策略，则获取
         	// 当前节点的分配策略，如果当前节点策略mode为０，则返回default_policy
 		pol = get_task_policy(current);
 
+	
 	// 区分交叉分配和普通分配
 	if (pol->mode == MPOL_INTERLEAVE)
 		// alloc_page_interleave直接调用__alloc_pages, 并做了些统计相关的操作。
 		// __alloc_pages会直接调用__alloc_pages_nodemask
 
-		// interleave_nodes会在policy所允许的节点中按顺序在节点中分配，如果到最后一个
-		// 再从第一个开始，如此反复。
+		// interleave_nodes会在policy所允许的节点中，从前到后
+		//按顺序在节点中分配，如果到最后一个再从第一个开始，如此反复。
 		page = alloc_page_interleave(gfp, order, interleave_nodes(pol));
 	else
 		// 普通分配
 		page = __alloc_pages_nodemask(gfp, order,
+				// numa_node_id返回当前有numa结点序号
+
 				policy_node(gfp, pol, numa_node_id()),
 				policy_nodemask(gfp, pol));
 
 	return page;
 }
+```
+## 路径1：alloc_page_interleave
+```c
+// 获取下一个interleave的节点
+// interleave模式是按顺序从允许的节点中分配内存，如果是最后一个节点，
+// 则从头开始循环分配
+static unsigned interleave_nodes(struct mempolicy *policy)
+{
+	unsigned next;
+	struct task_struct *me = current;
 
+	// policy->v.nodes是bind/interleave模式下可分配的节点集
+    	// il_prev是之前分配过的节点，next_node_in从
+	// 允许的节点集里循环找下一个节点
+	next = next_node_in(me->il_prev, policy->v.nodes);
+	// 如果在正常范围内，则修改il_prev的值
+	if (next < MAX_NUMNODES)
+		me->il_prev = next;
+	return next;
+}
+
+#define next_node_in(n, src) __next_node_in((n), &(src))
+int __next_node_in(int node, const nodemask_t *srcp)
+{
+	// 获取node之后的下一个结点
+	int ret = __next_node(node, srcp);
+
+	// 如果找到的节点是MAX_NUMNODES说明已经到可选集的末尾了，
+	// 则从头开始找一个节点
+	if (ret == MAX_NUMNODES)
+		ret = __first_node(srcp);
+	return ret;
+}
+
+// 在srcp里从n+1的位开始，搜索第一个置位的，最大搜索到MAX_NUMNODES，
+// 如果没有搜索到，则返回MAX_NUMNODES，否则返回第一个找到的序号
+static inline int __next_node(int n, const nodemask_t *srcp)
+{
+	return min_t(int,MAX_NUMNODES,find_next_bit(srcp->bits, MAX_NUMNODES, n+1));
+}
+
+static struct page *alloc_page_interleave(gfp_t gfp, unsigned order,
+					unsigned nid)
+{
+	struct page *page;
+
+	// 分配内存，这个函数直接调用
+	// __alloc_pages_nodemask，最后一个参数是NULL
+	page = __alloc_pages(gfp, order, nid);
+	
+	// vm_numa_stat_key一般都是开着的，如果关了就不用下面统计了
+	if (!static_branch_likely(&vm_numa_stat_key))
+		return page;
+	// 如果在指定的node上成功分配了页
+	if (page && page_to_nid(page) == nid) {
+		// 关抢占
+		preempt_disable();
+		// vmstat统计相关,NUMA_INTERLEAVE_HIT=3
+		__inc_numa_state(page_zone(page), NUMA_INTERLEAVE_HIT);
+		preempt_enable();
+	}
+	return page;
+}
+```
+## 普通分配
+```c
+static int policy_node(gfp_t gfp, struct mempolicy *policy, int nd)
+{
+	// MPOL_PREFERRED表示在preferred_node上分配，MPOL_F_LOCAL表示在当前节点分配
+	if (policy->mode == MPOL_PREFERRED && !(policy->flags & MPOL_F_LOCAL))
+		// 大多数情况都走这里
+		nd = policy->v.preferred_node;
+	else {
+		// MPOL_BIND和__GFP_THISNODE不要一起用。，系统会更倾向于根据MPOL_BIND中
+                // 的节点来分配内存，从而忽略__GFP_THISNODE标志
+		WARN_ON_ONCE(policy->mode == MPOL_BIND && (gfp & __GFP_THISNODE));
+	}
+
+	return nd;
+}
+
+static nodemask_t *policy_nodemask(gfp_t gfp, struct mempolicy *policy)
+{
+	// 如果策略是MPOL_BIND并且当前进程允许在策略上的这些节点运行
+	// 则返回指定的节点集
+	if (unlikely(policy->mode == MPOL_BIND) &&
+			apply_policy_zone(policy, gfp_zone(gfp)) &&
+			cpuset_nodemask_valid_mems_allowed(&policy->v.nodes))
+		return &policy->v.nodes;
+
+	// 大概率返回NULL
+	return NULL;
+}
+```
+## 内存分配的核心函数
+```c
 struct page *
 __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 							nodemask_t *nodemask)
 {
 	struct page *page;
+	// 默认分配的水位线是在低水位
 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
-	gfp_t alloc_mask; /* The gfp_t that was actually used for allocation */
+	gfp_t alloc_mask;
 	// 分配上下文 
 	struct alloc_context ac = { };
 
@@ -83,12 +202,13 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 	// 对flag做一些处理。todo: ?
 	alloc_flags |= alloc_flags_nofragment(ac.preferred_zoneref->zone, gfp_mask);
 
-	// 第一次尝试：从空闲列表里分配页。
+	// 第一次尝试：从空闲列表里分配页。这个大概率分成功
 	page = get_page_from_freelist(alloc_mask, order, alloc_flags, &ac);
 	// 大多数情况，在这一步就会分配成功
 	if (likely(page))
 		goto out;
 
+	// 走到这里说明分配失败了
 	/*
 	 * Apply scoped allocation constraints. This is mainly about GFP_NOFS
 	 * resp. GFP_NOIO which has to be inherited for all allocation requests
@@ -123,6 +243,132 @@ out:
 
 	return page;
 }
+
+static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
+		int preferred_nid, nodemask_t *nodemask,
+		struct alloc_context *ac, gfp_t *alloc_mask,
+		unsigned int *alloc_flags)
+{
+	// 算出gpf_mask里的zone类型，这里算出来的是最后考虑的zone
+	ac->highest_zoneidx = gfp_zone(gfp_mask);
+	// preferred_nid是首选的zone节点，这个算出zone节点对应的zonelist
+	ac->zonelist = node_zonelist(preferred_nid, gfp_mask);
+	ac->nodemask = nodemask;
+
+	// 获取迁移类型
+	ac->migratetype = gfp_migratetype(gfp_mask);
+
+	// todo: 后面再看这个路径，这个一般是false
+	if (cpusets_enabled()) {
+		*alloc_mask |= __GFP_HARDWALL;
+		/*
+		 * When we are in the interrupt context, it is irrelevant
+		 * to the current task context. It means that any node ok.
+		 */
+		if (!in_interrupt() && !ac->nodemask)
+			ac->nodemask = &cpuset_current_mems_allowed;
+		else
+			*alloc_flags |= ALLOC_CPUSET;
+	}
+
+	fs_reclaim_acquire(gfp_mask);
+	fs_reclaim_release(gfp_mask);
+
+	might_sleep_if(gfp_mask & __GFP_DIRECT_RECLAIM);
+
+	if (should_fail_alloc_page(gfp_mask, order))
+		return false;
+
+	*alloc_flags = current_alloc_flags(gfp_mask, *alloc_flags);
+
+	/* Dirty zone balancing only done in the fast path */
+	ac->spread_dirty_pages = (gfp_mask & __GFP_WRITE);
+
+	/*
+	 * The preferred zone is used for statistics but crucially it is
+	 * also used as the starting point for the zonelist iterator. It
+	 * may get reset for allocations that ignore memory policies.
+	 */
+	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
+					ac->highest_zoneidx, ac->nodemask);
+
+	return true;
+}
+
+static inline enum zone_type gfp_zone(gfp_t flags)
+{
+	enum zone_type z;
+	// 这一步可以算出来，flags里包含的zone类型位
+	int bit = (__force int) (flags & GFP_ZONEMASK);
+
+	// GFP_ZONES_SHIFT是个动态值，根据zone类型的大小有不同的shift
+	// 这一步可以算出来zone的类型
+	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
+					 ((1 << GFP_ZONES_SHIFT) - 1);
+	// 调试，这里面主要判断一些不能同时用的zone类型
+	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
+	return z;
+}
+
+// zone只有这4种类型。分配dma专用，高端内存（在64位系统上已经没有高端内存了），可移动内存
+// 一般分配的都是__GFP_MOVABLE
+#define GFP_ZONEMASK	(__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE)
+
+#define GFP_ZONE_TABLE ( \
+	(ZONE_NORMAL << 0 * GFP_ZONES_SHIFT)				       \
+	| (OPT_ZONE_DMA << ___GFP_DMA * GFP_ZONES_SHIFT)		       \
+	| (OPT_ZONE_HIGHMEM << ___GFP_HIGHMEM * GFP_ZONES_SHIFT)	       \
+	| (OPT_ZONE_DMA32 << ___GFP_DMA32 * GFP_ZONES_SHIFT)		       \
+	| (ZONE_NORMAL << ___GFP_MOVABLE * GFP_ZONES_SHIFT)		       \
+	| (OPT_ZONE_DMA << (___GFP_MOVABLE | ___GFP_DMA) * GFP_ZONES_SHIFT)    \
+	| (ZONE_MOVABLE << (___GFP_MOVABLE | ___GFP_HIGHMEM) * GFP_ZONES_SHIFT)\
+	| (OPT_ZONE_DMA32 << (___GFP_MOVABLE | ___GFP_DMA32) * GFP_ZONES_SHIFT)\
+)
+
+static inline struct zonelist *node_zonelist(int nid, gfp_t flags)
+{
+	// 每个pglist_data->node_zonelists里存放的是系统里所有numa节点上的zone
+	// 第0个元素是本节点的zone
+	// 一般都是返回第0个元素也就是本节点的zone，指定__GFP_THISNODE时会返回第1个元素
+	return NODE_DATA(nid)->node_zonelists + gfp_zonelist(flags);
+}
+
+static inline int gfp_zonelist(gfp_t flags)
+{
+	// ZONELIST_FALLBACK: 0
+	// ZONELIST_NOFALLBACK:1
+#ifdef CONFIG_NUMA
+	// 指定在特定的节点上分配
+	if (unlikely(flags & __GFP_THISNODE))
+		return ZONELIST_NOFALLBACK;
+#endif
+	// 一般都走这个路径
+	return ZONELIST_FALLBACK;
+}
+
+static inline int gfp_migratetype(const gfp_t gfp_flags)
+{
+	// 不能同时指定所有的移动标志
+	VM_WARN_ON((gfp_flags & GFP_MOVABLE_MASK) == GFP_MOVABLE_MASK);
+
+	// GFP_MOVABLE_SHIFT是3, ___GFP_MOVABLE是8
+	BUILD_BUG_ON((1UL << GFP_MOVABLE_SHIFT) != ___GFP_MOVABLE);
+	// MIGRATE_MOVABLE是1， 8 >> 3 = 1
+	BUILD_BUG_ON((___GFP_MOVABLE >> GFP_MOVABLE_SHIFT) != MIGRATE_MOVABLE);
+
+	// 一般不会走这个分支
+	if (unlikely(page_group_by_mobility_disabled))
+		return MIGRATE_UNMOVABLE;
+
+	// 算出迁移类型
+	return (gfp_flags & GFP_MOVABLE_MASK) >> GFP_MOVABLE_SHIFT;
+}
+
+// __GFP_RECLAIMABLE：页可以被回收
+// __GFP_MOVABLE：页可以被迁移也可以被回收
+#define ___GFP_MOVABLE		0x08u
+#define ___GFP_RECLAIMABLE	0x10u
+#define GFP_MOVABLE_MASK (__GFP_RECLAIMABLE|__GFP_MOVABLE)
 ```
 
 ## 快速路径
