@@ -194,8 +194,8 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 	gfp_mask &= gfp_allowed_mask;
 	// gfp_t实际上就是unsigned
 	alloc_mask = gfp_mask;
-	// prepare_alloc_pages主要是初始化alloc_context, 判断本次申请会不会失败，
-	// 如果会失败，则返回false
+	// prepare_alloc_pages主要是初始化alloc_context, 计算迁移类型，首选zone,node_mask, alloc_flag等
+	// 如果打开CONFIG_FAIL_PAGE_ALLOC还会判断分配是否会失败，失败则返回false
 	if (!prepare_alloc_pages(gfp_mask, order, preferred_nid, nodemask, &ac, &alloc_mask, &alloc_flags))
 		return NULL;
 
@@ -209,21 +209,15 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 		goto out;
 
 	// 走到这里说明分配失败了
-	/*
-	 * Apply scoped allocation constraints. This is mainly about GFP_NOFS
-	 * resp. GFP_NOIO which has to be inherited for all allocation requests
-	 * from a particular context which has been marked by
-	 * memalloc_no{fs,io}_{save,restore}.
-	 */
-	// todo: ?
+	
+	// 这个函数主要是对进程的进程中有NOIO或NOFS的标志进行处理
 	alloc_mask = current_gfp_context(gfp_mask);
+	// todo: 这里为什么把展开脏页关了？这个标志是在prepare里设置的
 	ac.spread_dirty_pages = false;
 
-	/*
-	 * Restore the original nodemask if it was potentially replaced with
-	 * &cpuset_current_mems_allowed to optimize the fast-path attempt.
-	 */
-	// todo: ?
+	// 还原最初的nodemask，ac.nodemask可能在prepare里被
+	// 替换成cpuset_current_mems_allowed，这是在快速路径里尝试的，
+	// 这里需要把它还原
 	ac.nodemask = nodemask;
 
 	// 从这里进入慢速路径分配
@@ -242,6 +236,25 @@ out:
 	trace_mm_page_alloc(page, order, alloc_mask, ac.migratetype);
 
 	return page;
+}
+
+static inline gfp_t current_gfp_context(gfp_t flags)
+{
+	// 进程的flags
+	unsigned int pflags = READ_ONCE(current->flags);
+
+	// PF_MEMALLOC_NOIO：不允许io
+	// PF_MEMALLOC_NOFS：没有fs
+	// 如果进程有这2个标志任意一个
+	if (unlikely(pflags & (PF_MEMALLOC_NOIO | PF_MEMALLOC_NOFS))) {
+		if (pflags & PF_MEMALLOC_NOIO)
+			// NOIO就把IO和FS标志去了
+			flags &= ~(__GFP_IO | __GFP_FS);
+		else if (pflags & PF_MEMALLOC_NOFS)
+			// NOFS只去fs
+			flags &= ~__GFP_FS;
+	}
+	return flags;
 }
 
 static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
@@ -1002,8 +1015,9 @@ static inline struct page *
 __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 						struct alloc_context *ac)
 {
+	// 允许回收
 	bool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
-	// PAGE_ALLOC_COSTLY_ORDER 
+	// PAGE_ALLOC_COSTLY_ORDER是3，大于这个的order被认为是分配代价高的
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
@@ -1024,13 +1038,17 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 retry_cpuset:
 	compaction_retries = 0;
 	no_progress_loops = 0;
+	// 压缩优先级是用来在回收的时候计算本次回收页数的，
+	// 计算公式为：需要回收的页 ＝  1 / 2^compact_priority
+	// DEF_COMPACT_PRIORITY＝2，
 	compact_priority = DEF_COMPACT_PRIORITY;
+	// 这个大数返回0。todo: 大多数情况返回0
 	cpuset_mems_cookie = read_mems_allowed_begin();
 
 	
 	alloc_flags = gfp_to_alloc_flags(gfp_mask);
 
-	// 重新计算最适合的zone
+	// 因为nodemask在分配失败后被还原成原始的nodemask,所以这里要重新计算最适合的zone
 	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
 					ac->highest_zoneidx, ac->nodemask);
 	if (!ac->preferred_zoneref->zone)
@@ -1222,13 +1240,9 @@ got_pg:
 static inline unsigned int
 gfp_to_alloc_flags(gfp_t gfp_mask)
 {
+	// 因为分配失败了，所以尝试使用min水位
 	unsigned int alloc_flags = ALLOC_WMARK_MIN | ALLOC_CPUSET;
 
-	/*
-	 * __GFP_HIGH is assumed to be the same as ALLOC_HIGH
-	 * and __GFP_KSWAPD_RECLAIM is assumed to be the same as ALLOC_KSWAPD
-	 * to save two branches.
-	 */
 	BUILD_BUG_ON(__GFP_HIGH != (__force gfp_t) ALLOC_HIGH);
 	BUILD_BUG_ON(__GFP_KSWAPD_RECLAIM != (__force gfp_t) ALLOC_KSWAPD);
 
@@ -1238,26 +1252,42 @@ gfp_to_alloc_flags(gfp_t gfp_mask)
 	 * policy or is asking for __GFP_HIGH memory.  GFP_ATOMIC requests will
 	 * set both ALLOC_HARDER (__GFP_ATOMIC) and ALLOC_HIGH (__GFP_HIGH).
 	 */
+	// todo:?
 	alloc_flags |= (__force int)
 		(gfp_mask & (__GFP_HIGH | __GFP_KSWAPD_RECLAIM));
 
 	if (gfp_mask & __GFP_ATOMIC) {
-		/*
-		 * Not worth trying to allocate harder for __GFP_NOMEMALLOC even
-		 * if it can't schedule.
-		 */
+		// 原子分配
+		// __GFP_NOMEMALLOC是分配器相关的线程设置的标志
+		// 这里只对非分配器设置ALLOC_HARDER标志
+		// todo: 这个标志对分配起什么作用
 		if (!(gfp_mask & __GFP_NOMEMALLOC))
 			alloc_flags |= ALLOC_HARDER;
-		/*
-		 * Ignore cpuset mems for GFP_ATOMIC rather than fail, see the
-		 * comment for __cpuset_node_allowed().
-		 */
+		// ALLOC_CPUSET是检查正确的CPU集合
+		// 原子分配不需要这个, todo: why?
 		alloc_flags &= ~ALLOC_CPUSET;
 	} else if (unlikely(rt_task(current)) && !in_interrupt())
+		// 如果是实时进程，也需要harder标志
 		alloc_flags |= ALLOC_HARDER;
 
+	// 这个函数主要根据进程进否禁用了CMA而计算是否在分配标志里增加ALLOC_CMA
 	alloc_flags = current_alloc_flags(gfp_mask, alloc_flags);
 
+	return alloc_flags;
+}
+
+static inline unsigned int current_alloc_flags(gfp_t gfp_mask,
+					unsigned int alloc_flags)
+{
+#ifdef CONFIG_CMA
+	unsigned int pflags = current->flags;
+
+	// 当前进程没有禁用CMA，要分配的页也是可移动的，就可以在CMA分配
+	if (!(pflags & PF_MEMALLOC_NOCMA) &&
+			gfp_migratetype(gfp_mask) == MIGRATE_MOVABLE)
+		alloc_flags |= ALLOC_CMA;
+
+#endif
 	return alloc_flags;
 }
 
@@ -1277,5 +1307,13 @@ static inline int __gfp_pfmemalloc_flags(gfp_t gfp_mask)
 	}
 
 	return 0;
+}
+
+static inline unsigned int read_mems_allowed_begin(void)
+{
+	if (!static_branch_unlikely(&cpusets_pre_enable_key))
+		return 0;
+
+	return read_seqcount_begin(&current->mems_allowed_seq);
 }
 ```
