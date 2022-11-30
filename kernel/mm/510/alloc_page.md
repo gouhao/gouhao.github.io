@@ -199,7 +199,7 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 	if (!prepare_alloc_pages(gfp_mask, order, preferred_nid, nodemask, &ac, &alloc_mask, &alloc_flags))
 		return NULL;
 
-	// 对flag做一些处理。todo: ?
+	// 这里面主要处理DMA32的情况。普通分配时，只是返回是否需要唤醒kswapd
 	alloc_flags |= alloc_flags_nofragment(ac.preferred_zoneref->zone, gfp_mask);
 
 	// 第一次尝试：从空闲列表里分配页。这个大概率分成功
@@ -271,28 +271,104 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 			*alloc_flags |= ALLOC_CPUSET;
 	}
 
+	// 这个在CONFIG_LOCKDEP没打开时，是空语句
 	fs_reclaim_acquire(gfp_mask);
 	fs_reclaim_release(gfp_mask);
 
+	// 这个函数在CONFIG_PREEMPT_VOLUNTARY打开时，如果条件成立会调用_cond_resched()
+	// 如果没打开配置，是空语句。
+	// 这里的意思是，如果分配时要求回收内存，则先让出cpu，让kswapd有机会执行（猜的）
 	might_sleep_if(gfp_mask & __GFP_DIRECT_RECLAIM);
 
+	// 这个在CONFIG_FAIL_PAGE_ALLOC打开时才有用，否则返回false。
+	// todo: 这个路径后面再看
 	if (should_fail_alloc_page(gfp_mask, order))
 		return false;
 
+	// 这个在CONFIG_CMA打开时才有用，否则直接返回*alloc_flags的值
+	// todo: cma相关的后面再看
 	*alloc_flags = current_alloc_flags(gfp_mask, *alloc_flags);
 
-	/* Dirty zone balancing only done in the fast path */
+	// 分配请求是为了写，则展开脏页
 	ac->spread_dirty_pages = (gfp_mask & __GFP_WRITE);
 
-	/*
-	 * The preferred zone is used for statistics but crucially it is
-	 * also used as the starting point for the zonelist iterator. It
-	 * may get reset for allocations that ignore memory policies.
-	 */
+	// 找一个合适的zone
 	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
 					ac->highest_zoneidx, ac->nodemask);
 
 	return true;
+}
+
+static inline struct zoneref *first_zones_zonelist(struct zonelist *zonelist,
+					enum zone_type highest_zoneidx,
+					nodemask_t *nodes)
+{
+	return next_zones_zonelist(zonelist->_zonerefs,
+							highest_zoneidx, nodes);
+}
+
+static __always_inline struct zoneref *next_zones_zonelist(struct zoneref *z,
+					enum zone_type highest_zoneidx,
+					nodemask_t *nodes)
+{
+	// 没有指定nodes时，而且z的zoneid没有超过最大的zoneid，则直接返回zone_id
+	// 一般都会走这个路径，一般传进来的都是首选id
+	if (likely(!nodes && zonelist_zone_idx(z) <= highest_zoneidx))
+		return z;
+	// 如果上面没到，或者规定了nodes，则要去找一个最合适的
+	return __next_zones_zonelist(z, highest_zoneidx, nodes);
+}
+
+struct zoneref *__next_zones_zonelist(struct zoneref *z,
+					enum zone_type highest_zoneidx,
+					nodemask_t *nodes)
+{
+	if (unlikely(nodes == NULL))
+		// 在next_zones_zonelist里已经处理了nodes为NULL的情况，能走到
+		// 这里，说明传进来的zoneid已经大于了最大值，这里就要循环找出一个
+		// 最小zoneid，因为zone是环链表，所以一定会找出一个合适的值
+		while (zonelist_zone_idx(z) > highest_zoneidx)
+			z++;
+	else
+		// 走到这里说明用户规定的node_mask
+		while (zonelist_zone_idx(z) > highest_zoneidx ||
+				(z->zone && !zref_in_nodemask(z, nodes)))
+			// 能走到这里面，说明zoneid大于最大值，或者zone不在用户规定的node_mask里,
+			// 这里就要循环找出一个合适的zone
+			z++;
+
+	return z;
+}
+
+static inline unsigned int
+alloc_flags_nofragment(struct zone *zone, gfp_t gfp_mask)
+{
+	unsigned int alloc_flags;
+
+	// __GFP_KSWAPD_RECLAIM表示，如果到达了low水位，则希望唤醒kswapd回收内存，
+	// 直到内存水位到high，有这个标志表示可以唤醒kswapd
+	alloc_flags = (__force int) (gfp_mask & __GFP_KSWAPD_RECLAIM);
+
+#ifdef CONFIG_ZONE_DMA32
+	// 这里处理dma相关
+
+	if (!zone)
+		return alloc_flags;
+
+	// ZONE_NORMAL表示正常的zone，如果是正常的zone，就不用下面处理了
+	if (zone_idx(zone) != ZONE_NORMAL)
+		return alloc_flags;
+
+	BUILD_BUG_ON(ZONE_NORMAL - ZONE_DMA32 != 1);
+
+	// populated_zone返回的是zone->present_pages，如果当前页没有zone，就直接返回？
+	// --zone表示是ZONE_NORMAL，因为ZONE_DMA32是排在NORMAL区后面
+	if (nr_online_nodes > 1 && !populated_zone(--zone))
+		return alloc_flags;
+	// 如果normal没有页，则不允许混合页类型
+	alloc_flags |= ALLOC_NOFRAGMENT;
+#endif /* CONFIG_ZONE_DMA32 */
+	return alloc_flags;
 }
 
 static inline enum zone_type gfp_zone(gfp_t flags)
@@ -369,6 +445,7 @@ static inline int gfp_migratetype(const gfp_t gfp_flags)
 #define ___GFP_MOVABLE		0x08u
 #define ___GFP_RECLAIMABLE	0x10u
 #define GFP_MOVABLE_MASK (__GFP_RECLAIMABLE|__GFP_MOVABLE)
+
 ```
 
 ## 快速路径
@@ -1037,7 +1114,7 @@ retry:
 	if (page)
 		goto got_pg;
 
-	/* Caller 不需要回收
+	/* Caller 不需要回收 */
 	if (!can_direct_reclaim)
 		goto nopage;
 
