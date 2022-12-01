@@ -1058,12 +1058,13 @@ retry_cpuset:
 	if (alloc_flags & ALLOC_KSWAPD)
 		wake_all_kswapds(order, gfp_mask, ac);
 
-	// 原文注释：调整了分配标志，说不定能成功，再试一次    
+	// 原文注释：调整了分配标志，说不定能成功，再试一次
+	// 这里调整了2个值：gfp_mask和alloc_flags
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
 	if (page)
 		goto got_pg;   
 
-	// todo: 没太看懂
+	// 允许回收 && (分配阶数大于3 || (分配大于1页 && 要求的页类型是不可移动的)) && 不允许忽略水位）
 	if (can_direct_reclaim &&
 			(costly_order ||
 			   (order > 0 && ac->migratetype != MIGRATE_MOVABLE))
@@ -1237,6 +1238,52 @@ got_pg:
 	return page;
 }
 
+bool gfp_pfmemalloc_allowed(gfp_t gfp_mask)
+{
+	// 这里 !! 的意思就是把返回值转换成0或1
+	return !!__gfp_pfmemalloc_flags(gfp_mask);
+}
+
+static inline int __gfp_pfmemalloc_flags(gfp_t gfp_mask)
+{
+	// 不是分配器程序
+	if (unlikely(gfp_mask & __GFP_NOMEMALLOC))
+		return 0;
+	// 是分配器程序
+	if (gfp_mask & __GFP_MEMALLOC)
+		// 这个是忽略水位线
+		return ALLOC_NO_WATERMARKS;
+	// 在软中断环境里的进程有PF_MEMALLOC，也忽略水位线
+	if (in_serving_softirq() && (current->flags & PF_MEMALLOC))
+		return ALLOC_NO_WATERMARKS;
+
+	// 不是中断上下文
+	if (!in_interrupt()) {
+		// 当前进程有PF_MEMALLOC，则忽略水位线
+		if (current->flags & PF_MEMALLOC)
+			return ALLOC_NO_WATERMARKS;
+		// 这个是判断是否允许使用保留的内存，主要判断了2种情况：
+		// 进程是否被杀，进程是否正在终止，这2种情况不用使用保留资源
+		else if (oom_reserves_allowed(current))
+			return ALLOC_OOM;
+	}
+
+	return 0;
+}
+
+static bool oom_reserves_allowed(struct task_struct *tsk)
+{
+	// oom受害者：表示正在被 oom 杀
+	// 主要是判断tsk->signal->oom_mm是否为空
+	if (!tsk_is_oom_victim(tsk))
+		return false;
+
+	// MMU一般都是打开的。TIF_MEMDIE表示进程正在终止
+	if (!IS_ENABLED(CONFIG_MMU) && !test_thread_flag(TIF_MEMDIE))
+		return false;
+
+	return true;
+}
 static inline unsigned int
 gfp_to_alloc_flags(gfp_t gfp_mask)
 {
