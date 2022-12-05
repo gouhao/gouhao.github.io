@@ -388,12 +388,18 @@ slab_alloc(struct kmem_cache *cachep, gfp_t flags, unsigned long caller)
 	void *objp;
 	struct obj_cgroup *objcg = NULL;
 
+	// 屏蔽掉不允许的标志
 	flags &= gfp_allowed_mask;
+
+	// 这个函数里调用一些hook，判断本次创建slab是否需要失败
 	cachep = slab_pre_alloc_hook(cachep, &objcg, 1, flags);
 	if (unlikely(!cachep))
 		return NULL;
-
+	// 判断有没有__GFP_DIRECT_RECLAIM标志，如果有，可能需要睡眠，
+	// 因为下面关中断了，所以在这里再试一次
 	cache_alloc_debugcheck_before(cachep, flags);
+	
+	// 分配
 	local_irq_save(save_flags);
 	objp = __do_cache_alloc(cachep, flags);
 	local_irq_restore(save_flags);
@@ -405,6 +411,30 @@ slab_alloc(struct kmem_cache *cachep, gfp_t flags, unsigned long caller)
 
 	slab_post_alloc_hook(cachep, objcg, flags, 1, &objp);
 	return objp;
+}
+
+static inline struct kmem_cache *slab_pre_alloc_hook(struct kmem_cache *s,
+						     struct obj_cgroup **objcgp,
+						     size_t size, gfp_t flags)
+{
+	flags &= gfp_allowed_mask;
+
+	fs_reclaim_acquire(flags);
+	fs_reclaim_release(flags);
+
+	// 这个就是判断有没有__GFP_DIRECT_RECLAIM标志，如果有这个标志的话，
+	// 查看其它进程是否需要调度
+	might_sleep_if(gfpflags_allow_blocking(flags));
+
+	// 判断是否应该失败。todo: 后面再看
+	if (should_failslab(s, flags))
+		return NULL;
+
+	// todo: cgroup后面再看
+	if (!memcg_slab_pre_alloc_hook(s, objcgp, size, flags))
+		return NULL;
+
+	return s;
 }
 ```
 
