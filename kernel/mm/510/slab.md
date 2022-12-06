@@ -876,9 +876,11 @@ done:
 
 static int __ref setup_cpu_cache(struct kmem_cache *cachep, gfp_t gfp)
 {
+	// 这个条件表示slab已经初始化完了，则使能cpucache
 	if (slab_state >= FULL)
 		return enable_cpucache(cachep, gfp);
 
+	// 走到这里表示slab还没有初始化完成？
 	cachep->cpu_cache = alloc_kmem_cache_cpus(cachep, 1, 1);
 	if (!cachep->cpu_cache)
 		return 1;
@@ -910,6 +912,236 @@ static int __ref setup_cpu_cache(struct kmem_cache *cachep, gfp_t gfp)
 	cpu_cache_get(cachep)->touched = 0;
 	cachep->batchcount = 1;
 	cachep->limit = BOOT_CPUCACHE_ENTRIES;
+	return 0;
+}
+
+static int enable_cpucache(struct kmem_cache *cachep, gfp_t gfp)
+{
+	int err;
+	int limit = 0;
+	int shared = 0;
+	int batchcount = 0;
+
+	// 创建random_seq随机数组
+	err = cache_random_seq_create(cachep, cachep->num, gfp);
+	if (err)
+		goto end;
+
+	// 走到这儿，limit=0，这个条件恒为false呀！！
+	if (limit && shared && batchcount)
+		goto skip_setup;
+
+	// 计算limit
+	if (cachep->size > 131072)
+		limit = 1;
+	else if (cachep->size > PAGE_SIZE)
+		limit = 8;
+	else if (cachep->size > 1024)
+		limit = 24;
+	else if (cachep->size > 256)
+		limit = 54;
+	else
+		limit = 120;
+
+	// 默认禁用共享，共享用于在不同的cpu之间共享对象
+	shared = 0;
+
+	// 对象小于页大小，而且cpu数量大于1，则会开启共享，默认共享8个对象
+	if (cachep->size <= PAGE_SIZE && num_possible_cpus() > 1)
+		shared = 8;
+
+#if DEBUG
+	/*
+	 * With debugging enabled, large batchcount lead to excessively long
+	 * periods with disabled local interrupts. Limit the batchcount
+	 */
+	if (limit > 32)
+		limit = 32;
+#endif
+	// batch为limit的一半，并以2对齐
+	batchcount = (limit + 1) / 2;
+skip_setup:
+	err = do_tune_cpucache(cachep, limit, batchcount, shared, gfp);
+end:
+	if (err)
+		pr_err("enable_cpucache failed for %s, error %d\n",
+		       cachep->name, -err);
+	return err;
+}
+
+static int do_tune_cpucache(struct kmem_cache *cachep, int limit,
+			    int batchcount, int shared, gfp_t gfp)
+{
+	struct array_cache __percpu *cpu_cache, *prev;
+	int cpu;
+
+	// 这里面主要分配了cachep->cpu_slab的percpu变量
+	cpu_cache = alloc_kmem_cache_cpus(cachep, limit, batchcount);
+	if (!cpu_cache)
+		return -ENOMEM;
+
+	// 先保存之前的
+	prev = cachep->cpu_cache;
+	// 然后设置新的cache
+	cachep->cpu_cache = cpu_cache;
+	
+	// 激活所有cpu?
+	if (prev)
+		kick_all_cpus_sync();
+
+	// todo: 这里为什么要检查中断是开的？
+	check_irq_on();
+	// 每次新增或销毁的批数量
+	cachep->batchcount = batchcount;
+	// todo: 这个limit是干啥的？
+	cachep->limit = limit;
+	// 本percpu缓存可以共享的数量
+	cachep->shared = shared;
+
+	// prev为NULL，表示是第一个分配cache，则直接调到设置
+	if (!prev)
+		goto setup_node;
+
+	// 释放每个prev里的cpucache
+	for_each_online_cpu(cpu) {
+		LIST_HEAD(list);
+		int node;
+		struct kmem_cache_node *n;
+		struct array_cache *ac = per_cpu_ptr(prev, cpu);
+
+		node = cpu_to_mem(cpu);
+		n = get_node(cachep, node);
+		spin_lock_irq(&n->list_lock);
+		free_block(cachep, ac->entry, ac->avail, node, &list);
+		spin_unlock_irq(&n->list_lock);
+		slabs_destroy(cachep, &list);
+	}
+	free_percpu(prev);
+
+setup_node:
+	return setup_kmem_cache_nodes(cachep, gfp);
+}
+
+
+static int setup_kmem_cache_nodes(struct kmem_cache *cachep, gfp_t gfp)
+{
+	int ret;
+	int node;
+	struct kmem_cache_node *n;
+
+	for_each_online_node(node) {
+		ret = setup_kmem_cache_node(cachep, node, gfp, true);
+		if (ret)
+			goto fail;
+
+	}
+
+	return 0;
+
+fail:
+	if (!cachep->list.next) {
+		/* Cache is not active yet. Roll back what we did */
+		node--;
+		while (node >= 0) {
+			n = get_node(cachep, node);
+			if (n) {
+				kfree(n->shared);
+				free_alien_cache(n->alien);
+				kfree(n);
+				cachep->node[node] = NULL;
+			}
+			node--;
+		}
+	}
+	return -ENOMEM;
+}
+
+static int setup_kmem_cache_node(struct kmem_cache *cachep,
+				int node, gfp_t gfp, bool force_change)
+{
+	int ret = -ENOMEM;
+	struct kmem_cache_node *n;
+	struct array_cache *old_shared = NULL;
+	struct array_cache *new_shared = NULL;
+	struct alien_cache **new_alien = NULL;
+	LIST_HEAD(list);
+
+	if (use_alien_caches) {
+		new_alien = alloc_alien_cache(node, cachep->limit, gfp);
+		if (!new_alien)
+			goto fail;
+	}
+
+	if (cachep->shared) {
+		new_shared = alloc_arraycache(node,
+			cachep->shared * cachep->batchcount, 0xbaadf00d, gfp);
+		if (!new_shared)
+			goto fail;
+	}
+
+	ret = init_cache_node(cachep, node, gfp);
+	if (ret)
+		goto fail;
+
+	n = get_node(cachep, node);
+	spin_lock_irq(&n->list_lock);
+	if (n->shared && force_change) {
+		free_block(cachep, n->shared->entry,
+				n->shared->avail, node, &list);
+		n->shared->avail = 0;
+	}
+
+	if (!n->shared || force_change) {
+		old_shared = n->shared;
+		n->shared = new_shared;
+		new_shared = NULL;
+	}
+
+	if (!n->alien) {
+		n->alien = new_alien;
+		new_alien = NULL;
+	}
+
+	spin_unlock_irq(&n->list_lock);
+	slabs_destroy(cachep, &list);
+
+	/*
+	 * To protect lockless access to n->shared during irq disabled context.
+	 * If n->shared isn't NULL in irq disabled context, accessing to it is
+	 * guaranteed to be valid until irq is re-enabled, because it will be
+	 * freed after synchronize_rcu().
+	 */
+	if (old_shared && force_change)
+		synchronize_rcu();
+
+fail:
+	kfree(old_shared);
+	kfree(new_shared);
+	free_alien_cache(new_alien);
+
+	return ret;
+}
+
+int cache_random_seq_create(struct kmem_cache *cachep, unsigned int count,
+				    gfp_t gfp)
+{
+	struct rnd_state state;
+
+	// count是slab里要求的对象数量
+	// todo: 这个判断什么意思？
+	if (count < 2 || cachep->random_seq)
+		return 0;
+
+	// todo: 分配count个int?
+	cachep->random_seq = kcalloc(count, sizeof(unsigned int), gfp);
+	if (!cachep->random_seq)
+		return -ENOMEM;
+
+	// 设置随机数种子
+	prandom_seed_state(&state, get_random_long());
+
+	// 把random_seq数组里的元素随机化
+	freelist_randomize(&state, cachep->random_seq, count);
 	return 0;
 }
 
