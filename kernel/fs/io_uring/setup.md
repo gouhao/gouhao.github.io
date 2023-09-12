@@ -1,4 +1,6 @@
 # io_uring_setup
+源码基于5.10
+
 io_uring_setup系统调用主要创建一个io_uring的上下文，这个上下文里包含提交，完成队列，创始io_wq worker线程，用于异步执行任务，如果指定了sq-poll, 还会创建相应的内核线程。
 
 ## io_uring_setup系统调用
@@ -22,14 +24,15 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
 			return -EINVAL;
 	}
 
-    	/* flags只支持这些标志，如果有其它标志都会报错
-	    	#define IORING_SETUP_IOPOLL	(1U << 0)	/* io poll 模式 */
-		#define IORING_SETUP_SQPOLL	(1U << 1)	/* sq poll 模式 */
-		#define IORING_SETUP_SQ_AFF	(1U << 2)	/* 指定线程cpu时指定这个参数*/
-		#define IORING_SETUP_CQSIZE	(1U << 3)	/* 应用设置完成队列大小 */
-		#define IORING_SETUP_CLAMP	(1U << 4)	/* 当用户指定的entries太大时，可以把值改小 */
-		#define IORING_SETUP_ATTACH_WQ	(1U << 5)	/* 添加到当前已经存在的wq里 */
-		#define IORING_SETUP_R_DISABLED	(1U << 6)	/* 如果是sq-poll模式，一开始不启动sq-thread */
+	/* 
+		flags只支持这些标志，如果有其它标志都会报错
+		#define IORING_SETUP_IOPOLL	(1U << 0)	// io poll 模式
+		#define IORING_SETUP_SQPOLL	(1U << 1)	// sq poll 模式
+		#define IORING_SETUP_SQ_AFF	(1U << 2)	// 在sq poll模式下，指定线程运行的cpu
+		#define IORING_SETUP_CQSIZE	(1U << 3)	// 指定完成队列大小
+		#define IORING_SETUP_CLAMP	(1U << 4)	// 当用户指定的entries太大时，可以把值改小
+		#define IORING_SETUP_ATTACH_WQ	(1U << 5)	// 添加到当前已经存在的wq里
+		#define IORING_SETUP_R_DISABLED	(1U << 6)	// 如果是sq-poll模式，一开始不启动sq-thread
 	 */
 	if (p.flags & ~(IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL |
 			IORING_SETUP_SQ_AFF | IORING_SETUP_CQSIZE |
@@ -42,7 +45,7 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
 ```
 在io_uring_setup系统调用接口里，主要检查了用户空间传来参数的合法性，然后调用io_uring_create来创建io_uring。
 
-
+## io_uring_create
 ```c
 static int io_uring_create(unsigned entries, struct io_uring_params *p,
 			   struct io_uring_params __user *params)
@@ -66,7 +69,7 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p,
 		entries = IORING_MAX_ENTRIES;
 	}
 
-    	// 提交队列大小向上舍入到2次幂
+	// 提交队列大小向上舍入到2次幂
 	p->sq_entries = roundup_pow_of_two(entries);
 
     	// 如果设置了完成队列的大小，和提交队列的处理一样
@@ -79,17 +82,19 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p,
 			p->cq_entries = IORING_MAX_CQ_ENTRIES;
 		}
 		p->cq_entries = roundup_pow_of_two(p->cq_entries);
+		// 完成队列大小不能小于提交队列大小
 		if (p->cq_entries < p->sq_entries)
 			return -EINVAL;
 	} else {
-        	// 如果不设置，就是提交队列大小的2倍
+        	// 如果不设置，完成队列默认是提交队列大小的2倍
 		p->cq_entries = 2 * p->sq_entries;
 	}
 
 	// 获取当前进程的user引用
 	user = get_uid(current_user());
 
-    	// 没有IPC_LOCK的权能，就要限制内存
+	// 没有IPC_LOCK的权能，就要限制内存
+	// CAP_IPC_LOCK：是否允许锁定共享内存
 	limit_mem = !capable(CAP_IPC_LOCK);
 
 	if (limit_mem) {
@@ -103,7 +108,7 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p,
 		}
 	}
 
-    	// 创建io_uring上下文对象
+    	// 创建io_uring上下文对象，这个函数里只是分配了一个对象并进行基本的初始化
 	ctx = io_ring_ctx_alloc(p);
 	if (!ctx) {
 		// 申请失败，要把限制再回退
@@ -122,6 +127,7 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p,
 	ctx->loginuid = current->loginuid;
 	ctx->sessionid = current->sessionid;
 #endif
+	// 引用创建io_uring的进程
 	ctx->sqo_task = get_task_struct(current);
 
 	// 增加内存引用计数
@@ -130,7 +136,7 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p,
 
 #ifdef CONFIG_BLK_CGROUP
 
-    	// 块-cgroup相关
+    	// blk-cgp相关，不太懂
 	/*
 	 * The sq thread will belong to the original cgroup it was inited in.
 	 * If the cgroup goes offline (e.g. disabling the io controller), then
@@ -139,7 +145,6 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p,
 	 */
 	rcu_read_lock();
 	ctx->sqo_blkcg_css = blkcg_css();
-	// todo: 这是在干啥？
 	ret = css_tryget_online(ctx->sqo_blkcg_css);
 	rcu_read_unlock();
 	if (!ret) {
@@ -150,7 +155,7 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p,
 	}
 #endif
 
-	// todo: 这个io_account_mem与上面的__io_account_mem有什么区别
+	// 这里的io_account_mem主要是把cq, sq所需要的页数加到mm_account->locked_vm
 	io_account_mem(ctx, ring_pages(p->sq_entries, p->cq_entries),
 		       ACCT_LOCKED);
 	// 设置内存限制的标记
@@ -257,7 +262,7 @@ static struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	if (!ctx)
 		return NULL;
 
-	// todo: 创建一个回退请求？
+	// 创建一个回退请求
 	ctx->fallback_req = kmem_cache_alloc(req_cachep, GFP_KERNEL);
 	if (!ctx->fallback_req)
 		goto err;
@@ -265,13 +270,14 @@ static struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	/*
 	 * 原文注释：使用比最大cq条目少5位的值，如果完全且均匀分布，则每个哈希列表应提供大约32个条目。
 	 */
-	// hash_bit是哈希表的长度
+	// hash_bit是完成队列长度的对数
 	hash_bits = ilog2(p->cq_entries);
 	hash_bits -= 5;
 	if (hash_bits <= 0)
 		hash_bits = 1;
+	// 取消队列
 	ctx->cancel_hash_bits = hash_bits;
-	// 取消请求队列
+	// 分配取消队列的内存
 	ctx->cancel_hash = kmalloc((1U << hash_bits) * sizeof(struct hlist_head),
 					GFP_KERNEL);
 	if (!ctx->cancel_hash)
@@ -279,12 +285,12 @@ static struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	// 初始化每个cancel_hash哈希表
 	__hash_init(ctx->cancel_hash, 1U << hash_bits);
 
+	// 初始化refs
 	if (percpu_ref_init(&ctx->refs, io_ring_ctx_ref_free,
 			    PERCPU_REF_ALLOW_REINIT, GFP_KERNEL))
 		goto err;
 
 	// 初始化各种列表和锁
-	// todo: 这些变量的含义
 	ctx->flags = p->flags;
 	init_waitqueue_head(&ctx->sqo_sq_wait);
 	INIT_LIST_HEAD(&ctx->sqd_list);
@@ -335,7 +341,7 @@ static int io_allocate_scq_urings(struct io_ring_ctx *ctx,
 	if (size == SIZE_MAX)
 		return -EOVERFLOW;
 
-	// io_mem_alloc直接调用的alloc_page, 会把size转换成对应页的数量
+	// io_mem_alloc直接调用的alloc_page，分配size对应的页的数量
 	rings = io_mem_alloc(size);
 	if (!rings)
 		return -ENOMEM;
@@ -355,7 +361,7 @@ static int io_allocate_scq_urings(struct io_ring_ctx *ctx,
 	ctx->sq_mask = rings->sq_ring_mask;
 	ctx->cq_mask = rings->cq_ring_mask;
 
-	// sqes的在大小
+	// sqes的大小
 	size = array_size(sizeof(struct io_uring_sqe), p->sq_entries);
 	// SIZE_MAX是size_t的最大值
 	if (size == SIZE_MAX) {
@@ -424,7 +430,7 @@ static int io_sq_offload_create(struct io_ring_ctx *ctx,
 		struct io_sq_data *sqd;
 
 		ret = -EPERM;
-		// 需要管理员权限，一般就是root
+		// 使用sqpoll模式，需要root权限
 		if (!capable(CAP_SYS_ADMIN))
 			goto err;
 
@@ -487,7 +493,7 @@ static int io_sq_offload_create(struct io_ring_ctx *ctx,
 		if (ret)
 			goto err;
 	} else if (p->flags & IORING_SETUP_SQ_AFF) {
-		// 没有SQPOLL，就不能有这个标志
+		// 非SQPOLL模式下，不能使用这个标志
 		ret = -EINVAL;
 		goto err;
 	}
@@ -673,10 +679,12 @@ static int io_uring_alloc_task_context(struct task_struct *task)
 	struct io_uring_task *tctx;
 	int ret;
 
+	// 分配内存
 	tctx = kmalloc(sizeof(*tctx), GFP_KERNEL);
 	if (unlikely(!tctx))
 		return -ENOMEM;
 
+	// 初始化inflight percpu
 	ret = percpu_counter_init(&tctx->inflight, 0, GFP_KERNEL);
 	if (unlikely(ret)) {
 		kfree(tctx);

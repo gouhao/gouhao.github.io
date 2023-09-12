@@ -259,7 +259,7 @@ ssize_t generic_file_buffered_read(struct kiocb *iocb,
 	prev_index = ra->prev_pos >> PAGE_SHIFT;
 	/* 预读偏移 */
 	prev_offset = ra->prev_pos & (PAGE_SIZE-1);
-	/* todo: 下次访问的页索引 */
+	/* 上次访问的页索引 */
 	last_index = (*ppos + iter->count + PAGE_SIZE-1) >> PAGE_SHIFT;
 
 	/* 本次读取在页内的偏移 */
@@ -287,11 +287,11 @@ find_page:
 			goto out;
 		}
 
-		/* 从mapping里找目标页面 */
+		/* 从缓存里找目标页面 */
 		page = find_get_page(mapping, index);
 		if (!page) { // 目标页面还没有缓存
 
-			// 用户不要做IO操作
+			// 没找到目标页就要做IO操作，如果用户不允许IO，直接退出
 			if (iocb->ki_flags & IOCB_NOIO)
 				goto would_block;
 			// 开始同步预读
@@ -305,18 +305,23 @@ find_page:
 			if (unlikely(page == NULL))
 				goto no_cached_page;
 		}
-		if (PageReadahead(page)) { // 如果是预读的页面
+
+		// PG_Readahead标志，表示读到这一页时，要开始异步预读
+		if (PageReadahead(page)) {
+			// 不允许IO
 			if (iocb->ki_flags & IOCB_NOIO) {
 				put_page(page);
 				goto out;
 			}
+
+			// 启动异步预读
 			page_cache_async_readahead(mapping,
 					ra, filp, page,
 					index, last_index - index);
 		}
-		if (!PageUptodate(page)) { 
-			/* 如果当前缓存的页面不是最新的 */
 
+		/* 如果当前缓存的页面不是最新的 */
+		if (!PageUptodate(page)) { 
 			if (iocb->ki_flags & IOCB_WAITQ) {
 				if (written) {
 					put_page(page);
@@ -682,100 +687,7 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 	return ret;
 }
 
-noinline int __add_to_page_cache_locked(struct page *page,
-					struct address_space *mapping,
-					pgoff_t offset, gfp_t gfp,
-					void **shadowp)
-{
-	// 初始化xarray
-	XA_STATE(xas, &mapping->i_pages, offset);
 
-	// 是否是大页
-	int huge = PageHuge(page);
-	int error;
-	bool charged = false;
-
-	VM_BUG_ON_PAGE(!PageLocked(page), page);
-	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
-	mapping_set_update(&xas, mapping);
-
-	// 设置页的mapping, index信息
-	get_page(page);
-	page->mapping = mapping;
-	page->index = offset;
-
-	if (!huge) {
-		// cgroup相关
-		error = mem_cgroup_charge(page, current->mm, gfp);
-		if (error)
-			goto error;
-		charged = true;
-	}
-
-	gfp &= GFP_RECLAIM_MASK;
-
-	// 把 page插入 address_space的xarray中
-	// todo: xarray没仔细研究
-	do {
-		unsigned int order = xa_get_order(xas.xa, xas.xa_index);
-		void *entry, *old = NULL;
-
-		if (order > thp_order(page))
-			xas_split_alloc(&xas, xa_load(xas.xa, xas.xa_index),
-					order, gfp);
-		xas_lock_irq(&xas);
-
-		// 查找是否有重复的?
-		xas_for_each_conflict(&xas, entry) {
-			old = entry;
-			if (!xa_is_value(entry)) {
-				xas_set_err(&xas, -EEXIST);
-				goto unlock;
-			}
-		}
-
-		if (old) {
-			if (shadowp)
-				*shadowp = old;
-			/* entry may have been split before we acquired lock */
-			order = xa_get_order(xas.xa, xas.xa_index);
-			if (order > thp_order(page)) {
-				xas_split(&xas, old, order);
-				xas_reset(&xas);
-			}
-		}
-
-		// 保存页
-		xas_store(&xas, page);
-		if (xas_error(&xas))
-			goto unlock;
-
-		if (old)
-			mapping->nrexceptional--;
-		// 增加page计数
-		mapping->nrpages++;
-
-		if (!huge)
-			__inc_lruvec_page_state(page, NR_FILE_PAGES);
-unlock:
-		xas_unlock_irq(&xas);
-	} while (xas_nomem(&xas, gfp));
-
-	if (xas_error(&xas)) {
-		error = xas_error(&xas);
-		if (charged)
-			mem_cgroup_uncharge(page);
-		goto error;
-	}
-
-	trace_mm_filemap_add_to_page_cache(page);
-	return 0;
-error:
-	page->mapping = NULL;
-	/* Leave page->index set: truncation relies upon it */
-	put_page(page);
-	return error;
-}
 
 void lru_cache_add(struct page *page)
 {
@@ -914,213 +826,4 @@ size_t copy_page_to_iter(struct page *page, size_t offset, size_t bytes,
 	else // pipe的读
 		return copy_page_to_iter_pipe(page, offset, bytes, i);
 }
-```
-
-预读没太搞明白，后面再看。。。
-```c
-static inline
-void page_cache_sync_readahead(struct address_space *mapping,
-		struct file_ra_state *ra, struct file *file, pgoff_t index,
-		unsigned long req_count)
-{
-	// index是本次需要读的页面，req_count是需要预读的页数
-	// 定义一个预读控制结构
-	DEFINE_READAHEAD(ractl, file, mapping, index);
-
-	// 同步预读
-	page_cache_sync_ra(&ractl, ra, req_count);
-}
-
-void page_cache_sync_ra(struct readahead_control *ractl,
-		struct file_ra_state *ra, unsigned long req_count)
-{
-	// 强制预读
-	// todo: 随机存储不是应该关闭预读吗？
-	bool do_forced_ra = ractl->file && (ractl->file->f_mode & FMODE_RANDOM);
-
-	// 如果没有预读，就强制预读
-	if (!ra->ra_pages || blk_cgroup_congested()) {
-		if (!ractl->file)
-			return;
-		req_count = 1;
-		do_forced_ra = true;
-	}
-
-	/* be dumb */
-	if (do_forced_ra) { // 强制预读
-		force_page_cache_ra(ractl, ra, req_count);
-		return;
-	}
-
-	// 一般预读
-	ondemand_readahead(ractl, ra, false, req_count);
-}
-
-void force_page_cache_ra(struct readahead_control *ractl,
-		struct file_ra_state *ra, unsigned long nr_to_read)
-{
-	struct address_space *mapping = ractl->mapping;
-	struct backing_dev_info *bdi = inode_to_bdi(mapping->host);
-	unsigned long max_pages, index;
-
-	// 预读肯定要有相关的a_ops
-	if (unlikely(!mapping->a_ops->readpage && !mapping->a_ops->readpages &&
-			!mapping->a_ops->readahead))
-		return;
-
-	index = readahead_index(ractl);
-	// 这句啥意思
-	max_pages = max_t(unsigned long, bdi->io_pages, ra->ra_pages);
-	nr_to_read = min_t(unsigned long, nr_to_read, max_pages);
-	while (nr_to_read) {
-		// 一次预读2M的数据，再换算成页数
-		unsigned long this_chunk = (2 * 1024 * 1024) / PAGE_SIZE;
-
-		if (this_chunk > nr_to_read)
-			this_chunk = nr_to_read;
-		ractl->_index = index;
-		do_page_cache_ra(ractl, this_chunk, 0);
-
-		index += this_chunk;
-		nr_to_read -= this_chunk;
-	}
-}
-
-
-void do_page_cache_ra(struct readahead_control *ractl,
-		unsigned long nr_to_read, unsigned long lookahead_size)
-{
-	struct inode *inode = ractl->mapping->host;
-	unsigned long index = readahead_index(ractl);
-
-	// 文件大小
-	loff_t isize = i_size_read(inode);
-	pgoff_t end_index;	/* The last page we want to read */
-
-	if (isize == 0)
-		return;
-
-	// 最大能读的页
-	end_index = (isize - 1) >> PAGE_SHIFT;
-	if (index > end_index)
-		return;
-	// 限制最大读的页数
-	if (nr_to_read > end_index - index)
-		nr_to_read = end_index - index + 1;
-
-	// 主要调用文件系统的readahead函数来预读页面
-	page_cache_ra_unbounded(ractl, nr_to_read, lookahead_size);
-}
-
-static void ondemand_readahead(struct readahead_control *ractl,
-		struct file_ra_state *ra, bool hit_readahead_marker,
-		unsigned long req_size)
-{
-	struct backing_dev_info *bdi = inode_to_bdi(ractl->mapping->host);
-	unsigned long max_pages = ra->ra_pages;
-	unsigned long add_pages;
-	unsigned long index = readahead_index(ractl);
-	pgoff_t prev_index;
-
-	// 如果是刚开始读，则初始化预读
-	if (!index)
-		goto initial_readahead;
-
-	/*
-	 * It's the expected callback index, assume sequential access.
-	 * Ramp up sizes, and push forward the readahead window.
-	 */
-	if ((index == (ra->start + ra->size - ra->async_size) ||
-	     index == (ra->start + ra->size))) {
-		ra->start += ra->size;
-		ra->size = get_next_ra_size(ra, max_pages);
-		ra->async_size = ra->size;
-		goto readit;
-	}
-
-	/*
-	 * Hit a marked page without valid readahead state.
-	 * E.g. interleaved reads.
-	 * Query the pagecache for async_size, which normally equals to
-	 * readahead size. Ramp it up and use it as the new readahead size.
-	 */
-	if (hit_readahead_marker) {
-		pgoff_t start;
-
-		rcu_read_lock();
-		start = page_cache_next_miss(ractl->mapping, index + 1,
-				max_pages);
-		rcu_read_unlock();
-
-		if (!start || start - index > max_pages)
-			return;
-
-		ra->start = start;
-		ra->size = start - index;	/* old async_size */
-		ra->size += req_size;
-		ra->size = get_next_ra_size(ra, max_pages);
-		ra->async_size = ra->size;
-		goto readit;
-	}
-
-	/*
-	 * oversize read
-	 */
-	if (req_size > max_pages)
-		goto initial_readahead;
-
-	/*
-	 * sequential cache miss
-	 * trivial case: (index - prev_index) == 1
-	 * unaligned reads: (index - prev_index) == 0
-	 */
-	prev_index = (unsigned long long)ra->prev_pos >> PAGE_SHIFT;
-	if (index - prev_index <= 1UL)
-		goto initial_readahead;
-
-	/*
-	 * Query the page cache and look for the traces(cached history pages)
-	 * that a sequential stream would leave behind.
-	 */
-	if (try_context_readahead(ractl->mapping, ra, index, req_size,
-			max_pages))
-		goto readit;
-
-	/*
-	 * standalone, small random read
-	 * Read as is, and do not pollute the readahead state.
-	 */
-	do_page_cache_ra(ractl, req_size, 0);
-	return;
-
-initial_readahead:
-	ra->start = index;
-	ra->size = get_init_ra_size(req_size, max_pages);
-
-	// 可以异步读的数据量
-	// 因为在预读的时候，如果需要的页面已经读到了，则可以立即返回，不用等所有的页面读取后才返回
-	ra->async_size = ra->size > req_size ? ra->size - req_size : ra->size;
-
-readit:
-	/*
-	 * Will this read hit the readahead marker made by itself?
-	 * If so, trigger the readahead marker hit now, and merge
-	 * the resulted next readahead window into the current one.
-	 * Take care of maximum IO pages as above.
-	 */
-	if (index == ra->start && ra->size == ra->async_size) {
-		add_pages = get_next_ra_size(ra, max_pages);
-		if (ra->size + add_pages <= max_pages) {
-			ra->async_size = add_pages;
-			ra->size += add_pages;
-		} else {
-			ra->size = max_pages;
-			ra->async_size = max_pages >> 1;
-		}
-	}
-
-	ractl->_index = ra->start;
-	do_page_cache_ra(ractl, ra->size, ra->async_size);
-}
-
 ```

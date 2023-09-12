@@ -20,10 +20,10 @@ ssize_t generic_perform_write(struct file *file,
 		size_t copied;		/* Bytes copied from user */
 		void *fsdata;
 
-        // 算出pos在页内的偏移，相当于 offset = pos % PAGE_SIZE
+        	// 算出pos在页内的偏移，相当于 offset = pos % PAGE_SIZE
 		offset = (pos & (PAGE_SIZE - 1));
 
-        // 可写的数据量
+        	// 可写的数据量
 		bytes = min_t(unsigned long, PAGE_SIZE - offset,
 						iov_iter_count(i));
 
@@ -34,13 +34,13 @@ again:
 			break;
 		}
 
-        // 有信号要处理
+        	// 有信号要处理
 		if (fatal_signal_pending(current)) {
 			status = -EINTR;
 			break;
 		}
 
-        // 为写做准备,主要是把需要写的页面准备好,如果内存里还没有,就要从磁盘上读
+        	// 为写做准备,主要是把需要写的页面准备好,如果内存里还没有,就要从磁盘上读
 		status = a_ops->write_begin(file, mapping, pos, bytes, flags,
 						&page, &fsdata);
 		if (unlikely(status < 0))
@@ -49,23 +49,23 @@ again:
 		if (mapping_writably_mapped(mapping))
 			flush_dcache_page(page);
 
-        // 从用户空间向页里写数据
+        	// 从用户空间向页里写数据
 		copied = iov_iter_copy_from_user_atomic(page, i, offset, bytes);
 		flush_dcache_page(page);
 
-        // 写结束
+        	// 写结束
 		status = a_ops->write_end(file, mapping, pos, bytes, copied,
 						page, fsdata);
 		if (unlikely(status < 0))
 			break;
 
-        // 写入的数量
+        	// 写入的数量
 		copied = status;
 
-        // 检查是否需要调度,则让出cpu
+        	// 检查是否需要调度,则让出cpu
 		cond_resched();
 
-        // 从count里减去已经复制的数据,里面写的比较复杂,不知道为啥要这么写
+        	// 从count里减去已经复制的数据,里面写的比较复杂,不知道为啥要这么写
 		iov_iter_advance(i, copied);
 		if (unlikely(copied == 0)) {
 			// 如果没有复制到数据,重新计算bytes?
@@ -74,11 +74,11 @@ again:
 			goto again;
 		}
 
-        // 累加相关计数器
+        	// 累加相关计数器
 		pos += copied;
 		written += copied;
 
-        // 刷新脏页,如果脏页太多,就会写磁盘
+       		// 刷新脏页,如果脏页太多,就会写磁盘
 		balance_dirty_pages_ratelimited(mapping);
 	} while (iov_iter_count(i));
 
@@ -137,10 +137,10 @@ struct page *grab_cache_page_write_begin(struct address_space *mapping,
 int __block_write_begin_int(struct page *page, loff_t pos, unsigned len,
 		get_block_t *get_block, struct iomap *iomap)
 {
-    // 算出页内偏移, 相当于: from = pos % PAGE_SIZE
+	// 算出页内偏移, 相当于: from = pos % PAGE_SIZE
 	unsigned from = pos & (PAGE_SIZE - 1);
 
-    // 数据终点
+	// 数据终点
 	unsigned to = from + len;
 	struct inode *inode = page->mapping->host;
 	unsigned block_start, block_end;
@@ -154,45 +154,45 @@ int __block_write_begin_int(struct page *page, loff_t pos, unsigned len,
 	BUG_ON(to > PAGE_SIZE);
 	BUG_ON(from > to);
 
-    // 获取/创建页的buffer_head, 存在page->private里
+	// 获取/创建页的buffer_head, 存在page->private里
 	head = create_page_buffers(page, inode, 0);
 
-    // 块大小
+	// 块大小
 	blocksize = head->b_size;
 
-    // 块大小对应的位
+	// 块大小对应的位
 	bbits = block_size_bits(blocksize);
 
-    // 对应的块号
+	// 对应的块号
 	block = (sector_t)page->index << (PAGE_SHIFT - bbits);
 
-    // 遍历页缓冲区所有的页,bh->b_this_page存储着下一页的指针
+	// 遍历页缓冲区所有的页,bh->b_this_page存储着下一页的指针
 	for(bh = head, block_start = 0; bh != head || !block_start;
 	    block++, block_start=block_end, bh = bh->b_this_page) {
         
-        // 一块数据的终点
+        	// 一块数据的终点
 		block_end = block_start + blocksize;
 
-        // 如果这块数据不在页的范围内,继续循环
+        	// 如果这块数据不在页的范围内,继续循环
 		if (block_end <= from || block_start >= to) {
-            // 如果页和buffer_head的最新标志不同,则把buffer_head改成和页相同的
-            // todo: 为什么要在这里判断??
+			// 如果页和buffer_head的最新标志不同,则把buffer_head改成和页相同的
+			// todo: 为什么要在这里判断??
 			if (PageUptodate(page)) {
 				if (!buffer_uptodate(bh))
 					set_buffer_uptodate(bh);
 			}
 			continue;
 		}
-        // 清除new标志
+        	// 清除new标志
 		if (buffer_new(bh))
 			clear_buffer_new(bh);
 
-        // 如果bh还没映射,则映射之
+        	// 如果bh还没映射,则映射之
 		if (!buffer_mapped(bh)) {
 			WARN_ON(bh->b_size != blocksize);
 
-            // get_block是各个文件系统传进来用于获取块的函数,
-            // 将块上的内容,填到页面上
+			// get_block是各个文件系统传进来用于获取块的函数,
+			// 将块上的内容,填到页面上
 			if (get_block) {
 				err = get_block(inode, block, bh, 1);
 				if (err)
@@ -205,14 +205,14 @@ int __block_write_begin_int(struct page *page, loff_t pos, unsigned len,
 				clean_bdev_bh_alias(bh);
 
 				if (PageUptodate(page)) {
-                    // 如果页内容是新的,则清除相应标志,继续循环
+                    			// 如果页内容是新的,则清除相应标志,继续循环
 					clear_buffer_new(bh);
 					set_buffer_uptodate(bh);
 					mark_buffer_dirty(bh);
 					continue;
 				}
 
-                // 如果块的起始点和页的起始点重合,则把不需要的位置都清0
+                		// 如果块的起始点和页的起始点重合,则把不需要的位置都清0
 				if (block_end > to || block_start < from)
 					zero_user_segments(page,
 						to, block_end,
@@ -220,31 +220,31 @@ int __block_write_begin_int(struct page *page, loff_t pos, unsigned len,
 				continue;
 			}
 		}
-        // 同步bh和页面的uptodate标志, 继续循环
+        	// 同步bh和页面的uptodate标志, 继续循环
 		if (PageUptodate(page)) {
 			if (!buffer_uptodate(bh))
 				set_buffer_uptodate(bh);
 			continue; 
 		}
 
-        // 如果数据不是最新的,发起读操作
+        	// 如果数据不是最新的,发起读操作
 		if (!buffer_uptodate(bh) && !buffer_delay(bh) &&
 		    !buffer_unwritten(bh) &&
 		     (block_start < from || block_end > to)) {
-            // 这个从磁盘上直接读
+            		// 这个从磁盘上直接读
 			ll_rw_block(REQ_OP_READ, 0, 1, &bh);
 			*wait_bh++=bh;
 		}
 	}
 	
-    // 有等待读盘的buffer,要等他们完成
+    	// 有等待读盘的buffer,要等他们完成
 	while(wait_bh > wait) {
 		wait_on_buffer(*--wait_bh);
-        // 如果读完,数据还不是最新的,那就出错了
+        	// 如果读完,数据还不是最新的,那就出错了
 		if (!buffer_uptodate(*wait_bh))
 			err = -EIO;
 	}
-    // 如果有错误,就把各个页面清0
+    	// 如果有错误,就把各个页面清0
 	if (unlikely(err))
 		page_zero_new_buffers(page, from, to);
 	return err;
@@ -287,20 +287,23 @@ int block_write_end(struct file *file, struct address_space *mapping,
 	struct inode *inode = mapping->host;
 	unsigned start;
 
-    // 数据起点
+	// 数据起点
 	start = pos & (PAGE_SIZE - 1);
 
-    // 如果复制数据失败,则把已经复制的清0
+	// 如果复制数据失败,则把未复制的地方清0
 	if (unlikely(copied < len)) {
+		// page不是最新的，则全部清0
 		if (!PageUptodate(page))
 			copied = 0;
 
+		// 把未复制后面的地方都清0
 		page_zero_new_buffers(page, start+copied, start+len);
 	}
 
-    // 刷新dcache缓存??
+	// 刷新dcache缓存??
 	flush_dcache_page(page);
 
+	// 把已写入的位置提交
 	__block_commit_write(inode, page, start, start+copied);
 
 	return copied;
@@ -321,26 +324,66 @@ static int __block_commit_write(struct inode *inode, struct page *page,
 	do {
 		block_end = block_start + blocksize;
 		if (block_end <= from || block_start >= to) {
+			// 不是目标块
+
+			// 如果不是目标块，且这个bh不是最新，则只是部分写
 			if (!buffer_uptodate(bh))
 				partial = 1;
 		} else {
+			// 是目标块
+
+			// 设置更新状态
 			set_buffer_uptodate(bh);
+
+			// 把bh标脏
 			mark_buffer_dirty(bh);
 		}
+		// 清除buffer的new标志
 		clear_buffer_new(bh);
 
 		block_start = block_end;
 		bh = bh->b_this_page;
 	} while (bh != head);
 
-	/*
-	 * If this is a partial write which happened to make all buffers
-	 * uptodate then we can optimize away a bogus readpage() for
-	 * the next read(). Here we 'discover' whether the page went
-	 * uptodate as a result of this (potentially partial) write.
-	 */
+	// 如果不是部分写，则把page标记更新
 	if (!partial)
 		SetPageUptodate(page);
 	return 0;
+}
+
+void mark_buffer_dirty(struct buffer_head *bh)
+{
+	// bh不是最新的
+	WARN_ON_ONCE(!buffer_uptodate(bh));
+
+	trace_block_dirty_buffer(bh);
+
+	// 如果已经标脏了，则直接退出
+	if (buffer_dirty(bh)) {
+		smp_mb();
+		if (buffer_dirty(bh))
+			return;
+	}
+
+	// 设置bh脏并返回之前的状态
+	if (!test_set_buffer_dirty(bh)) {
+		// 如果之前不脏
+		struct page *page = bh->b_page;
+		struct address_space *mapping = NULL;
+
+		lock_page_memcg(page);
+		// 设置page的脏标志
+		if (!TestSetPageDirty(page)) {
+			// 如果之前不脏
+			mapping = page_mapping(page);
+			// 设置page的脏标记
+			if (mapping)
+				__set_page_dirty(page, mapping, 0);
+		}
+		unlock_page_memcg(page);
+		// 标记inode脏
+		if (mapping)
+			__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+	}
 }
 ```

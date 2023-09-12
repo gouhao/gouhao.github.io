@@ -1,4 +1,6 @@
 # io-wq
+源码基于5.10
+
 io-wq是io_uring用来做异步任务。
 
 ## 创建 io-wq
@@ -22,7 +24,7 @@ struct io_wq *io_wq_create(unsigned bounded, struct io_wq_data *data)
 	if (!wq->wqes)
 		goto err_wq;
 
-	// todo: 后面看。好像会设置运行任务task的亲和性，应该是附上迁移
+	// 根据cpu上下线情况，动态设置task的可运行cpu mask
 	ret = cpuhp_state_add_instance_nocalls(io_wq_online, &wq->cpuhp_node);
 	if (ret)
 		goto err_wqes;

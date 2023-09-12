@@ -1,4 +1,6 @@
 ## io_uring_enter
+源码基于5.10
+
 ```c
 SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		u32, min_complete, u32, flags, const sigset_t __user *, sig,
@@ -75,6 +77,8 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		ret = io_uring_add_task_file(ctx, f.file);
 		if (unlikely(ret))
 			goto out;
+		
+		// 提交请求期间要用uring_lock
 		mutex_lock(&ctx->uring_lock);
 		// 提交to_submit个文件请求
 		submitted = io_submit_sqes(ctx, to_submit);
@@ -103,6 +107,8 @@ out:
 	percpu_ref_put(&ctx->refs);
 out_fput:
 	fdput(f);
+
+	// 有提交的就返回提交的数量，没有提交的就返回错误码
 	return submitted ? submitted : ret;
 }
 ```
@@ -111,9 +117,9 @@ io_uring_enter的主流程:
 2. 提交sqe.如果是sqpoll模式那只需唤醒相应的worker线程就可以;如果是普通模式,就直接提交sq里的sqe
 3. 如果需要等待特定数量的任务完成,那就等待
 
-io_uring_enter里的前2个流程都比较简单,主要看一下第3个流程.
+提交sqe流程在另一篇文章里单独写。
 
-## 一般等待
+## 非io_poll模式下等待完成结果
 如果不是iopoll模式启动的io_uring,那就走io_cqring_wait,这个函数主要是等io worker的执行完成:
 ```c
 static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
@@ -250,12 +256,11 @@ static int io_iopoll_check(struct io_ring_ctx *ctx, long min)
 
 	mutex_lock(&ctx->uring_lock);
 	do {
-		// 刷出cq的溢出
+		// 如果溢出列表里元素，则把溢出元素刷出到完成队列里
 		if (test_bit(0, &ctx->cq_check_overflow))
 			__io_cqring_overflow_flush(ctx, false, NULL, NULL);
 
 		// 有完成的cqe
-		// todo: 这里为什么不等到有需要数量的cqe??
 		if (io_cqring_events(ctx))
 			break;
 
@@ -273,6 +278,7 @@ static int io_iopoll_check(struct io_ring_ctx *ctx, long min)
 		if (ret <= 0)
 			break;
 		ret = 0;
+	// 循环条件：min不为0, nr_events为0, 不需要调度
 	} while (min && !nr_events && !need_resched());
 
 	mutex_unlock(&ctx->uring_lock);
@@ -280,9 +286,211 @@ static int io_iopoll_check(struct io_ring_ctx *ctx, long min)
 }
 ```
 io-poll的等待也很简单:
-1. 先刷新溢出列表
+1. 先把溢出列表刷出到完成列表
 2. 如果没有完成的cqe,就处理io-poll,直到有完成的cqe
 
+##
+```c
+static int io_iopoll_getevents(struct io_ring_ctx *ctx, unsigned int *nr_events,
+				long min)
+{
+	// iopoll_list不为空，也不需要调度
+	while (!list_empty(&ctx->iopoll_list) && !need_resched()) {
+		int ret;
+
+		ret = io_do_iopoll(ctx, nr_events, min);
+		// 出错，直接返回
+		if (ret < 0)
+			return ret;
+		// 必须要等到min个io完成，返回0表示完成
+		if (*nr_events >= min)
+			return 0;
+	}
+
+	return 1;
+}
+
+static int io_do_iopoll(struct io_ring_ctx *ctx, unsigned int *nr_events,
+			long min)
+{
+	struct io_kiocb *req, *tmp;
+	LIST_HEAD(done);
+	bool spin;
+	int ret;
+
+	/*
+	 * Only spin for completions if we don't have multiple devices hanging
+	 * off our complete list, and we're under the requested amount.
+	 */
+	spin = !ctx->poll_multi_file && *nr_events < min;
+
+	ret = 0;
+	// 遍历io_poll列表，取出请求
+	list_for_each_entry_safe(req, tmp, &ctx->iopoll_list, inflight_entry) {
+		struct kiocb *kiocb = &req->rw.kiocb;
+
+		// 请求已经完成，移到done列表
+		if (READ_ONCE(req->iopoll_completed)) {
+			list_move_tail(&req->inflight_entry, &done);
+			continue;
+		}
+
+		// 走到这儿说明请求没完成
+
+		// done列表不为空，退出循环？
+		if (!list_empty(&done))
+			break;
+
+		// 调用具体文件系统的iopoll接口
+		ret = kiocb->ki_filp->f_op->iopoll(kiocb, spin);
+		// 出错返回
+		if (ret < 0)
+			break;
+
+		// 调用完iopoll，再检查一遍
+		if (READ_ONCE(req->iopoll_completed))
+			list_move_tail(&req->inflight_entry, &done);
+
+		// 如果iopoll返回成功，则置spin为tr
+		if (ret && spin)
+			spin = false;
+		
+		// 重置ret
+		ret = 0;
+	}
+
+	if (!list_empty(&done))
+		io_iopoll_complete(ctx, nr_events, &done);
+
+	return ret;
+}
+
+static void io_iopoll_complete(struct io_ring_ctx *ctx, unsigned int *nr_events,
+			       struct list_head *done)
+{
+	struct req_batch rb;
+	struct io_kiocb *req;
+	LIST_HEAD(again);
+
+	/* order with ->result store in io_complete_rw_iopoll() */
+	smp_rmb();
+
+	// 把rb里的成员设为0
+	io_init_req_batch(&rb);
+
+	// 遍历done列表
+	while (!list_empty(done)) {
+		int cflags = 0;
+
+		// 取出请求
+		req = list_first_entry(done, struct io_kiocb, inflight_entry);
+
+		// 如果请求的结果是重试，重置结果和完成状态，再次加到again末尾
+		if (READ_ONCE(req->result) == -EAGAIN) {
+			req->result = 0;
+			req->iopoll_completed = 0;
+			list_move_tail(&req->inflight_entry, &again);
+			continue;
+		}
+		// 先把元素从done列表删除
+		list_del(&req->inflight_entry);
+
+		// 选择了buffer，先释放。todo:?
+		if (req->flags & REQ_F_BUFFER_SELECTED)
+			cflags = io_put_rw_kbuf(req);
+
+		// 把请求结果插到完成队列
+		__io_cqring_fill_event(req, req->result, cflags);
+
+		(*nr_events)++;
+
+		// 如果请求没人再引用，则加到批量释放里
+		if (refcount_dec_and_test(&req->refs))
+			io_req_free_batch(&rb, req);
+	}
+
+	// 处理cq的完成流程
+	io_commit_cqring(ctx);
+
+	// 如果是sqpoll，则唤醒一些等待队列
+	if (ctx->flags & IORING_SETUP_SQPOLL)
+		io_cqring_ev_posted(ctx);
+	
+	// 释放批量释放列表里的请求
+	io_req_free_batch_finish(ctx, &rb);
+
+	// 如果重试列表不为空，则把重试列表里的元素再次加到iopoll列表里
+	if (!list_empty(&again))
+		io_iopoll_queue(&again);
+}
+
+static void io_iopoll_queue(struct list_head *again)
+{
+	struct io_kiocb *req;
+
+	do {
+		req = list_first_entry(again, struct io_kiocb, inflight_entry);
+		// 先把请求从飞行列表里删掉
+		list_del(&req->inflight_entry);
+		__io_complete_rw(req, -EAGAIN, 0, NULL);
+	} while (!list_empty(again));
+}
+
+static void __io_complete_rw(struct io_kiocb *req, long res, long res2,
+			     struct io_comp_state *cs)
+{
+	// 重新提交请求
+	if (!io_rw_reissue(req, res))
+		// 如果失败了，就直接完成
+		io_complete_rw_common(&req->rw.kiocb, res, cs);
+}
+
+static bool io_rw_reissue(struct io_kiocb *req, long res)
+{
+#ifdef CONFIG_BLOCK
+	umode_t mode = file_inode(req->file)->i_mode;
+	int ret;
+
+	if (!S_ISBLK(mode) && !S_ISREG(mode))
+		return false;
+	if ((res != -EAGAIN && res != -EOPNOTSUPP) || io_wq_current_is_worker())
+		return false;
+	/*
+	 * If ref is dying, we might be running poll reap from the exit work.
+	 * Don't attempt to reissue from that path, just let it fail with
+	 * -EAGAIN.
+	 */
+	if (percpu_ref_is_dying(&req->ctx->refs))
+		return false;
+
+	ret = io_sq_thread_acquire_mm(req->ctx, req);
+
+	if (io_resubmit_prep(req, ret)) {
+		refcount_inc(&req->refs);
+		io_queue_async_work(req);
+		return true;
+	}
+
+#endif
+	return false;
+}
+
+static void io_complete_rw_common(struct kiocb *kiocb, long res,
+				  struct io_comp_state *cs)
+{
+	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw.kiocb);
+	int cflags = 0;
+
+	if (kiocb->ki_flags & IOCB_WRITE)
+		kiocb_end_write(req);
+
+	if (res != req->result)
+		req_set_fail_links(req);
+	if (req->flags & REQ_F_BUFFER_SELECTED)
+		cflags = io_put_rw_kbuf(req);
+	__io_req_complete(req, res, cflags, cs);
+}
+```
 ## 刷新溢出列表
 ```c
 static void io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force,
@@ -338,13 +546,13 @@ static bool __io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force,
 		// 把请求移动到临时列表
 		list_move(&req->compl.list, &list);
 		if (cqe) {
-			// 把req的相应值，设置到cqe里
+			// 把溢出列表的一个元素的值放到cqe里
 			WRITE_ONCE(cqe->user_data, req->user_data);
 			WRITE_ONCE(cqe->res, req->result);
 			WRITE_ONCE(cqe->flags, req->compl.cflags);
 		} else {
-			// 如果没有cqe了,又是强制刷新,那就是放弃这个req了
-			// 没有cqe了，增加溢出计数器
+			// 如果没有cqe了,又是强制刷新,那就是放弃这个完成结果了。
+			// 只是增加溢出计数器
 			ctx->cached_cq_overflow++;
 			// 把两个溢出计数器进行同步
 			WRITE_ONCE(ctx->rings->cq_overflow,
@@ -360,10 +568,12 @@ static bool __io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force,
 
 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
 
-	// 唤醒一些等待的人
+	// 唤醒在cq_wait, sq_data->wait, ctx->waitt上等待的人，
+	// 还要发送一个event事件
 	io_cqring_ev_posted(ctx);
 
-	// 释放临时列表上的req
+	// list里保存的是上面从溢出列表里取出的元素，如果这个列表不为空，
+	// 需要释放里面的req，因为req的结果已经被放到cqe里了，或者强制刷新已被放弃
 	while (!list_empty(&list)) {
 		req = list_first_entry(&list, struct io_kiocb, compl.list);
 		list_del(&req->compl.list);
@@ -372,6 +582,54 @@ static bool __io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force,
 
 	// cqe不等于NULL,说明cq队列有空闲，也就是说overflow列表里没有溢出的cqe
 	return cqe != NULL;
+}
+
+static void io_commit_cqring(struct io_ring_ctx *ctx)
+{
+	// todo: 没太看懂，刷出超时的？
+	io_flush_timeouts(ctx);
+	// 把cached_cq_tail的值更新到cq_tail里
+	__io_commit_cqring(ctx);
+
+	// 如果延迟列表不为空，把延迟列表里的加到wq队列
+	if (unlikely(!list_empty(&ctx->defer_list)))
+		__io_queue_deferred(ctx);
+}
+
+static void io_flush_timeouts(struct io_ring_ctx *ctx)
+{
+	u32 seq;
+
+	if (list_empty(&ctx->timeout_list))
+		return;
+
+	seq = ctx->cached_cq_tail - atomic_read(&ctx->cq_timeouts);
+
+	do {
+		u32 events_needed, events_got;
+		struct io_kiocb *req = list_first_entry(&ctx->timeout_list,
+						struct io_kiocb, timeout.list);
+
+		if (io_is_timeout_noseq(req))
+			break;
+
+		/*
+		 * Since seq can easily wrap around over time, subtract
+		 * the last seq at which timeouts were flushed before comparing.
+		 * Assuming not more than 2^31-1 events have happened since,
+		 * these subtractions won't have wrapped, so we can check if
+		 * target is in [last_seq, current_seq] by comparing the two.
+		 */
+		events_needed = req->timeout.target_seq - ctx->cq_last_tm_flush;
+		events_got = seq - ctx->cq_last_tm_flush;
+		if (events_got < events_needed)
+			break;
+
+		list_del_init(&req->timeout.list);
+		io_kill_timeout(req, 0);
+	} while (!list_empty(&ctx->timeout_list));
+
+	ctx->cq_last_tm_flush = seq;
 }
 
 static void io_cqring_ev_posted(struct io_ring_ctx *ctx)

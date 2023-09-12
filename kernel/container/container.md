@@ -7,18 +7,10 @@ yum install docker-ce
 ## 容器相关命令
 ### 导入本地镜像
 ```sh
-$ cat cgroup/uniontechos-server-20-1050u1a-amd64-cui-release-20220722-1700.img.tar | docker import - gouhao:1.0
-sha256:01331d1b27b1725992d1eb2a29772510ff446f006a1d8d5fd0453f43dbb871ab
-$ docker images
-REPOSITORY          TAG                 IMAGE ID            CREATED             SIZE
-gouhao              1.0                 01331d1b27b1        38 seconds ago      317MB
-
-$ docker rmi -f 01331d1b27b1
-Untagged: gouhao:1.0
-Deleted: sha256:01331d1b27b1725992d1eb2a29772510ff446f006a1d8d5fd0453f43dbb871ab
-
-docker run -it uniontechos-server-20-1050u1a:latest /bin/bash
-
+docker load -i uniontechos-server-20-1050u2a-arm64-cui-release-20221124-1118.img.tar
+docker run -it uniontechos-server-20-1050u1a /bin/bash
+docker rmi -f 01331d1b27b1
+docker pull ubuntu
 ```
 ### 启动交互式容器
 ```sh	

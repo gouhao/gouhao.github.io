@@ -1,7 +1,7 @@
 # fusefs初始化
 源码基于stable-5.10.102
 
-## 模块初始化
+## 1. 模块初始化
 ```c
 static int __init fuse_init(void)
 {
@@ -34,10 +34,10 @@ static int __init fuse_init(void)
 	if (res)
 		goto err_sysfs_cleanup;
 
-	// 限制后台最大请求数
+	// 检查限制后台最大请求数的值，如果超过范围，则限制到合理范围
 	sanitize_global_limit(&max_user_bgreq);
 
-	// 限制最大拥塞阈值
+	// 检查限制最大拥塞阈值，如果超过范围，则限制到合理范围
 	sanitize_global_limit(&max_user_congthresh);
 
 	return 0;
@@ -69,7 +69,7 @@ static void sanitize_global_limit(unsigned *limit)
 3. 注册fusectl文件系统
 4. 创建sys文件系统里的相关目录
 
-## fuse_fs_init
+## 2. fuse_fs_init
 ```c
 static int __init fuse_fs_init(void)
 {
@@ -79,7 +79,7 @@ static int __init fuse_fs_init(void)
 	fuse_inode_cachep = kmem_cache_create("fuse_inode",
 			sizeof(struct fuse_inode), 0,
 			SLAB_HWCACHE_ALIGN|SLAB_ACCOUNT|SLAB_RECLAIM_ACCOUNT,
-			// 初始化方法
+			// 初始化方法，每次分配一个对象的时候都调用这个方法
 			fuse_inode_init_once);
 	err = -ENOMEM;
 	if (!fuse_inode_cachep)
@@ -133,7 +133,7 @@ static void fuse_inode_init_once(void *foo)
 }
 ```
 
-## fuse_dev_init
+## 3. fuse_dev_init
 
 ```c
 int __init fuse_dev_init(void)
@@ -179,7 +179,7 @@ static int fuse_sysfs_init(void)
 		goto out_err;
 	}
 
-	// 在fuse下面创建一个空文件夹
+	// 在/sys/fs/fuse下面创建connections
 	err = sysfs_create_mount_point(fuse_kobj, "connections");
 	if (err)
 		goto out_fuse_unregister;
@@ -210,4 +210,4 @@ MODULE_ALIAS_FS("fusectl");
 
 ```
 
-从上面可知fuse模块有以下别名：fuse, fuseblk, fusectl。
+从上面可知fuse模块有以下别名：fuse, fuseblk, fusectl，当需要这些文件系统时，会自动加载这些模块。

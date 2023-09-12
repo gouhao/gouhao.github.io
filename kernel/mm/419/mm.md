@@ -40,7 +40,7 @@ struct page {
 		};
 		struct {	/* slab, slob and slub */
 			union {
-				struct list_head slab_list;	/* uses lru */
+				struct list_head slab_list;	// 链入slab列表
 				struct {	/* Partial pages */
 					struct page *next;
 #ifdef CONFIG_64BIT
@@ -54,12 +54,12 @@ struct page {
 			};
 			struct kmem_cache *slab_cache; /* not slob */
 			/* Double-word boundary */
-			void *freelist;		/* first free object */
+			void *freelist;		/* slab空闲对象列表 */
 			union {
-				void *s_mem;	/* slab: first object */
+				void *s_mem;	/* slab: 第一个对象 */
 				unsigned long counters;		/* SLUB */
 				struct {			/* SLUB */
-					unsigned inuse:16;
+					unsigned inuse:16; // 正在使用
 					unsigned objects:15;
 					unsigned frozen:1;
 				};
@@ -118,7 +118,7 @@ struct page {
 		 */
 		unsigned int page_type;
 
-		unsigned int active;		/* SLAB */
+		unsigned int active;		/* slab里活跃的数量 */
 		int units;			/* SLOB */
 	};
 

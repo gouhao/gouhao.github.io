@@ -1,0 +1,7 @@
+简介：
+    本demo支持6个调试开关。dd_f1~dd_f6
+
+集成到内核:
+1.把debugfs_demo.h放到include/linux目录下
+2.debusfs_demo.c 随便放到哪，只要编进内核就行
+3.在想要用开关的代码中#include <linux/debugfs_demo.h>，就可以用开关

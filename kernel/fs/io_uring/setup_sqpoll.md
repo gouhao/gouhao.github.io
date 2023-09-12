@@ -1,4 +1,6 @@
 ## sqpoll thread
+源码基于5.10
+
 ```c
 static int io_sq_thread(void *data)
 {

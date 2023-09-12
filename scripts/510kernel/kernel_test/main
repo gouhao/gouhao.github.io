@@ -1,0 +1,32 @@
+#!/bin/python
+# -*- coding:utf-8 -*-
+"""
+内核自动化测试主程序
+
+作者：苟浩 <gouhao@uniontech.com>
+日期：2023年01月13日
+
+用法：
+	./main
+
+注意：testcases里放的是各个测试用例，测试用例必须有可执行权限。
+
+"""
+
+import os
+
+TESTCASES_DIR = "testcases"
+
+testcases = os.listdir(TESTCASES_DIR)
+
+for case in testcases:
+	case_path = "./%s/%s" % (TESTCASES_DIR, case)
+	if not os.path.isfile(case_path) or \
+		not os.access(case_path, os.X_OK):
+		continue
+
+	ret = "PASS"
+	if os.system(case_path):
+		ret = "FAILED"
+	
+	print("%s %s" % (case_path, ret))

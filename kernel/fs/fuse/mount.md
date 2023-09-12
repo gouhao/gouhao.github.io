@@ -1,6 +1,6 @@
 # fusefs挂载
 
-## fuse_init_fs_context
+## 1. fuse_init_fs_context
 ```c
 static int fuse_init_fs_context(struct fs_context *fc)
 {
@@ -43,7 +43,7 @@ static const struct fs_context_operations fuse_context_ops = {
 初始化函数里，主要创建了fuse_fs_context对象，每个挂载的上下文对象。
 
 
-## fuse_get_tree
+## 2. fuse_get_tree
 ```c
 static int fuse_get_tree(struct fs_context *fc)
 {
@@ -66,7 +66,7 @@ static int fuse_get_tree(struct fs_context *fc)
 ```
 在挂载fusefs的时候，必须要传fd, rootmod, user_id, group_id，这4个参数。然后就根据是否有设备，调用不同的vfs函数，核心工作都在fuse_fill_super里。
 
-## fuse_fill_super
+### 2.1 fuse_fill_super
 ```c
 static int fuse_fill_super(struct super_block *sb, struct fs_context *fsc)
 {
@@ -83,7 +83,8 @@ static int fuse_fill_super(struct super_block *sb, struct fs_context *fsc)
 	if (!file)
 		goto err;
 
-	// 判断是否是文件的操作函数表是不是fuse_dev_operations，
+	// 判断是否是文件的操作函数表是不是fuse_dev_operations，这个opts是fuse和cuse这两个设备的，
+	// 所以打开的文件必须是/dev/fuse或/dev/cuse
 	// 而且这个文件打开的用户空间和当前用户空间必须一致，原文注释说是为了防止攻击
 	if ((file->f_op != &fuse_dev_operations) ||
 	    (file->f_cred->user_ns != sb->s_user_ns))
@@ -106,8 +107,10 @@ static int fuse_fill_super(struct super_block *sb, struct fs_context *fsc)
 	
 	// 初始化链接对象
 	fuse_conn_init(fc, fm, sb->s_user_ns, &fuse_dev_fiq_ops, NULL);
+	// 释放链接函数
 	fc->release = fuse_free_conn;
 
+	// mount信息
 	sb->s_fs_info = fm;
 
 	// 填充超级块
@@ -297,6 +300,7 @@ static void fuse_iqueue_init(struct fuse_iqueue *fiq,
 	INIT_LIST_HEAD(&fiq->pending);
 	INIT_LIST_HEAD(&fiq->interrupts);
 	fiq->forget_list_tail = &fiq->forget_list_head;
+	// 已连接
 	fiq->connected = 1;
 	fiq->ops = ops;
 	fiq->priv = priv;
