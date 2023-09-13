@@ -242,7 +242,7 @@ struct file_system_type {
 // 挂载点
 struct mountpoint {
 	struct hlist_node m_hash;
-    // 挂载目录
+	// 挂载目录
 	struct dentry *m_dentry;
 	struct hlist_head m_list;
 	int m_count;
