@@ -99,7 +99,7 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 		// 把请求标准化
 		ext4_mb_normalize_request(ac, ar);
 
-		// 分配一个ext4_prealloc_space对象
+		// 给ac分配一个ext4_prealloc_space对象
 		*errp = ext4_mb_pa_alloc(ac);
 		if (*errp)
 			goto errout;
@@ -168,6 +168,438 @@ out:
 
 	return block;
 }
+
+static int ext4_mb_pa_alloc(struct ext4_allocation_context *ac)
+{
+	struct ext4_prealloc_space *pa;
+
+	BUG_ON(ext4_pspace_cachep == NULL);
+	// 分配pa
+	pa = kmem_cache_zalloc(ext4_pspace_cachep, GFP_NOFS);
+	if (!pa)
+		return -ENOMEM;
+	// 引用数量设置为1
+	atomic_set(&pa->pa_count, 1);
+	ac->ac_pa = pa;
+	return 0;
+}
+```
+
+## 11. ext4_mb_regular_allocator
+```c
+static noinline_for_stack int
+ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
+{
+	ext4_group_t prefetch_grp = 0, ngroups, group, i;
+	int cr = -1;
+	int err = 0, first_err = 0;
+	unsigned int nr = 0, prefetch_ios = 0;
+	struct ext4_sb_info *sbi;
+	struct super_block *sb;
+	struct ext4_buddy e4b;
+	int lost;
+
+	// 超级块信息
+	sb = ac->ac_sb;
+	sbi = EXT4_SB(sb);
+	// 有多少个组
+	ngroups = ext4_get_groups_count(sb);
+	
+	// 非extent限制到blockfile_groups
+	if (!(ext4_test_inode_flag(ac->ac_inode, EXT4_INODE_EXTENTS)))
+		ngroups = sbi->s_blockfile_groups;
+
+	// 已经找到了不应该走这个函数
+	BUG_ON(ac->ac_status == AC_STATUS_FOUND);
+
+	// 先试一下目标块
+	err = ext4_mb_find_by_goal(ac, &e4b);
+	// 出错或者找到了
+	if (err || ac->ac_status == AC_STATUS_FOUND)
+		goto out;
+
+	// 只找目标块, 则退出. 这个标志应该很少用吧
+	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
+		goto out;
+
+	// 把长度转换成2的幂
+	i = fls(ac->ac_g_ex.fe_len);
+	ac->ac_2order = 0;
+	// todo: ?
+	if (i >= sbi->s_mb_order2_reqs && i <= sb->s_blocksize_bits + 2) {
+		/*
+		 * This should tell if fe_len is exactly power of 2
+		 */
+		if ((ac->ac_g_ex.fe_len & (~(1 << (i - 1)))) == 0)
+			ac->ac_2order = array_index_nospec(i - 1,
+							   sb->s_blocksize_bits + 2);
+	}
+
+	// 流式分配
+	if (ac->ac_flags & EXT4_MB_STREAM_ALLOC) {
+		spin_lock(&sbi->s_md_lock);
+		// 使用上次的组
+		ac->ac_g_ex.fe_group = sbi->s_mb_last_group;
+		// 从上次开始的地方分配
+		ac->ac_g_ex.fe_start = sbi->s_mb_last_start;
+		spin_unlock(&sbi->s_md_lock);
+	}
+
+	// todo: cr?
+	cr = ac->ac_2order ? 0 : 1;
+	/*
+	 * cr == 0 try to get exact allocation,
+	 * cr == 3  try to get anything
+	 */
+repeat:
+	for (; cr < 4 && ac->ac_status == AC_STATUS_CONTINUE; cr++) {
+		ac->ac_criteria = cr;
+		// 从目标组开始
+		group = ac->ac_g_ex.fe_group;
+		prefetch_grp = group;
+
+		for (i = 0; i < ngroups; group++, i++) {
+			int ret = 0;
+			cond_resched();
+			// 到了最大组再从头开始
+			if (group >= ngroups)
+				group = 0;
+
+			// 当前组到了预读点 && (cr > 1 || 预取次数没有超过限制)
+			if ((prefetch_grp == group) &&
+			    (cr > 1 ||
+			     prefetch_ios < sbi->s_mb_prefetch_limit)) {
+				unsigned int curr_ios = prefetch_ios;
+
+				// 预取数量
+				nr = sbi->s_mb_prefetch;
+
+				// 有灵活组特性
+				if (ext4_has_feature_flex_bg(sb)) {
+					// 每个灵活组几个组
+					nr = 1 << sbi->s_log_groups_per_flex;
+					// what ?
+					nr -= group & (nr - 1);
+					// 预取组的最小值
+					nr = min(nr, sbi->s_mb_prefetch);
+				}
+				// 预读组, 返回值是下次预取的位置, prefetch_ios返回的是
+				// 提交io的数量
+				prefetch_grp = ext4_mb_prefetch(sb, group,
+							nr, &prefetch_ios);
+				if (prefetch_ios == curr_ios)
+					nr = 0;
+			}
+
+			// 检查这个组是不是适合分配
+			ret = ext4_mb_good_group_nolock(ac, group, cr);
+			if (ret <= 0) {
+				// 不适合
+				if (!first_err)
+					first_err = ret;
+				continue;
+			}
+			// 加载block位图
+			err = ext4_mb_load_buddy(sb, group, &e4b);
+			if (err)
+				goto out;
+
+			ext4_lock_group(sb, group);
+
+			// 再检查一次group, 因为上面加锁了, 获得锁后情况可能变了
+			ret = ext4_mb_good_group(ac, group, cr);
+			if (ret == 0) {
+				ext4_unlock_group(sb, group);
+				ext4_mb_unload_buddy(&e4b);
+				continue;
+			}
+
+			// 扫描次数
+			ac->ac_groups_scanned++;
+
+			// 根据cr走不同的扫描
+			if (cr == 0)
+				ext4_mb_simple_scan_group(ac, &e4b);
+			else if (cr == 1 && sbi->s_stripe &&
+					!(ac->ac_g_ex.fe_len % sbi->s_stripe))
+				ext4_mb_scan_aligned(ac, &e4b);
+			else
+				ext4_mb_complex_scan_group(ac, &e4b);
+
+			ext4_unlock_group(sb, group);
+			ext4_mb_unload_buddy(&e4b);
+
+			// 不等于continue就是找到或出错了
+			if (ac->ac_status != AC_STATUS_CONTINUE)
+				break;
+		}
+	}
+
+	// todo: what?
+	if (ac->ac_b_ex.fe_len > 0 && ac->ac_status != AC_STATUS_FOUND &&
+	    !(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
+		/*
+		 * We've been searching too long. Let's try to allocate
+		 * the best chunk we've found so far
+		 */
+		ext4_mb_try_best_found(ac, &e4b);
+		if (ac->ac_status != AC_STATUS_FOUND) {
+			/*
+			 * Someone more lucky has already allocated it.
+			 * The only thing we can do is just take first
+			 * found block(s)
+			 */
+			lost = atomic_inc_return(&sbi->s_mb_lost_chunks);
+			mb_debug(sb, "lost chunk, group: %u, start: %d, len: %d, lost: %d\n",
+				 ac->ac_b_ex.fe_group, ac->ac_b_ex.fe_start,
+				 ac->ac_b_ex.fe_len, lost);
+
+			ac->ac_b_ex.fe_group = 0;
+			ac->ac_b_ex.fe_start = 0;
+			ac->ac_b_ex.fe_len = 0;
+			ac->ac_status = AC_STATUS_CONTINUE;
+			ac->ac_flags |= EXT4_MB_HINT_FIRST;
+			cr = 3;
+			goto repeat;
+		}
+	}
+out:
+	// 有错误
+	if (!err && ac->ac_status != AC_STATUS_FOUND && first_err)
+		err = first_err;
+
+	mb_debug(sb, "Best len %d, origin len %d, ac_status %u, ac_flags 0x%x, cr %d ret %d\n",
+		 ac->ac_b_ex.fe_len, ac->ac_o_ex.fe_len, ac->ac_status,
+		 ac->ac_flags, cr, err);
+
+	if (nr)
+		ext4_mb_prefetch_fini(sb, prefetch_grp, nr);
+
+	return err;
+}
+
+static noinline_for_stack
+int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
+				struct ext4_buddy *e4b)
+{
+	ext4_group_t group = ac->ac_g_ex.fe_group;
+	int max;
+	int err;
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	struct ext4_group_info *grp = ext4_get_group_info(ac->ac_sb, group);
+	struct ext4_free_extent ex;
+
+	// 没有找目标块退出
+	if (!(ac->ac_flags & EXT4_MB_HINT_TRY_GOAL))
+		return 0;
+	// 该组的空闲块为0
+	if (grp->bb_free == 0)
+		return 0;
+
+	err = ext4_mb_load_buddy(ac->ac_sb, group, e4b);
+	if (err)
+		return err;
+
+	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(e4b->bd_info))) {
+		ext4_mb_unload_buddy(e4b);
+		return 0;
+	}
+
+	ext4_lock_group(ac->ac_sb, group);
+	max = mb_find_extent(e4b, ac->ac_g_ex.fe_start,
+			     ac->ac_g_ex.fe_len, &ex);
+	ex.fe_logical = 0xDEADFA11; /* debug value */
+
+	if (max >= ac->ac_g_ex.fe_len && ac->ac_g_ex.fe_len == sbi->s_stripe) {
+		ext4_fsblk_t start;
+
+		start = ext4_group_first_block_no(ac->ac_sb, e4b->bd_group) +
+			ex.fe_start;
+		/* use do_div to get remainder (would be 64-bit modulo) */
+		if (do_div(start, sbi->s_stripe) == 0) {
+			ac->ac_found++;
+			ac->ac_b_ex = ex;
+			ext4_mb_use_best_found(ac, e4b);
+		}
+	} else if (max >= ac->ac_g_ex.fe_len) {
+		BUG_ON(ex.fe_len <= 0);
+		BUG_ON(ex.fe_group != ac->ac_g_ex.fe_group);
+		BUG_ON(ex.fe_start != ac->ac_g_ex.fe_start);
+		ac->ac_found++;
+		ac->ac_b_ex = ex;
+		ext4_mb_use_best_found(ac, e4b);
+	} else if (max > 0 && (ac->ac_flags & EXT4_MB_HINT_MERGE)) {
+		/* Sometimes, caller may want to merge even small
+		 * number of blocks to an existing extent */
+		BUG_ON(ex.fe_len <= 0);
+		BUG_ON(ex.fe_group != ac->ac_g_ex.fe_group);
+		BUG_ON(ex.fe_start != ac->ac_g_ex.fe_start);
+		ac->ac_found++;
+		ac->ac_b_ex = ex;
+		ext4_mb_use_best_found(ac, e4b);
+	}
+	ext4_unlock_group(ac->ac_sb, group);
+	ext4_mb_unload_buddy(e4b);
+
+	return 0;
+}
+
+static int ext4_mb_load_buddy(struct super_block *sb, ext4_group_t group,
+			      struct ext4_buddy *e4b)
+{
+	return ext4_mb_load_buddy_gfp(sb, group, e4b, GFP_NOFS);
+}
+
+static noinline_for_stack int
+ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
+		       struct ext4_buddy *e4b, gfp_t gfp)
+{
+	int blocks_per_page;
+	int block;
+	int pnum;
+	int poff;
+	struct page *page;
+	int ret;
+	struct ext4_group_info *grp;
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct inode *inode = sbi->s_buddy_cache;
+
+	might_sleep();
+	mb_debug(sb, "load group %u\n", group);
+
+	// 每页的块数
+	blocks_per_page = PAGE_SIZE / sb->s_blocksize;
+	// 组信息
+	grp = ext4_get_group_info(sb, group);
+
+	// 块大小
+	e4b->bd_blkbits = sb->s_blocksize_bits;
+	// group info
+	e4b->bd_info = grp;
+	// 超级块
+	e4b->bd_sb = sb;
+	// 组号
+	e4b->bd_group = group;
+	e4b->bd_buddy_page = NULL;
+	e4b->bd_bitmap_page = NULL;
+
+	// 组需要先初始化
+	if (unlikely(EXT4_MB_GRP_NEED_INIT(grp))) {
+		/*
+		 * we need full data about the group
+		 * to make a good selection
+		 */
+		ret = ext4_mb_init_group(sb, group, gfp);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * buddy缓存节点存储块位图和块信息在连续的块里，所以每个组
+	 * 我们需要2个块
+	 */
+	block = group * 2;
+	// 页号
+	pnum = block / blocks_per_page;
+	// 页内偏移
+	poff = block % blocks_per_page;
+
+	// 获取对应的页
+	page = find_get_page_flags(inode->i_mapping, pnum, FGP_ACCESSED);
+	if (page == NULL || !PageUptodate(page)) {
+		// 如果page为空或者不是最新的，则重新创建一个
+		if (page)
+			/*
+			 * drop the page reference and try
+			 * to get the page with lock. If we
+			 * are not uptodate that implies
+			 * somebody just created the page but
+			 * is yet to initialize the same. So
+			 * wait for it to initialize.
+			 */
+			put_page(page);
+		page = find_or_create_page(inode->i_mapping, pnum, gfp);
+		if (page) {
+			BUG_ON(page->mapping != inode->i_mapping);
+			if (!PageUptodate(page)) {
+				ret = ext4_mb_init_cache(page, NULL, gfp);
+				if (ret) {
+					unlock_page(page);
+					goto err;
+				}
+				mb_cmp_bitmaps(e4b, page_address(page) +
+					       (poff * sb->s_blocksize));
+			}
+			unlock_page(page);
+		}
+	}
+	if (page == NULL) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	// 还不是最新的那就出错了
+	if (!PageUptodate(page)) {
+		ret = -EIO;
+		goto err;
+	}
+
+	// 记录页和位图的起点
+	e4b->bd_bitmap_page = page;
+	e4b->bd_bitmap = page_address(page) + (poff * sb->s_blocksize);
+
+	// 兄弟块的页及偏移
+	block++;
+	pnum = block / blocks_per_page;
+	poff = block % blocks_per_page;
+
+	// 和上面类似，找页，如果没找到就创建
+	page = find_get_page_flags(inode->i_mapping, pnum, FGP_ACCESSED);
+	if (page == NULL || !PageUptodate(page)) {
+		if (page)
+			put_page(page);
+		page = find_or_create_page(inode->i_mapping, pnum, gfp);
+		if (page) {
+			BUG_ON(page->mapping != inode->i_mapping);
+			if (!PageUptodate(page)) {
+				ret = ext4_mb_init_cache(page, e4b->bd_bitmap,
+							 gfp);
+				if (ret) {
+					unlock_page(page);
+					goto err;
+				}
+			}
+			unlock_page(page);
+		}
+	}
+	if (page == NULL) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	if (!PageUptodate(page)) {
+		ret = -EIO;
+		goto err;
+	}
+
+	/* Pages marked accessed already */
+	e4b->bd_buddy_page = page;
+	e4b->bd_buddy = page_address(page) + (poff * sb->s_blocksize);
+
+	return 0;
+
+err:
+	if (page)
+		put_page(page);
+	if (e4b->bd_bitmap_page)
+		put_page(e4b->bd_bitmap_page);
+	if (e4b->bd_buddy_page)
+		put_page(e4b->bd_buddy_page);
+	e4b->bd_buddy = NULL;
+	e4b->bd_bitmap = NULL;
+	return ret;
+}
+
+
+
 ```
 
 ### 1.1 ext4_mb_initialize_context
