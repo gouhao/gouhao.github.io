@@ -299,14 +299,14 @@ repeat:
 					first_err = ret;
 				continue;
 			}
-			// 加载block位图
+			// 加载兄弟的block位图。todo: what is buddy bitmap
 			err = ext4_mb_load_buddy(sb, group, &e4b);
 			if (err)
 				goto out;
 
 			ext4_lock_group(sb, group);
 
-			// 再检查一次group, 因为上面加锁了, 获得锁后情况可能变了
+			// 再检查一次group是否有空闲的块适合分配, 因为上面加锁了, 获得锁后情况可能变了
 			ret = ext4_mb_good_group(ac, group, cr);
 			if (ret == 0) {
 				ext4_unlock_group(sb, group);
@@ -580,7 +580,7 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 		goto err;
 	}
 
-	/* Pages marked accessed already */
+	// 设置 buddy 页的地址和偏移
 	e4b->bd_buddy_page = page;
 	e4b->bd_buddy = page_address(page) + (poff * sb->s_blocksize);
 
@@ -599,7 +599,51 @@ err:
 }
 
 
+static noinline_for_stack
+void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
+					struct ext4_buddy *e4b)
+{
+	struct super_block *sb = ac->ac_sb;
+	struct ext4_group_info *grp = e4b->bd_info;
+	void *buddy;
+	int i;
+	int k;
+	int max;
 
+	BUG_ON(ac->ac_2order <= 0);
+	for (i = ac->ac_2order; i <= sb->s_blocksize_bits + 1; i++) {
+		if (grp->bb_counters[i] == 0)
+			continue;
+
+		buddy = mb_find_buddy(e4b, i, &max);
+		BUG_ON(buddy == NULL);
+
+		k = mb_find_next_zero_bit(buddy, max, 0);
+		if (k >= max) {
+			ext4_grp_locked_error(ac->ac_sb, e4b->bd_group, 0, 0,
+				"%d free clusters of order %d. But found 0",
+				grp->bb_counters[i], i);
+			ext4_mark_group_bitmap_corrupted(ac->ac_sb,
+					 e4b->bd_group,
+					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
+			break;
+		}
+		ac->ac_found++;
+
+		ac->ac_b_ex.fe_len = 1 << i;
+		ac->ac_b_ex.fe_start = k << i;
+		ac->ac_b_ex.fe_group = e4b->bd_group;
+
+		ext4_mb_use_best_found(ac, e4b);
+
+		BUG_ON(ac->ac_f_ex.fe_len != ac->ac_g_ex.fe_len);
+
+		if (EXT4_SB(sb)->s_mb_stats)
+			atomic_inc(&EXT4_SB(sb)->s_bal_2orders);
+
+		break;
+	}
+}
 ```
 
 ### 1.1 ext4_mb_initialize_context
