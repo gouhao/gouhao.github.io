@@ -462,6 +462,7 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 	int ret;
 	struct ext4_group_info *grp;
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	// buddy信息存储在专门的inode里
 	struct inode *inode = sbi->s_buddy_cache;
 
 	might_sleep();
@@ -596,6 +597,190 @@ err:
 	e4b->bd_buddy = NULL;
 	e4b->bd_bitmap = NULL;
 	return ret;
+}
+
+/* The buddy information is attached the buddy cache inode
+ * for convenience. The information regarding each group
+ * is loaded via ext4_mb_load_buddy. The information involve
+ * block bitmap and buddy information. The information are
+ * stored in the inode as
+ *
+ * {                        page                        }
+ * [ group 0 bitmap][ group 0 buddy] [group 1][ group 1]...
+ *
+ *
+ * one block each for bitmap and buddy information.
+ * So for each group we take up 2 blocks. A page can
+ * contain blocks_per_page (PAGE_SIZE / blocksize)  blocks.
+ * So it can have information regarding groups_per_page which
+ * is blocks_per_page/2
+ *
+ * Locking note:  This routine takes the block group lock of all groups
+ * for this page; do not hold this lock when calling this routine!
+ */
+static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
+{
+	ext4_group_t ngroups;
+	int blocksize;
+	int blocks_per_page;
+	int groups_per_page;
+	int err = 0;
+	int i;
+	ext4_group_t first_group, group;
+	int first_block;
+	struct super_block *sb;
+	struct buffer_head *bhs;
+	struct buffer_head **bh = NULL;
+	struct inode *inode;
+	char *data;
+	char *bitmap;
+	struct ext4_group_info *grinfo;
+
+	inode = page->mapping->host;
+	sb = inode->i_sb;
+	// 组数
+	ngroups = ext4_get_groups_count(sb);
+	// 块大小
+	blocksize = i_blocksize(inode);
+	// 每页存的块数
+	blocks_per_page = PAGE_SIZE / blocksize;
+
+	mb_debug(sb, "init page %lu\n", page->index);
+
+	// 每页能放几个组的buddy信息，如上注释是 blocks_per_page/2
+	groups_per_page = blocks_per_page >> 1;
+	if (groups_per_page == 0)
+		groups_per_page = 1;
+
+	/* allocate buffer_heads to read bitmaps */
+	if (groups_per_page > 1) {
+		i = sizeof(struct buffer_head *) * groups_per_page;
+		bh = kzalloc(i, gfp);
+		if (bh == NULL) {
+			err = -ENOMEM;
+			goto out;
+		}
+	} else
+		bh = &bhs;
+
+	first_group = page->index * blocks_per_page / 2;
+
+	/* read all groups the page covers into the cache */
+	for (i = 0, group = first_group; i < groups_per_page; i++, group++) {
+		if (group >= ngroups)
+			break;
+
+		grinfo = ext4_get_group_info(sb, group);
+		/*
+		 * If page is uptodate then we came here after online resize
+		 * which added some new uninitialized group info structs, so
+		 * we must skip all initialized uptodate buddies on the page,
+		 * which may be currently in use by an allocating task.
+		 */
+		if (PageUptodate(page) && !EXT4_MB_GRP_NEED_INIT(grinfo)) {
+			bh[i] = NULL;
+			continue;
+		}
+		bh[i] = ext4_read_block_bitmap_nowait(sb, group, false);
+		if (IS_ERR(bh[i])) {
+			err = PTR_ERR(bh[i]);
+			bh[i] = NULL;
+			goto out;
+		}
+		mb_debug(sb, "read bitmap for group %u\n", group);
+	}
+
+	/* wait for I/O completion */
+	for (i = 0, group = first_group; i < groups_per_page; i++, group++) {
+		int err2;
+
+		if (!bh[i])
+			continue;
+		err2 = ext4_wait_block_bitmap(sb, group, bh[i]);
+		if (!err)
+			err = err2;
+	}
+
+	first_block = page->index * blocks_per_page;
+	for (i = 0; i < blocks_per_page; i++) {
+		group = (first_block + i) >> 1;
+		if (group >= ngroups)
+			break;
+
+		if (!bh[group - first_group])
+			/* skip initialized uptodate buddy */
+			continue;
+
+		if (!buffer_verified(bh[group - first_group]))
+			/* Skip faulty bitmaps */
+			continue;
+		err = 0;
+
+		/*
+		 * data carry information regarding this
+		 * particular group in the format specified
+		 * above
+		 *
+		 */
+		data = page_address(page) + (i * blocksize);
+		bitmap = bh[group - first_group]->b_data;
+
+		/*
+		 * We place the buddy block and bitmap block
+		 * close together
+		 */
+		if ((first_block + i) & 1) {
+			/* this is block of buddy */
+			BUG_ON(incore == NULL);
+			mb_debug(sb, "put buddy for group %u in page %lu/%x\n",
+				group, page->index, i * blocksize);
+			trace_ext4_mb_buddy_bitmap_load(sb, group);
+			grinfo = ext4_get_group_info(sb, group);
+			grinfo->bb_fragments = 0;
+			memset(grinfo->bb_counters, 0,
+			       sizeof(*grinfo->bb_counters) *
+				(sb->s_blocksize_bits+2));
+			/*
+			 * incore got set to the group block bitmap below
+			 */
+			ext4_lock_group(sb, group);
+			/* init the buddy */
+			memset(data, 0xff, blocksize);
+			ext4_mb_generate_buddy(sb, data, incore, group);
+			ext4_unlock_group(sb, group);
+			incore = NULL;
+		} else {
+			/* this is block of bitmap */
+			BUG_ON(incore != NULL);
+			mb_debug(sb, "put bitmap for group %u in page %lu/%x\n",
+				group, page->index, i * blocksize);
+			trace_ext4_mb_bitmap_load(sb, group);
+
+			/* see comments in ext4_mb_put_pa() */
+			ext4_lock_group(sb, group);
+			memcpy(data, bitmap, blocksize);
+
+			/* mark all preallocated blks used in in-core bitmap */
+			ext4_mb_generate_from_pa(sb, data, group);
+			ext4_mb_generate_from_freelist(sb, data, group);
+			ext4_unlock_group(sb, group);
+
+			/* set incore so that the buddy information can be
+			 * generated using this
+			 */
+			incore = data;
+		}
+	}
+	SetPageUptodate(page);
+
+out:
+	if (bh) {
+		for (i = 0; i < groups_per_page; i++)
+			brelse(bh[i]);
+		if (bh != &bhs)
+			kfree(bh);
+	}
+	return err;
 }
 
 
@@ -1264,4 +1449,9 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 	mb_debug(ac->ac_sb, "goal: %lld(was %lld) blocks at %u\n", size,
 		 orig_size, start);
 }
+```
+
+
+
+```c
 ```
