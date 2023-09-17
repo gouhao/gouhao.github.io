@@ -4,23 +4,23 @@
 
 源码基于stable-5.10.102
 
-遍历路径的代码有好几种，原理大概都差不多，这里看的是path_lookupat。
+遍历路径的代码大多入口是path_lookupat。
 ```c
 // 在遍历路径是保存遍历过程中的数据及结果
 struct nameidata {
-    // 保存遍历过程中最后结点的dentry和vfsmount
+	// 当前正在处理结点为的路径,里面有dentry和vfsmount
 	struct path	path;
-    // 最后结点的文件名？
+	// 当前正在处理节点的文件名
 	struct qstr	last;
-    // 根目录信息
+	// 根目录信息
 	struct path	root;
-    // inode
+	// inode
 	struct inode	*inode; /* path.dentry.d_inode */
 	unsigned int	flags;
 	unsigned	seq, m_seq, r_seq;
-    // 最后文件的类型
+	// 最后文件的类型
 	int		last_type;
-    // 遍历的深度，有时候遍历会陷入循环，比如软链接
+	// 遍历的深度，有时候遍历会陷入循环，比如软链接
 	unsigned	depth;
 	int		total_link_count;
 	struct saved {
@@ -29,36 +29,54 @@ struct nameidata {
 		const char *name;
 		unsigned seq;
 	} *stack, internal[EMBEDDED_LEVELS];
-    // 要找的文件名
+	// 要找的文件名
 	struct filename	*name;
 	struct nameidata *saved;
 	unsigned	root_seq;
-    // 开始查找的目录的fd
+	// 开始查找的目录的fd
 	int		dfd;
 	kuid_t		dir_uid;
 	umode_t		dir_mode;
 } __randomize_layout;
 
+// 一般会调set_nameidata来设置nd
+static void set_nameidata(struct nameidata *p, int dfd, struct filename *name)
+{
+	// 进程当前的nd
+	struct nameidata *old = current->nameidata;
+	p->stack = p->internal;
+	// 开始查找的目录
+	p->dfd = dfd;
+	// 文件名,这个用struct filename包装了一下
+	p->name = name;
+	// 链接的数量,链接数量不能超过40,如果超过40就算是循环了
+	p->total_link_count = old ? old->total_link_count : 0;
+	// 保存老值
+	p->saved = old;
+	// 把新的nd设置到进程里
+	current->nameidata = p;
+}
+
 // nd是上层函数传过来的，会设置好要找的文件名，开始的路径，和一些标志等
 static int path_lookupat(struct nameidata *nd, unsigned flags, struct path *path)
 {
-    // 先根据要找的文件路径初始化nd中的数据
+	// 先根据要找的文件路径初始化nd中的数据, 返回值是要找的文件名
 	const char *s = path_init(nd, flags);
 	int err;
 
-    // 找挂载点？
+	// 找挂载点,在开始的时候跟踪挂载
 	if (unlikely(flags & LOOKUP_DOWN) && !IS_ERR(s)) {
 		err = handle_lookup_down(nd);
 		if (unlikely(err < 0))
 			s = ERR_PTR(err);
 	}
 
-    // 开始遍历
+	// 开始遍历
 	while (!(err = link_path_walk(s, nd)) &&
 	       (s = lookup_last(nd)) != NULL)
 		;
 
-    // 找挂载点？
+	// 找挂载点,在结束的时候跟踪挂载
 	if (!err && unlikely(nd->flags & LOOKUP_MOUNTPOINT)) {
 		err = handle_lookup_down(nd);
 		nd->flags &= ~LOOKUP_JUMPED; // no d_weak_revalidate(), please...
@@ -66,82 +84,89 @@ static int path_lookupat(struct nameidata *nd, unsigned flags, struct path *path
 	if (!err)
 		err = complete_walk(nd);
 
-    // 如果找的是目录，则进行判断
+	// 如果找的是目录，则进行判断
 	if (!err && nd->flags & LOOKUP_DIRECTORY)
 		if (!d_can_lookup(nd->path.dentry))
 			err = -ENOTDIR;
 
-    // 如果没有出错就把找到的结果放到path中
+	// 如果没有出错就把找到的结果放到path中
 	if (!err) {
 		*path = nd->path;
 		nd->path.mnt = NULL;
 		nd->path.dentry = NULL;
 	}
-    // 结束遍历，这个函数要和path_init成对使用
+	// 结束遍历，这个函数要和path_init成对使用
 	terminate_walk(nd);
 	return err;
 }
 ```
-上面代码中主要有两个函数：path_init和link_path_walk。  
+上面代码中的主要函数:
 path_init将开始要查找的路径设置好，我们平时输文件名的时候有绝对路径和相对路径，也就是以"/"开始和不以"/"开始，在task里有数据结构记录当前进程的工作目录和根目录，所以path_init就根据要找的文件名设置好nd中的相关数据。  
 link_path_walk是主要的遍历过程，在这函数里会根据每个目录的名字，找到对应的dentry, inode数据结构，先在内存里找这些数据，如果内存里没有就从磁盘上读。  
+handle_lookup_down是跟踪挂载点,如果当前结点是挂载点的话,就会进入到新的文件系统里.
+
 下面是代码：
 ```c
 static const char *path_init(struct nameidata *nd, unsigned flags)
 {
 	int error;
-    // 取出要查找的文件名
+	// 取出要查找的文件名
 	const char *s = nd->name->name;
 
+	// todo: ?
 	if (!*s)
 		flags &= ~LOOKUP_RCU;
-    // 代码里有些rcu相关的代码路径，我们只看普通的代码路径，比较好理解
+
+	// 如果是rcu需要先获取读锁
 	if (flags & LOOKUP_RCU)
 		rcu_read_lock();
 
 	nd->flags = flags | LOOKUP_JUMPED;
 	nd->depth = 0;
 
+	// 顺序锁的计数
 	nd->m_seq = __read_seqcount_begin(&mount_lock.seqcount);
 	nd->r_seq = __read_seqcount_begin(&rename_lock.seqcount);
 	smp_rmb();
 
-    // 如果标志里明确要找的是根目录
+	// 如果标志里明确要从根目录找
 	if (flags & LOOKUP_ROOT) {
-        // 根目录的dentry
+		// 根目录的dentry
 		struct dentry *root = nd->root.dentry;
-        // 根目录的inode
+		// 根目录的inode
 		struct inode *inode = root->d_inode;
 
-        // 如果root不是目录类型，则出错
-        // todo: 什么时候根结点不是目录？
+		// 如果root不是目录类型，则出错
+		// d_can_lookup判断dentry类型是不是DCACHE_DIRECTORY_TYPE
+		// todo: 什么时候根结点不是目录？
 		if (*s && unlikely(!d_can_lookup(root)))
 			return ERR_PTR(-ENOTDIR);
         
-        // 设置root的path和inode
+		// 设置当前目录为根节点
 		nd->path = nd->root;
 		nd->inode = inode;
 		if (flags & LOOKUP_RCU) {
+			// 如果是rcu,获取现在的顺序号,后面和这个序号比对,如果序号不一致,则表示读
+			// 到的值变了
 			nd->seq = read_seqcount_begin(&nd->path.dentry->d_seq);
 			nd->root_seq = nd->seq;
 		} else {
+			// 普通路径获取引用计数
 			path_get(&nd->path);
 		}
-        // 返回文件名
+        	// 返回文件名
 		return s;
 	}
 
-    // 如果没有LOOKUP_ROOT的标志就得从文件名里判断是要从根目录
-    // 找还是从当前目录找
+	// 如果没有LOOKUP_ROOT的标志就得从文件名里判断是要从根目录找还是从当前目录找
 	nd->root.mnt = NULL;
 	nd->path.mnt = NULL;
 	nd->path.dentry = NULL;
 
-	/* Absolute pathname -- fetch the root (LOOKUP_IN_ROOT uses nd->dfd). */
-    // 如果是以'/'开头的路径，则是绝对路径
-    // todo: LOOKUP_IN_ROOT是啥？
+	// 如果是以'/'开头的路径，则是绝对路径,就表示从根目录开始找
+	// LOOKUP_IN_ROOT是把当前目录当做根目录
 	if (*s == '/' && !(flags & LOOKUP_IN_ROOT)) {
-        // nd_jump_root会设置nd里相关变量为当前进程根目录的dentry和对应的文件系统
+		// nd_jump_root会设置nd里相关变量为当前进程根目录的dentry和对应的文件系统
 		error = nd_jump_root(nd);
 		if (unlikely(error))
 			return ERR_PTR(error);
@@ -150,6 +175,7 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 
 	// 这里都是相对路径
 	if (nd->dfd == AT_FDCWD) {
+		// 设置为当前工作目录的path和inode
 		if (flags & LOOKUP_RCU) {
 			struct fs_struct *fs = current->fs;
 			unsigned seq;
@@ -161,43 +187,44 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 				nd->seq = __read_seqcount_begin(&nd->path.dentry->d_seq);
 			} while (read_seqcount_retry(&fs->seq, seq));
 		} else {
-            // 这个会设置当前进程工作目录的dentry和对应的文件系统
-            // 获取的是current->fs->pwd
+			// 这个会设置当前进程工作目录的dentry和对应的文件系统
+			// 获取的是current->fs->pwd
 			get_fs_pwd(current->fs, &nd->path);
 			nd->inode = nd->path.dentry->d_inode;
 		}
 	} else {
 		// 这个路径就是用户指定了相对路径
 
-        // 先找出用户指定路径的文件描述符结构
+		// 先找出用户指定路径的文件描述符结构
 		struct fd f = fdget_raw(nd->dfd);
 		struct dentry *dentry;
 
 		if (!f.file)
 			return ERR_PTR(-EBADF);
 
-        // 文件的dentry
+		// 文件的dentry
 		dentry = f.file->f_path.dentry;
 
-        // 指定的开始路径不是目录，则返回
+		// 指定的开始路径不是目录，则返回
 		if (*s && unlikely(!d_can_lookup(dentry))) {
 			fdput(f);
 			return ERR_PTR(-ENOTDIR);
 		}
 
-        // 设置开始目录的pach对象
+		// 设置开始目录的path对象和inode为特定文件的
 		nd->path = f.file->f_path;
 		if (flags & LOOKUP_RCU) {
 			nd->inode = nd->path.dentry->d_inode;
 			nd->seq = read_seqcount_begin(&nd->path.dentry->d_seq);
 		} else {
-            // 设置开始目录的inode
+			// 设置开始目录的inode
 			path_get(&nd->path);
 			nd->inode = nd->path.dentry->d_inode;
 		}
 		fdput(f);
 	}
 
+	// todo: what ?
 	/* For scoped-lookups we need to set the root to the dirfd as well. */
 	if (flags & LOOKUP_IS_SCOPED) {
 		nd->root = nd->path;
@@ -213,22 +240,26 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 
 static int nd_jump_root(struct nameidata *nd)
 {
+	// todo: ?
 	if (unlikely(nd->flags & LOOKUP_BENEATH))
 		return -EXDEV;
+	// LOOKUP_NO_XDEV 遍历路径没有挂载点?
 	if (unlikely(nd->flags & LOOKUP_NO_XDEV)) {
 		/* Absolute path arguments to path_init() are allowed. */
 		if (nd->path.mnt != NULL && nd->path.mnt != nd->root.mnt)
 			return -EXDEV;
 	}
 
-    // 因为在path_init里把nd->root.mnt置为null了，所以这个条件成立
+	// 根fs还没设置
 	if (!nd->root.mnt) {
-        // set_root会获取当前进程的根文件系统和根dentry,
-        // 获取的是current->fs->root
+		// set_root会获取当前进程的根文件系统和根dentry,
+		// 获取的是current->fs->root
 		int error = set_root(nd);
 		if (error)
 			return error;
 	}
+
+	// 下面是根据有无rcu采用不同方式设置nd的根节点和根inode
 	if (nd->flags & LOOKUP_RCU) {
 		struct dentry *d;
 		nd->path = nd->root;
@@ -238,13 +269,14 @@ static int nd_jump_root(struct nameidata *nd)
 		if (unlikely(read_seqcount_retry(&d->d_seq, nd->seq)))
 			return -ECHILD;
 	} else {
-        // 先释放原来的path
+		// 先释放原来的path
 		path_put(&nd->path);
-        // 设置新path和inode
+		// 设置path和inode为根节点的值
 		nd->path = nd->root;
 		path_get(&nd->path);
 		nd->inode = nd->path.dentry->d_inode;
 	}
+
 	nd->flags |= LOOKUP_JUMPED;
 	return 0;
 }
@@ -255,19 +287,20 @@ path_init把nd里开始查找的dentry, inode, 文件系统相关信息设置好
 ```c
 static int link_path_walk(const char *name, struct nameidata *nd)
 {
-	int depth = 0; // depth <= nd->depth
+	int depth = 0;
 	int err;
 
-    // 初始化类型和flags
+	// 初始化默认类型和flags, 默认是根结点,找的是父结点,在下面的遍历中会改
 	nd->last_type = LAST_ROOT;
 	nd->flags |= LOOKUP_PARENT;
 	if (IS_ERR(name))
 		return PTR_ERR(name);
     
-    // 如果路径以'/'开头，则跳过'/'，所以在路径中间加多个'/'是允许的
+	// 如果路径以'/'开头，则跳过'/'，所以在路径中间加多个'/'是允许的
 	while (*name=='/')
 		name++;
-    // 如果路径到头了，那直接返回
+
+	// 如果路径到头了，那直接返回
 	if (!*name)
 		return 0;
 
@@ -276,12 +309,17 @@ static int link_path_walk(const char *name, struct nameidata *nd)
 		u64 hash_len;
 		int type;
 
-        // map_loopup会检查对当前目录的EXEC权限
+		// map_loopup会检查对当前目录的EXEC权限
+		/* 权限校验的一般流程:
+			1. 如果是属主, 直接校验对就的权限
+			2. 否则,如果有acl, 先校验acl
+			3. acl通过后再校验rwe权限
+		*/
 		err = may_lookup(nd);
 		if (err)
 			return err;
 
-        /**
+		/**
 		 算出name中以'/'分隔的一个节点的hash值和节点长度。
 		 name是整个路径，比如/root/aaa, 由于在前面已经去掉了第一个'/'，
 		 所以第一次循环时，这里的name是 root/aaa, 
@@ -290,23 +328,30 @@ static int link_path_walk(const char *name, struct nameidata *nd)
 		*/
 		hash_len = hash_name(nd->path.dentry, name);
 
+		// 默认是正常结点
 		type = LAST_NORM;
 
 		// 这里会判断 '..' 和 '.'的情况
 		if (name[0] == '.') switch (hashlen_len(hash_len)) {
 			case 2:
+				// 2个都是 .
 				if (name[1] == '.') {
 					type = LAST_DOTDOT;
 					nd->flags |= LOOKUP_JUMPED;
 				}
 				break;
 			case 1:
+				// 只有一个点是当前目录
 				type = LAST_DOT;
 		}
 		if (likely(type == LAST_NORM)) {
-			// 如果是普通的文件名，则通过文件系统计算哈希值，如果文件系统支持的话
+			// 如果是普通的文件名
 			struct dentry *parent = nd->path.dentry;
+			// 去除跳转标志
 			nd->flags &= ~LOOKUP_JUMPED;
+
+			// DCACHE_OP_HASH表示文件系统有自己计算哈希值的方法，则通过
+			// 文件系统计算哈希值，如果文件系统支持的话
 			if (unlikely(parent->d_flags & DCACHE_OP_HASH)) {
 				struct qstr this = { { .hash_len = hash_len }, .name = name };
 				err = parent->d_op->d_hash(parent, &this);
@@ -317,14 +362,18 @@ static int link_path_walk(const char *name, struct nameidata *nd)
 			}
 		}
 
+		// 设置哈希值,名称和类型
 		nd->last.hash_len = hash_len;
 		nd->last.name = name;
 		nd->last_type = type;
 
+		// 字符串前进len个长度
 		name += hashlen_len(hash_len);
+		// 如果后面没有字符了,跳到ok
 		if (!*name)
 			goto OK;
 
+		// 走到这儿表示后面还有字符串
 		// 跳过路径后面多个 '/'，所以在路径里加多个'/'，也没事
 		do {
 			name++;
@@ -332,32 +381,40 @@ static int link_path_walk(const char *name, struct nameidata *nd)
 
 		
 		if (unlikely(!*name)) { // name是最后一个节点
-OK:
-			
-			/* pathname or trailing symlink, done */
+OK: // 遍历完成
 			if (!depth) {
+				// depth为0,表示没有软链接,则查找完成了
+
+				// 设置目录的uid和mod
 				nd->dir_uid = nd->inode->i_uid;
 				nd->dir_mode = nd->inode->i_mode;
+				// 去除找父目录的标志
 				nd->flags &= ~LOOKUP_PARENT;
 				return 0;
 			}
-			/* last component of nested symlink */
+			// 如果之前有软链接,则取出保存的未处理完的路径名
 			name = nd->stack[--depth].name;
+			// 获取nd对应的目录
 			link = walk_component(nd, 0);
-		} else { // name是中间节点
+		} else { 
+			// name是中间节点
 			link = walk_component(nd, WALK_MORE);
 		}
+
+		// link返回的是符号链接的值
 		if (unlikely(link)) { 
 			// 如果是个符号链接，则取出称号链接的值，继续循环
 			if (IS_ERR(link))
 				return PTR_ERR(link);
-			/* a symlink to follow */
+			// 先把以前的name保存到栈里
 			nd->stack[depth++].name = name;
+			// 因为这个节点是链接,则先处理链接
 			name = link;
 			continue;
 		}
+
+		// 不是个目录,则出错
 		if (unlikely(!d_can_lookup(nd->path.dentry))) {
-			// 搜索过程中出错，则返回
 			if (nd->flags & LOOKUP_RCU) {
 				if (!try_to_unlazy(nd))
 					return -ECHILD;
@@ -373,8 +430,9 @@ static const char *walk_component(struct nameidata *nd, int flags)
 	struct inode *inode;
 	unsigned seq;
 	
-	if (unlikely(nd->last_type != LAST_NORM)) { // 处理 '.'和'..'
-		// todo: 这个啥意思
+	// 如果不是正常路径, 则只有需要处理 . 和 ..
+	if (unlikely(nd->last_type != LAST_NORM)) { 
+		// todo: what?
 		if (!(flags & WALK_MORE) && nd->depth)
 			put_link(nd);
 		
@@ -410,7 +468,7 @@ static const char *handle_dots(struct nameidata *nd, int type)
 
 		// 如果还没设置根文件系统挂载信息，则设置为进程的根目录的文件系统
 		if (!nd->root.mnt) {
-			// set_root是设置 current->fs->root
+			// set_root是设置 nd的根目录为current->fs->root
 			error = ERR_PTR(set_root(nd));
 			if (error)
 				return error;
@@ -470,6 +528,7 @@ static struct dentry *follow_dotdot(struct nameidata *nd,
 
 		// choose_mountpoint会递规的把path设置成挂载点上一层目录和挂载点的文件系统
 		// 之所以要递规，是因为一个目录可能会挂载多个文件系统
+		// real_mount是通过struct vfsmount对象获取对应的struct mount结构
 		if (!choose_mountpoint(real_mount(nd->path.mnt),
 				       &nd->root, &path))
 			goto in_root;
@@ -499,11 +558,69 @@ in_root:
 	return NULL;
 }
 
+// 这里传下来的root是nd的root, path是用来做返回值的        
+static bool choose_mountpoint(struct mount *m, const struct path *root,
+			      struct path *path)
+{
+	bool found;
+
+	rcu_read_lock();
+	// 整个大循环是为了处理rcu
+	while (1) {
+		unsigned seq, mseq = read_seqbegin(&mount_lock);
+
+		// 选一个挂载点
+		found = choose_mountpoint_rcu(m, root, path, &seq);
+		if (unlikely(!found)) {
+			if (!read_seqretry(&mount_lock, mseq))
+				break;
+		} else {
+			// 这个函数主要是递增mount的引用计数
+			if (likely(__legitimize_path(path, seq, mseq)))
+				break;
+			rcu_read_unlock();
+			path_put(path);
+			rcu_read_lock();
+		}
+	}
+	rcu_read_unlock();
+	return found;
+}
+
+static bool choose_mountpoint_rcu(struct mount *m, const struct path *root,
+				  struct path *path, unsigned *seqp)
+{
+	// 判断m != m->mnt_parent;
+	while (mnt_has_parent(m)) {
+		// 文件系统挂载点的dentry
+		struct dentry *mountpoint = m->mnt_mountpoint;
+
+		// 设置成父文件系统
+		m = m->mnt_parent;
+
+		// 已到达进程的根目录,则不用找了
+		if (unlikely(root->dentry == mountpoint &&
+			     root->mnt == &m->mnt))
+			break;
+
+		// 挂载点不是该文件系统的根节点, 这种情况下挂载点可用?	
+		if (mountpoint != m->mnt.mnt_root) {
+			path->mnt = &m->mnt;
+			path->dentry = mountpoint;
+			*seqp = read_seqcount_begin(&mountpoint->d_seq);
+			return true;
+		}
+
+		// 走到这儿表示挂载点与根文件系统的根节点相同
+	}
+	return false;
+}
+
 static const char *step_into(struct nameidata *nd, int flags,
 		     struct dentry *dentry, struct inode *inode, unsigned seq)
 {
 	struct path path;
-	// handle_mounts会判断当前dentry是否是挂载点，如果是的话，则前进到挂载点里
+	// handle_mounts会判断当前dentry是否是挂载点，如果是的话，则前进到最后一个挂载点里
 	int err = handle_mounts(nd, dentry, &path, &inode, &seq);
 
 	if (err < 0)
@@ -525,6 +642,8 @@ static const char *step_into(struct nameidata *nd, int flags,
 		nd->seq = seq;
 		return NULL;
 	}
+
+	// 走到这儿表示是个符号链接
 	if (nd->flags & LOOKUP_RCU) {
 		/* make sure that d_is_symlink above matches inode */
 		if (read_seqcount_retry(&path.dentry->d_seq, seq))
@@ -533,7 +652,7 @@ static const char *step_into(struct nameidata *nd, int flags,
 		if (path.mnt == nd->path.mnt)
 			mntget(path.mnt);
 	}
-	// 走到这里说明是软连接，要跟踪到软链接里
+	// 走到这里说明是软连接，要跟踪到软链接里, 返回值是链接的字符串
 	return pick_link(nd, &path, inode, seq, flags);
 }
 
@@ -561,7 +680,7 @@ static inline int handle_mounts(struct nameidata *nd, struct dentry *dentry,
 	// 遍历挂载点，因为挂载点上可能会挂载多个文件系统，所以要前进到最后挂载的文件系统上
 	ret = traverse_mounts(path, &jumped, &nd->total_link_count, nd->flags);
 	
-	// jumped表示是不是跳到其它文件系统上了
+	// jumped表示跳到其它文件系统上了
 	if (jumped) {
 		if (unlikely(nd->flags & LOOKUP_NO_XDEV))
 			ret = -EXDEV;
@@ -596,7 +715,7 @@ static inline int traverse_mounts(struct path *path, bool *jumped,
 		return 0;
 	}
 
-	// 遍历挂载点已挂载的文件
+	// 遍历挂载点已挂载的文件, 最终的结果会返回到path里
 	return __traverse_mounts(path, flags, jumped, count, lookup_flags);
 }
 
@@ -609,7 +728,7 @@ static int __traverse_mounts(struct path *path, unsigned flags, bool *jumped,
 	int ret = 0;
 
 	while (flags & DCACHE_MANAGED_DENTRY) {
-		// todo: DCACHE_MANAGE_TRANSIT ??
+		// DCACHE_MANAGE_TRANSIT 管理访问, 每经过这个路径要调用文件系统来判断
 		if (flags & DCACHE_MANAGE_TRANSIT) {
 			ret = path->dentry->d_op->d_manage(path, false);
 			flags = smp_load_acquire(&path->dentry->d_flags);
@@ -619,7 +738,7 @@ static int __traverse_mounts(struct path *path, unsigned flags, bool *jumped,
 
 		// 如果是已经挂载的文件系统
 		if (flags & DCACHE_MOUNTED) {	// something's mounted on it..
-			// lookup_mnt是找到挂载到path目录上的文件系统
+			// lookup_mnt是找到第1个挂载到path目录上的文件系统
 			struct vfsmount *mounted = lookup_mnt(path);
 			if (mounted) {
 				// 这个分支是找到一个挂载在当前目录上的文件系统
@@ -637,15 +756,17 @@ static int __traverse_mounts(struct path *path, unsigned flags, bool *jumped,
 				// here we know it's positive
 				flags = path->dentry->d_flags;
 				need_mntput = true;
+
+				// 这里经过循环, 如果这个挂载点目录上还有挂载的文件系统,会一直前进到最后一个挂载的文件系统
 				continue;
 			}
 		}
 
-		// todo：DCACHE_NEED_AUTOMOUNT ？？
+		// 不需要处理自动挂载则退出
 		if (!(flags & DCACHE_NEED_AUTOMOUNT))
 			break;
 
-		// todo：如果这个文件系统没挂载，则自动挂载？
+		// 如果这个文件系统没挂载，则自动挂载
 		ret = follow_automount(path, count, lookup_flags);
 		flags = smp_load_acquire(&path->dentry->d_flags);
 		if (ret < 0)
@@ -669,6 +790,7 @@ static const char *pick_link(struct nameidata *nd, struct path *link,
 {
 	struct saved *last;
 	const char *res;
+	// 判断链接循环数据,防止无限循环,最大层级为40
 	int error = reserve_stack(nd, link, seq);
 
 	if (unlikely(error)) {
@@ -765,6 +887,9 @@ static struct dentry *lookup_fast(struct nameidata *nd,
 		status = d_revalidate(dentry, nd->flags);
 	}
 	if (unlikely(status <= 0)) {
+		// 出错
+
+		// 把dentry置无效
 		if (!status)
 			d_invalidate(dentry);
 		dput(dentry);
@@ -775,6 +900,7 @@ static struct dentry *lookup_fast(struct nameidata *nd,
 
 struct dentry *__d_lookup(const struct dentry *parent, const struct qstr *name)
 {
+	// 名字对应的哈希
 	unsigned int hash = name->hash;
 	// 根据hash算出哈希表的头指针
 	struct hlist_bl_head *b = d_hash(hash);
@@ -839,7 +965,8 @@ again:
 	dentry = d_alloc_parallel(dir, name, &wq);
 	if (IS_ERR(dentry))
 		return dentry;
-	if (unlikely(!d_in_lookup(dentry))) {	// 这个分支就是在上面申请内存的时候别人创建了一个dentry
+	// 判断dentry是否在lookup阶段,如果不是则有其他人操作了dentry?,新分配的dentry都有这个标志
+	if (unlikely(!d_in_lookup(dentry))) {	
 		// 验证dentry的合法性
 		int error = d_revalidate(dentry, flags);
 		if (unlikely(error <= 0)) {
