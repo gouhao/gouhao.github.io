@@ -179,7 +179,7 @@ struct ext4_extent {
 	__le32	ee_start_lo;	/* low 32 bits of physical block */
 };
 ```
-## 3. 创建文件流程
+## 2.3 创建文件流程
 1. 从父目录所在的组开始，找一个有空闲inode的组  
 2. 读inode-bitmap，找一个有空闲的位置  
 3. 加到父目录的文件里  
