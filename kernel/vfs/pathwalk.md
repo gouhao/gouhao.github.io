@@ -8,7 +8,7 @@
 ```c
 // 在遍历路径是保存遍历过程中的数据及结果
 struct nameidata {
-	// 当前正在处理结点为的路径,里面有dentry和vfsmount
+	// 当前正在处理节点的父目录,里面有dentry和vfsmount
 	struct path	path;
 	// 当前正在处理节点的文件名
 	struct qstr	last;
@@ -71,7 +71,8 @@ static int path_lookupat(struct nameidata *nd, unsigned flags, struct path *path
 			s = ERR_PTR(err);
 	}
 
-	// 开始遍历
+	// 开始遍历，link_path_walk只获取中间节点的dentry,
+	// lookup_last获取最后一个节点的dentry
 	while (!(err = link_path_walk(s, nd)) &&
 	       (s = lookup_last(nd)) != NULL)
 		;

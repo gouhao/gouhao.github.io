@@ -47,7 +47,7 @@ Ts'o 将 ext4 描述为一个显著扩展 ext3 但仍然依赖于旧技术的临
 ext4 在功能上与 ext3 在功能上非常相似，但支持大文件系统，提高了对碎片的抵抗力，有更高的性能以及更好的时间戳。
 
 
-### 1.5 ext4 vs ext3
+### 2. 新增特性
 ext3 和 ext4 有一些非常明确的差别，在这里集中讨论下。
 
 1. 向后兼容性  
@@ -126,7 +126,7 @@ ext4 通过 e4defrag 解决了这个问题，且是一个在线、内核模式�
 
 你可以在[设计文档](https://ext4.wiki.kernel.org/index.php/Design_for_Large_Allocation_Blocks)中查看详细说明。
 
-## 2. 磁盘布局
+## 3. 磁盘布局
 ext4fs将磁盘分成一个个块组(block group)，如下：
 |group0|group1|group2|group3|....|
 |---|---|---|---|---|
@@ -135,7 +135,7 @@ ext4fs将磁盘分成一个个块组(block group)，如下：
 |---|---|---|---|---|---|---|---|
 |1 block|1 block|many blocks|many blocks|1 block|1 block|many blocks|many blocks|
 
-## 2.1 目录组织形式
+## 3.1 目录组织形式
 ```c
 struct ext4_dir_entry_2 {
 	__le32	inode;			/* inode号 */
@@ -150,7 +150,7 @@ struct ext4_dir_entry_2 {
 
 ```
 
-## 2.2 数据块的组织形式
+## 3.2 数据块的组织形式
 具体文件数据采用extent形式组织。数据结构上采用b+树来存储，根结点存在`struct ext4_inode_info->i_data`里。  
 叶子节点存储具体的extent数据，数据结构为`struct ext4_extent`。中间的节点为索引节点，数据结构为`struct ext4_extent_idx`。  
 每个索引或extent树的开头是`struct ext4_extent_header`，示例图：[https://blog.csdn.net/hu1610552336/article/details/128509011](https://blog.csdn.net/hu1610552336/article/details/128509011)。
@@ -179,18 +179,35 @@ struct ext4_extent {
 	__le32	ee_start_lo;	/* low 32 bits of physical block */
 };
 ```
-## 2.3 创建文件流程
+## 3.3 创建文件流程
 1. 从父目录所在的组开始，找一个有空闲inode的组  
 2. 读inode-bitmap，找一个有空闲的位置  
 3. 加到父目录的文件里  
 4. inode标脏，并把inode与dentry关联  
 
 
-## 2. 工具
+## 4. 工具
 
-### 2.1 mkfs.ext4/mke2fs
+### 4.1 mkfs.ext4/mke2fs
 大多系统上mkfs.ext4是指向mke2fs的软链接，mke2fs程序是制作ext2/3/4的用户层工具。
 
+```sh
+$ mkfs.ext4
+Usage: mkfs.ext4 [-c|-l filename] [-b block-size] [-C cluster-size]
+	[-i bytes-per-inode] [-I inode-size] [-J journal-options]
+	[-G flex-group-size] [-N number-of-inodes] [-d root-directory]
+	[-m reserved-blocks-percentage] [-o creator-os]
+	[-g blocks-per-group] [-L volume-label] [-M last-mounted-directory]
+	[-O feature[,...]] [-r fs-revision] [-E extended-option[,...]]
+	[-t fs-type] [-T usage-type ] [-U UUID] [-e errors_behavior][-z undo_file]
+	[-jnqvDFSV] device [blocks-count]
+
+-e:
+	continue    Continue normal execution.
+	remount-ro  Remount file system read-only.
+	panic       Cause a kernel panic.
+
+```
 1. 块大小1K
 ```sh
 # 创建一个120k块大小为1k的虚拟设备
@@ -234,7 +251,258 @@ Writing superblocks and filesystem accounting information: done
 
 ```
 
-### 2.2 dumpe2fs
+### 4.2 挂载选项
+```sh
+  ro
+        只读挂载. 当只读挂载时ext4会执行replay (因此会写入分区)。使用"ro,noload"可以避免写入分区
+
+  journal_checksum
+        使能校验日志事务。这将允许在e2fsck恢复代码，内核与会去检测错误. 这是一个兼容特性旧文件系统会忽略它
+
+  journal_async_commit
+        日志异步提交，写入磁盘时不等待描述块。这个使能后老内核无法挂载此设备，内部会使唤能'journal_checksum'
+
+  journal_path=path, journal_dev=devnum
+        指定一个额外的日志设备
+
+  norecovery, noload
+        挂载的时候不加载日志.  如果fs没有卸载干净，跳过日志重播会导致文件系统错误
+
+  data=journal
+        所有的数据在写入主文件系统之前先写入日志。使能这个将禁用延迟分配和O_DIRECT支持
+
+  data=ordered	(*)
+	所有的数据会强制直接写到主文件系统早于它的元数据提交到日志
+        All data are forced directly out to the main file system prior to its
+        metadata being committed to the journal.
+
+  data=writeback
+	数据顺序不确定。数据也许会在它的元数据已经提交到日志之后写入主文件系统
+        Data ordering is not preserved, data may be written into the main file
+        system after its metadata has been committed to the journal.
+
+  commit=nrsec	(*)
+        This setting limits the maximum age of the running transaction to
+        'nrsec' seconds.  The default value is 5 seconds.  This means that if
+        you lose your power, you will lose as much as the latest 5 seconds of
+        metadata changes (your filesystem will not be damaged though, thanks
+        to the journaling). This default value (or any low value) will hurt
+        performance, but it's good for data-safety.  Setting it to 0 will have
+        the same effect as leaving it at the default (5 seconds).  Setting it
+        to very large values will improve performance.  Note that due to
+        delayed allocation even older data can be lost on power failure since
+        writeback of those data begins only after time set in
+        /proc/sys/vm/dirty_expire_centisecs.
+
+  barrier=<0|1(*)>, barrier(*), nobarrier
+        This enables/disables the use of write barriers in the jbd code.
+        barrier=0 disables, barrier=1 enables.  This also requires an IO stack
+        which can support barriers, and if jbd gets an error on a barrier
+        write, it will disable again with a warning.  Write barriers enforce
+        proper on-disk ordering of journal commits, making volatile disk write
+        caches safe to use, at some performance penalty.  If your disks are
+        battery-backed in one way or another, disabling barriers may safely
+        improve performance.  The mount options "barrier" and "nobarrier" can
+        also be used to enable or disable barriers, for consistency with other
+        ext4 mount options.
+
+  inode_readahead_blks=n
+        This tuning parameter controls the maximum number of inode table blocks
+        that ext4's inode table readahead algorithm will pre-read into the
+        buffer cache.  The default value is 32 blocks.
+
+  nouser_xattr
+        Disables Extended User Attributes.  See the attr(5) manual page for
+        more information about extended attributes.
+
+  noacl
+        This option disables POSIX Access Control List support. If ACL support
+        is enabled in the kernel configuration (CONFIG_EXT4_FS_POSIX_ACL), ACL
+        is enabled by default on mount. See the acl(5) manual page for more
+        information about acl.
+
+  bsddf	(*)
+        Make 'df' act like BSD.
+
+  minixdf
+        Make 'df' act like Minix.
+
+  debug
+        Extra debugging information is sent to syslog.
+
+  abort
+        Simulate the effects of calling ext4_abort() for debugging purposes.
+        This is normally used while remounting a filesystem which is already
+        mounted.
+
+  errors=remount-ro
+        Remount the filesystem read-only on an error.
+
+  errors=continue
+        Keep going on a filesystem error.
+
+  errors=panic
+        Panic and halt the machine if an error occurs.  (These mount options
+        override the errors behavior specified in the superblock, which can be
+        configured using tune2fs)
+
+  data_err=ignore(*)
+        Just print an error message if an error occurs in a file data buffer in
+        ordered mode.
+  data_err=abort
+        Abort the journal if an error occurs in a file data buffer in ordered
+        mode.
+
+  grpid | bsdgroups
+        New objects have the group ID of their parent.
+
+  nogrpid (*) | sysvgroups
+        New objects have the group ID of their creator.
+
+  resgid=n
+        The group ID which may use the reserved blocks.
+
+  resuid=n
+        The user ID which may use the reserved blocks.
+
+  sb=
+        Use alternate superblock at this location.
+
+  quota, noquota, grpquota, usrquota
+        These options are ignored by the filesystem. They are used only by
+        quota tools to recognize volumes where quota should be turned on. See
+        documentation in the quota-tools package for more details
+        (http://sourceforge.net/projects/linuxquota).
+
+  jqfmt=<quota type>, usrjquota=<file>, grpjquota=<file>
+        These options tell filesystem details about quota so that quota
+        information can be properly updated during journal replay. They replace
+        the above quota options. See documentation in the quota-tools package
+        for more details (http://sourceforge.net/projects/linuxquota).
+
+  stripe=n
+        Number of filesystem blocks that mballoc will try to use for allocation
+        size and alignment. For RAID5/6 systems this should be the number of
+        data disks *  RAID chunk size in file system blocks.
+
+  delalloc	(*)
+        Defer block allocation until just before ext4 writes out the block(s)
+        in question.  This allows ext4 to better allocation decisions more
+        efficiently.
+
+  nodelalloc
+        Disable delayed allocation.  Blocks are allocated when the data is
+        copied from userspace to the page cache, either via the write(2) system
+        call or when an mmap'ed page which was previously unallocated is
+        written for the first time.
+
+  max_batch_time=usec
+        Maximum amount of time ext4 should wait for additional filesystem
+        operations to be batch together with a synchronous write operation.
+        Since a synchronous write operation is going to force a commit and then
+        a wait for the I/O complete, it doesn't cost much, and can be a huge
+        throughput win, we wait for a small amount of time to see if any other
+        transactions can piggyback on the synchronous write.   The algorithm
+        used is designed to automatically tune for the speed of the disk, by
+        measuring the amount of time (on average) that it takes to finish
+        committing a transaction.  Call this time the "commit time".  If the
+        time that the transaction has been running is less than the commit
+        time, ext4 will try sleeping for the commit time to see if other
+        operations will join the transaction.   The commit time is capped by
+        the max_batch_time, which defaults to 15000us (15ms).   This
+        optimization can be turned off entirely by setting max_batch_time to 0.
+
+  min_batch_time=usec
+        This parameter sets the commit time (as described above) to be at least
+        min_batch_time.  It defaults to zero microseconds.  Increasing this
+        parameter may improve the throughput of multi-threaded, synchronous
+        workloads on very fast disks, at the cost of increasing latency.
+
+  journal_ioprio=prio
+        The I/O priority (from 0 to 7, where 0 is the highest priority) which
+        should be used for I/O operations submitted by kjournald2 during a
+        commit operation.  This defaults to 3, which is a slightly higher
+        priority than the default I/O priority.
+
+  auto_da_alloc(*), noauto_da_alloc
+        Many broken applications don't use fsync() when replacing existing
+        files via patterns such as fd = open("foo.new")/write(fd,..)/close(fd)/
+        rename("foo.new", "foo"), or worse yet, fd = open("foo",
+        O_TRUNC)/write(fd,..)/close(fd).  If auto_da_alloc is enabled, ext4
+        will detect the replace-via-rename and replace-via-truncate patterns
+        and force that any delayed allocation blocks are allocated such that at
+        the next journal commit, in the default data=ordered mode, the data
+        blocks of the new file are forced to disk before the rename() operation
+        is committed.  This provides roughly the same level of guarantees as
+        ext3, and avoids the "zero-length" problem that can happen when a
+        system crashes before the delayed allocation blocks are forced to disk.
+
+  noinit_itable
+        Do not initialize any uninitialized inode table blocks in the
+        background.  This feature may be used by installation CD's so that the
+        install process can complete as quickly as possible; the inode table
+        initialization process would then be deferred until the next time the
+        file system is unmounted.
+
+  init_itable=n
+        The lazy itable init code will wait n times the number of milliseconds
+        it took to zero out the previous block group's inode table.  This
+        minimizes the impact on the system performance while file system's
+        inode table is being initialized.
+
+  discard, nodiscard(*)
+        Controls whether ext4 should issue discard/TRIM commands to the
+        underlying block device when blocks are freed.  This is useful for SSD
+        devices and sparse/thinly-provisioned LUNs, but it is off by default
+        until sufficient testing has been done.
+
+  nouid32
+        Disables 32-bit UIDs and GIDs.  This is for interoperability  with
+        older kernels which only store and expect 16-bit values.
+
+  block_validity(*), noblock_validity
+        These options enable or disable the in-kernel facility for tracking
+        filesystem metadata blocks within internal data structures.  This
+        allows multi- block allocator and other routines to notice bugs or
+        corrupted allocation bitmaps which cause blocks to be allocated which
+        overlap with filesystem metadata blocks.
+
+  dioread_lock, dioread_nolock
+        Controls whether or not ext4 should use the DIO read locking. If the
+        dioread_nolock option is specified ext4 will allocate uninitialized
+        extent before buffer write and convert the extent to initialized after
+        IO completes. This approach allows ext4 code to avoid using inode
+        mutex, which improves scalability on high speed storages. However this
+        does not work with data journaling and dioread_nolock option will be
+        ignored with kernel warning. Note that dioread_nolock code path is only
+        used for extent-based files.  Because of the restrictions this options
+        comprises it is off by default (e.g. dioread_lock).
+
+  max_dir_size_kb=n
+        This limits the size of directories so that any attempt to expand them
+        beyond the specified limit in kilobytes will cause an ENOSPC error.
+        This is useful in memory constrained environments, where a very large
+        directory can cause severe performance problems or even provoke the Out
+        Of Memory killer.  (For example, if there is only 512mb memory
+        available, a 176mb directory may seriously cramp the system's style.)
+
+  i_version
+        Enable 64-bit inode version support. This option is off by default.
+
+  dax
+        Use direct access (no page cache).  See
+        Documentation/filesystems/dax.txt.  Note that this option is
+        incompatible with data=journal.
+
+  inlinecrypt
+        When possible, encrypt/decrypt the contents of encrypted files using the
+        blk-crypto framework rather than filesystem-layer encryption. This
+        allows the use of inline encryption hardware. The on-disk format is
+        unaffected. For more details, see
+        Documentation/block/inline-encryption.rst.
+```
+
+### 4.3 dumpe2fs
 该命令用于查看设备上运行的ext系列文件系统(ext2/3/4)的各项信息。输出中的各项参数信息可以分为两部分，上半部分是超级块（Super Block）中包含的各项参数
 信息，下半部分是各个块组（Block Group）的各项参数信息。
 
@@ -398,14 +666,14 @@ Group 0: (Blocks 1-4095) csum 0xb4a4 [ITABLE_ZEROED]
   Free blocks: 1202-4095
   Free inodes: 12-1024
 ```
-### 2.3 fsck.ext4
+### 4.4 fsck.ext4
 ```sh
 $ fsck.ext4 ext4dev 
 e2fsck 1.44.5 (15-Dec-2018)
 ext4dev: clean, 11/16 files, 21/120 blocks
 ```
 
-### 2.4 通过hexdump查看磁盘数据
+### 4.5 通过hexdump查看磁盘数据
 ```sh
 $ hexdump -s 1024 -n 1024 ext4img -C
 00000400  10 27 00 00 40 9c 00 00  d0 07 00 00 3f 84 00 00  |.'..@.......?...|
