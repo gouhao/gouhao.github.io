@@ -225,7 +225,7 @@ void lru_cache_add(struct page *page)
 	pvec = this_cpu_ptr(&lru_pvecs.lru_add);
 
 	// pagevec_add返回0, 说明数组里没空间了
-	// 没空间 || 是组合页
+	// 没空间 || 是组合页,则添加到全局lru列表
 	if (!pagevec_add(pvec, page) || PageCompound(page))
 		__pagevec_lru_add(pvec);
 	local_unlock(&lru_pvecs.lock);

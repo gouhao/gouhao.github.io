@@ -74,7 +74,7 @@ static void wb_wakeup(struct bdi_writeback *wb)
 ```
 
 ## wb_check_start_all
-wb_check_start_all在wb_do_writeback里调用
+wb_check_start_all在 wb_do_writeback 里调用
 ```c
 // wb_check_start_all处理wakeup_flusher_threads发出的请求
 static long wb_check_start_all(struct bdi_writeback *wb)

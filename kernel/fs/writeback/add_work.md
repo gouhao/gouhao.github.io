@@ -410,7 +410,7 @@ restart:
 			last_wb = NULL;
 		}
 
-		// wb没有脏inode，dirty_time列表也是空，则不给这个wb里放
+		// wb没有进行脏io，dirty_time列表也是空，则不给这个wb里放
 		// 因为可能不会进行回写，或者回写会很晚
 		if (!wb_has_dirty_io(wb) &&
 		    (base_work->sync_mode == WB_SYNC_NONE ||
