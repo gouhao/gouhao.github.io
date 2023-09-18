@@ -135,6 +135,50 @@ ext4fs将磁盘分成一个个块组(block group)，如下：
 |---|---|---|---|---|---|---|---|
 |1 block|1 block|many blocks|many blocks|1 block|1 block|many blocks|many blocks|
 
+## 2.1 目录组织形式
+```c
+struct ext4_dir_entry_2 {
+	__le32	inode;			/* inode号 */
+	__le16	rec_len;		/* entry长度 */
+	__u8	name_len;		/* 文件长度 */
+	__u8	file_type;		/* 文件类型 */
+	char	name[EXT4_NAME_LEN];	/* 文件名 */
+};
+每个目录文件里的数据存储的是`struct ext4_dir_entry_2`结构，在搜索时按照文件名比对，然后找到对应文件的inode。
+
+为了加速文件查找，ext4引入了新特性，把目录的形式组织成了哈希表，key是具体文件名的哈希值，value是对应的数据块。
+
+```
+
+## 2.2 数据块的组织形式
+具体文件数据采用extent形式组织。数据结构上采用b+树来存储，根结点存在`struct ext4_inode_info->i_data`里。  
+叶子节点存储具体的extent数据，数据结构为`struct ext4_extent`。中间的节点为索引节点，数据结构为`struct ext4_extent_idx`。  
+每个索引或extent树的开头是`struct ext4_extent_header`，示例图：[https://blog.csdn.net/hu1610552336/article/details/128509011](https://blog.csdn.net/hu1610552336/article/details/128509011)。
+
+```c
+struct ext4_extent_header {
+	__le16	eh_magic;	/* probably will support different formats */
+	__le16	eh_entries;	/* number of valid entries */
+	__le16	eh_max;		/* capacity of store in entries */
+	__le16	eh_depth;	/* has tree real underlying blocks? */
+	__le32	eh_generation;	/* generation of the tree */
+};
+
+struct ext4_extent_idx {
+	__le32	ei_block;	/* index covers logical blocks from 'block' */
+	__le32	ei_leaf_lo;	/* pointer to the physical block of the next *
+				 * level. leaf or next index could be there */
+	__le16	ei_leaf_hi;	/* high 16 bits of physical block */
+	__u16	ei_unused;
+};
+
+struct ext4_extent {
+	__le32	ee_block;	/* first logical block extent covers */
+	__le16	ee_len;		/* number of blocks covered by extent */
+	__le16	ee_start_hi;	/* high 16 bits of physical block */
+	__le32	ee_start_lo;	/* low 32 bits of physical block */
+};
+```
 ## 3. 创建文件流程
 1. 从父目录所在的组开始，找一个有空闲inode的组  
 2. 读inode-bitmap，找一个有空闲的位置  
@@ -359,6 +403,20 @@ Group 0: (Blocks 1-4095) csum 0xb4a4 [ITABLE_ZEROED]
 $ fsck.ext4 ext4dev 
 e2fsck 1.44.5 (15-Dec-2018)
 ext4dev: clean, 11/16 files, 21/120 blocks
+```
+
+### 2.4 通过hexdump查看磁盘数据
+```sh
+$ hexdump -s 1024 -n 1024 ext4img -C
+00000400  10 27 00 00 40 9c 00 00  d0 07 00 00 3f 84 00 00  |.'..@.......?...|
+00000410  05 27 00 00 01 00 00 00  00 00 00 00 00 00 00 00  |.'..............|
+00000420  00 20 00 00 00 20 00 00  d0 07 00 00 bf c2 ff 64  |. ... .........d|
+00000430  bf c2 ff 64 01 00 ff ff  53 ef 01 00 01 00 00 00  |...d....S.......|
+00000440  ba c2 ff 64 00 00 00 00  00 00 00 00 01 00 00 00  |...d............|
+00000450  00 00 00 00 0b 00 00 00  80 00 00 00 3c 00 00 00  |............<...|
+00000460  c6 02 00 00 7b 00 00 00  8f e0 89 81 a7 52 40 fb  |....{........R@.|
+00000470  94 17 bc 2c 1e ed 47 dc  00 00 00 00 00 00 00 00  |...,..G.........|
+00000480  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
 ```
 
 
