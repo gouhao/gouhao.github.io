@@ -652,4 +652,179 @@ $ hexdump -s 1024 -n 1024 ext4img -C
 00000480  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
 ```
 
+## 5. 通过设置查看fs信息
+```sh
 
+$ dd if=/dev/zero of=img bs=4k count=100
+100+0 records in
+100+0 records out
+409600 bytes (410 kB, 400 KiB) copied, 0.000535364 s, 765 MB/s
+
+$ mkfs.ext4 img 
+mke2fs 1.46.5 (30-Dec-2021)
+
+Filesystem too small for a journal
+Discarding device blocks: done                            
+Creating filesystem with 100 4k blocks and 64 inodes
+
+Allocating group tables: done                            
+Writing inode tables: done                            
+Writing superblocks and filesystem accounting information: done
+
+$ mkdir mp && mount img mp
+
+# 创建一个文件
+$ echo hello > mp/testfile
+```
+
+### 5.1 查看目录里的文件信息
+我们创建的文件系统只有一个目录就是根目录，ext4的根目录ino是2，固定的。  
+我们要想查看目录里的文件信息，就得知道目录的数据块号，不管是文件还是目录的数据块号都在inode里存着。ext4的inode信息在inodes-table里，我们通过`dumpe2fs`来查看相关信息。
+```sh
+$ dumpe2fs img 
+... # 省略了大量与本情景无关的信息
+Block size:               4096
+Fragment size:            4096
+...
+Inode size:               256
+...
+
+
+Group 0: (Blocks 0-99) csum 0xe2bf [ITABLE_ZEROED]
+  Primary superblock at 0, Group descriptors at 1-1
+  Block bitmap at 2 (+2), csum 0x41b9c9c1
+  Inode bitmap at 18 (+18), csum 0x5c403384
+  Inode table at 34-37 (+34)
+  85 free blocks, 52 free inodes, 2 directories, 52 unused inodes
+  Free blocks: 9-17, 19-33, 39-99
+  Free inodes: 13-64
+```
+从上面可以看出，块大小4k，inode结构的大小256，inode-table在第34个块上，所以根目录的inode结构起点为：  
+34*4096+(2-1)*256=139520，因为块号是从0开始的，所以2要减1。
+
+使用`hexdump`来查看盘上的数据：
+```sh
+# -s是跳过多少字符，-n是显示多少字节
+$ hexdump -s 139520 -n 256 img 
+0022100 41ed 0000 1000 0000 a90f 6509 a920 6509
+0022110 a920 6509 0000 0000 0000 0003 0008 0000
+0022120 0000 0008 0001 0000 f30a 0001 0004 0000
+0022130 0000 0000 0000 0000 0001 0000 0003 0000
+0022140 0000 0000 0000 0000 0000 0000 0000 0000
+* # 中间省略的都是0
+0022170 0000 0000 0000 0000 0000 0000 cbf5 0000
+0022180 0020 eda5 2f1c 5fc8 2f1c 5fc8 f3a0 0398
+0022190 a8c2 6509 0000 0000 0000 0000 0000 0000
+00221a0 0000 0000 0000 0000 0000 0000 0000 0000
+*
+0022200
+```
+然后对着`struct ext4_inode`来看一下具体的数据:
+```c
+struct ext4_inode {
+	__le16	i_mode;	// 文件模式：0x41ed
+	__le16	i_uid;	// uid: 0x0000，也就是root用户
+	__le32	i_size_lo; // 文件大小：0x00000001，注意：ext4是小端，高16位在后。
+	__le32	i_atime; // 访问时间：0x6509a90f=1695131919=2023年 09月 19日 星期二 21:58:39 CST
+	__le32	i_ctime; // 元数据修改时间：0x6509a920
+	__le32	i_mtime; // 内容修改时间：0x6509a920
+	__le32	i_dtime; // 删除时间：0x00000000
+	__le16	i_gid;	// gid: 0x0000
+	__le16	i_links_count; // 链接数：0x0003
+	__le32	i_blocks_lo; // 块数量：0x00000008
+	__le32	i_flags; // 标志：0x00080000
+	union {
+		struct {
+			__le32  l_i_version;
+		} linux1;
+		struct {
+			__u32  h_i_translator;
+		} hurd1;
+		struct {
+			__u32  m_i_reserved1;
+		} masix1;
+	} osd1;	// 这个联合体不知道存的啥：0x00000001
+
+	/* 
+	数据块这里要大书特书！
+
+	EXT4_N_BLOCKS是15，i_block的长度一共是60字节。
+	ext4例用extent存储数据。简单说一下extent，extent由ext4_extent_header，ext4_extent_idx，ext4_extent来组织，
+	每个块（注意这里的块说的是存extent信息的块，不是存文件数据的数据块）块头第一个数据是header，紧接着可以存idx或者extent，
+	如果该块是叶子节点就存extent，如果是中间节点就存idx，关于extent详细可以看网上有关文章。
+
+	header,idx,extent这3个结构都是12字节，所以i_block可以存一个header和4个idx或extent。
+	在我们这个情景中，由于是新建的文件，所以i_block里存的就是叶子结点也就是extent。
+
+	对照上面盘上的数据，下面分别列出header和extent的数据
+	struct ext4_extent_header {
+		__le16	eh_magic; // 魔数：0xf30a，这是写死的
+		__le16	eh_entries; // 块已有的entry数量：0x0001
+		__le16	eh_max;	// 块最大可放entry数量：0x0004，i_block只能放4个
+		__le16	eh_depth; // 树深度：0x0000，它相当于是根节点，所以是第0层
+		__le32	eh_generation; // 树的年代：0x00000000，不知道啥是年代
+	};
+
+	struct ext4_extent {
+		__le32	ee_block; // 逻辑块起点：0x00000000
+		__le16	ee_len;	// extent长度：0x0001，extent里只有一个块
+		__le16	ee_start_hi; // 物理块号高16位：0x0000
+		__le32	ee_start_lo; // 物理块号的低32位：0x00000003，这就是根目录数据块的块号
+	};
+	*/
+	__le32	i_block[EXT4_N_BLOCKS]; 
+
+
+	// 我们已经找到了根目录所在的数据块，后面的数据不一一对照了，有兴趣的自己查看，
+	__le32	i_generation;	/* File version (for NFS) */
+	__le32	i_file_acl_lo;	/* File ACL */
+	__le32	i_size_high;
+	__le32	i_obso_faddr;	/* Obsoleted fragment address */
+	union {
+		struct {
+			__le16	l_i_blocks_high; /* were l_i_reserved1 */
+			__le16	l_i_file_acl_high;
+			__le16	l_i_uid_high;	/* these 2 fields */
+			__le16	l_i_gid_high;	/* were reserved2[0] */
+			__le16	l_i_checksum_lo;/* crc32c(uuid+inum+inode) LE */
+			__le16	l_i_reserved;
+		} linux2;
+		struct {
+			__le16	h_i_reserved1;	/* Obsoleted fragment number/size which are removed in ext4 */
+			__u16	h_i_mode_high;
+			__u16	h_i_uid_high;
+			__u16	h_i_gid_high;
+			__u32	h_i_author;
+		} hurd2;
+		struct {
+			__le16	h_i_reserved1;	/* Obsoleted fragment number/size which are removed in ext4 */
+			__le16	m_i_file_acl_high;
+			__u32	m_i_reserved2[2];
+		} masix2;
+	} osd2;				/* OS dependent 2 */
+	__le16	i_extra_isize;
+	__le16	i_checksum_hi;	/* crc32c(uuid+inum+inode) BE */
+	__le32  i_ctime_extra;  /* extra Change time      (nsec << 2 | epoch) */
+	__le32  i_mtime_extra;  /* extra Modification time(nsec << 2 | epoch) */
+	__le32  i_atime_extra;  /* extra Access time      (nsec << 2 | epoch) */
+	__le32  i_crtime;       /* File Creation time */
+	__le32  i_crtime_extra; /* extra FileCreationtime (nsec << 2 | epoch) */
+	__le32  i_version_hi;	/* high 32 bits for 64-bit version */
+	__le32	i_projid;	/* Project ID */
+};
+```
+根目录数据块号为3，所以块起点为：
+3*4096=12288
+
+```sh
+# 这里我加了-C参数，可以把每个byte对应的字符打印出来，方便查看
+$ hexdump -s 12288 -n 256 -C img 
+00003000  02 00 00 00 0c 00 01 02  2e 00 00 00 02 00 00 00  |................|
+00003010  0c 00 02 02 2e 2e 00 00  0b 00 00 00 14 00 0a 02  |................|
+00003020  6c 6f 73 74 2b 66 6f 75  6e 64 00 00 0c 00 00 00  |lost+found......|
+00003030  c8 0f 08 01 74 65 73 74  66 69 6c 65 00 00 00 00  |....testfile....|
+00003040  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00003100
+root@gouhao-pc:/home/gouhao/tmp/ext4test# 
+```
