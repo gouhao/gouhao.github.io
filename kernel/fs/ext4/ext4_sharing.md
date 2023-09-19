@@ -273,38 +273,21 @@ Writing superblocks and filesystem accounting information: done
 
   data=ordered	(*)
 	所有的数据会强制直接写到主文件系统早于它的元数据提交到日志
-        All data are forced directly out to the main file system prior to its
-        metadata being committed to the journal.
 
   data=writeback
 	数据顺序不确定。数据也许会在它的元数据已经提交到日志之后写入主文件系统
-        Data ordering is not preserved, data may be written into the main file
-        system after its metadata has been committed to the journal.
 
   commit=nrsec	(*)
-        This setting limits the maximum age of the running transaction to
-        'nrsec' seconds.  The default value is 5 seconds.  This means that if
-        you lose your power, you will lose as much as the latest 5 seconds of
-        metadata changes (your filesystem will not be damaged though, thanks
-        to the journaling). This default value (or any low value) will hurt
-        performance, but it's good for data-safety.  Setting it to 0 will have
-        the same effect as leaving it at the default (5 seconds).  Setting it
-        to very large values will improve performance.  Note that due to
-        delayed allocation even older data can be lost on power failure since
-        writeback of those data begins only after time set in
-        /proc/sys/vm/dirty_expire_centisecs.
+        这个设置限制运行中事务的最大年龄到nrsec秒。默认是5秒。这意味着如果断电你将丢失最多5
+	秒的元数据改变（文件系统不会损坏）。这个默认值（或更低的值）将对性能产生影响，但是对数据
+	安全有好处。把这个值设为0时，也是默认值5秒。把它设成一个很大的值会提高性能。注意：由于延迟
+	分配的原因，老的数据可能会在掉电后丢失，因为它要等待回写。
 
   barrier=<0|1(*)>, barrier(*), nobarrier
-        This enables/disables the use of write barriers in the jbd code.
-        barrier=0 disables, barrier=1 enables.  This also requires an IO stack
-        which can support barriers, and if jbd gets an error on a barrier
-        write, it will disable again with a warning.  Write barriers enforce
-        proper on-disk ordering of journal commits, making volatile disk write
-        caches safe to use, at some performance penalty.  If your disks are
-        battery-backed in one way or another, disabling barriers may safely
-        improve performance.  The mount options "barrier" and "nobarrier" can
-        also be used to enable or disable barriers, for consistency with other
-        ext4 mount options.
+	这个参数用来使能或禁用写屏障在jdb代码里。0禁用，1使能。这需要io栈支持屏障，如果jbd
+	在写屏障获得一个错误，它将被禁用并打印一个warning.写屏障会强制日志提交的合适顺序，让
+	写缓存能安全的使用在同样的性能处罚。如果你的磁盘有后背蓄电池，禁用屏障也许能安全的提高
+	性能。"barrier"和"nobarrier"也能使能或禁用屏障。
 
   inode_readahead_blks=n
         This tuning parameter controls the maximum number of inode table blocks
@@ -316,10 +299,7 @@ Writing superblocks and filesystem accounting information: done
         more information about extended attributes.
 
   noacl
-        This option disables POSIX Access Control List support. If ACL support
-        is enabled in the kernel configuration (CONFIG_EXT4_FS_POSIX_ACL), ACL
-        is enabled by default on mount. See the acl(5) manual page for more
-        information about acl.
+        禁用访问控制列表。如果CONFIG_EXT4_FS_POSIX_ACL使能了，那ACL是默认使能的。
 
   bsddf	(*)
         Make 'df' act like BSD.
@@ -328,73 +308,58 @@ Writing superblocks and filesystem accounting information: done
         Make 'df' act like Minix.
 
   debug
-        Extra debugging information is sent to syslog.
+	额外的调试信息会被发到syslog。
 
   abort
-        Simulate the effects of calling ext4_abort() for debugging purposes.
-        This is normally used while remounting a filesystem which is already
-        mounted.
+	模拟调用ext4_abort()的效果为了调试目的。当已挂载一个fs后也可以使用abort。
 
   errors=remount-ro
-        Remount the filesystem read-only on an error.
+        当出现错误后把fs重新挂载为只读。
 
   errors=continue
-        Keep going on a filesystem error.
+        当fs出现错误后继续执行。
 
   errors=panic
-        Panic and halt the machine if an error occurs.  (These mount options
-        override the errors behavior specified in the superblock, which can be
-        configured using tune2fs)
+	当错误出现时panic并停止机器。这个挂载选项会覆盖在超级块里指定的值，可以用tune2fs来配置。
 
   data_err=ignore(*)
-        Just print an error message if an error occurs in a file data buffer in
-        ordered mode.
+	在ordered模式时，如果文件数据发生错误只打印一个日志
   data_err=abort
-        Abort the journal if an error occurs in a file data buffer in ordered
-        mode.
+	ordered模式时，如果文件数据出错则使日志失败。
 
   grpid | bsdgroups
-        New objects have the group ID of their parent.
+	新对象的groupid从他的父目录来。
 
   nogrpid (*) | sysvgroups
-        New objects have the group ID of their creator.
+	新对象的groupid从它的创建者来。
 
   resgid=n
-        The group ID which may use the reserved blocks.
+	指定的groupid可以使用保留块。
 
   resuid=n
-        The user ID which may use the reserved blocks.
+        指定的userid可以使用保留块
 
   sb=
-        Use alternate superblock at this location.
+        使用替换的超级块
 
   quota, noquota, grpquota, usrquota
-        These options are ignored by the filesystem. They are used only by
-        quota tools to recognize volumes where quota should be turned on. See
-        documentation in the quota-tools package for more details
+	这些选项会被fs忽略，当quota打开时，它们只是被quota工具来识别卷。详情请看
         (http://sourceforge.net/projects/linuxquota).
 
   jqfmt=<quota type>, usrjquota=<file>, grpjquota=<file>
-        These options tell filesystem details about quota so that quota
-        information can be properly updated during journal replay. They replace
-        the above quota options. See documentation in the quota-tools package
-        for more details (http://sourceforge.net/projects/linuxquota).
+	这些选项告诉文件系统配额的详情，以便于quota信息能够在日志回放期间正确的更新。
+	它们会替换上面那些quato选项。详情(http://sourceforge.net/projects/linuxquota).
 
   stripe=n
-        Number of filesystem blocks that mballoc will try to use for allocation
-        size and alignment. For RAID5/6 systems this should be the number of
-        data disks *  RAID chunk size in file system blocks.
+	块数量，mballoc会用它来分配块大小和做对齐。对于RAID5／6来说这应该是数据盘数量＊RAID chunk size
+	的块数量。
 
   delalloc	(*)
-        Defer block allocation until just before ext4 writes out the block(s)
-        in question.  This allows ext4 to better allocation decisions more
-        efficiently.
+	推迟块的分配直到ext4写出数据块，这允许ext4做更有效的分配策略。
 
   nodelalloc
-        Disable delayed allocation.  Blocks are allocated when the data is
-        copied from userspace to the page cache, either via the write(2) system
-        call or when an mmap'ed page which was previously unallocated is
-        written for the first time.
+	禁用延迟分配。当数据从用户空间复制到pagecache时分配块。要么通过write系统调用要么通过
+	mmap第1次写时分配。
 
   max_batch_time=usec
         Maximum amount of time ext4 should wait for additional filesystem
