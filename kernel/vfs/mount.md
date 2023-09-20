@@ -4,6 +4,276 @@
 ## 简介
 挂载就是把设备上的根目录与系统中现有的目录关联，这样在访问挂载点时，就会通过挂载点目录进入设备上的文件系统。
 
+## mount
+```c
+SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
+		char __user *, type, unsigned long, flags, void __user *, data)
+{
+	int ret;
+	char *kernel_type;
+	char *kernel_dev;
+	void *options;
+
+	// 从用户空间复制类型
+	kernel_type = copy_mount_string(type);
+	ret = PTR_ERR(kernel_type);
+	if (IS_ERR(kernel_type))
+		goto out_type;
+
+	// 复制设备名
+	kernel_dev = copy_mount_string(dev_name);
+	ret = PTR_ERR(kernel_dev);
+	if (IS_ERR(kernel_dev))
+		goto out_dev;
+
+	// 复制挂载选项
+	options = copy_mount_options(data);
+	ret = PTR_ERR(options);
+	if (IS_ERR(options))
+		goto out_data;
+
+	// 正式挂载
+	ret = do_mount(kernel_dev, dir_name, kernel_type, flags, options);
+
+	kfree(options);
+out_data:
+	kfree(kernel_dev);
+out_dev:
+	kfree(kernel_type);
+out_type:
+	return ret;
+}
+
+long do_mount(const char *dev_name, const char __user *dir_name,
+		const char *type_page, unsigned long flags, void *data_page)
+{
+	struct path path;
+	int ret;
+
+	// 获取目录的路径
+	ret = user_path_at(AT_FDCWD, dir_name, LOOKUP_FOLLOW, &path);
+	if (ret)
+		return ret;
+	// 挂载
+	ret = path_mount(dev_name, &path, type_page, flags, data_page);
+	path_put(&path);
+	return ret;
+}
+
+int path_mount(const char *dev_name, struct path *path,
+		const char *type_page, unsigned long flags, void *data_page)
+{
+	unsigned int mnt_flags = 0, sb_flags;
+	int ret;
+
+	// 先去掉魔数：0xC0ED0000
+	if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
+		flags &= ~MS_MGC_MSK;
+
+	// 截断data数据到4096
+	if (data_page)
+		((char *)data_page)[PAGE_SIZE - 1] = 0;
+
+	// 不允许user挂载？
+	if (flags & MS_NOUSER)
+		return -EINVAL;
+
+	// 安全检查
+	ret = security_sb_mount(dev_name, path, type_page, flags, data_page);
+	if (ret)
+		return ret;
+	// 挂载需要CAP_SYS_ADMIN权限
+	if (!may_mount())
+		return -EPERM;
+	
+	// 强制锁也需要CAP_SYS_ADMIN权限
+	if ((flags & SB_MANDLOCK) && !may_mandlock())
+		return -EPERM;
+
+	// 下面都是标志转换
+	/* Default to relatime unless overriden */
+	if (!(flags & MS_NOATIME))
+		mnt_flags |= MNT_RELATIME;
+
+	/* Separate the per-mountpoint flags */
+	if (flags & MS_NOSUID)
+		mnt_flags |= MNT_NOSUID;
+	if (flags & MS_NODEV)
+		mnt_flags |= MNT_NODEV;
+	if (flags & MS_NOEXEC)
+		mnt_flags |= MNT_NOEXEC;
+	if (flags & MS_NOATIME)
+		mnt_flags |= MNT_NOATIME;
+	if (flags & MS_NODIRATIME)
+		mnt_flags |= MNT_NODIRATIME;
+	if (flags & MS_STRICTATIME)
+		mnt_flags &= ~(MNT_RELATIME | MNT_NOATIME);
+	if (flags & MS_RDONLY)
+		mnt_flags |= MNT_READONLY;
+	if (flags & MS_NOSYMFOLLOW)
+		mnt_flags |= MNT_NOSYMFOLLOW;
+
+	/* The default atime for remount is preservation */
+	if ((flags & MS_REMOUNT) &&
+	    ((flags & (MS_NOATIME | MS_NODIRATIME | MS_RELATIME |
+		       MS_STRICTATIME)) == 0)) {
+		mnt_flags &= ~MNT_ATIME_MASK;
+		mnt_flags |= path->mnt->mnt_flags & MNT_ATIME_MASK;
+	}
+
+	// 超级块标志参数？
+	sb_flags = flags & (SB_RDONLY |
+			    SB_SYNCHRONOUS |
+			    SB_MANDLOCK |
+			    SB_DIRSYNC |
+			    SB_SILENT |
+			    SB_POSIXACL |
+			    SB_LAZYTIME |
+			    SB_I_VERSION);
+
+	// 需要标志选择不同挂载类型
+	if ((flags & (MS_REMOUNT | MS_BIND)) == (MS_REMOUNT | MS_BIND))
+		return do_reconfigure_mnt(path, mnt_flags);
+	if (flags & MS_REMOUNT)
+		return do_remount(path, flags, sb_flags, mnt_flags, data_page);
+	if (flags & MS_BIND)
+		return do_loopback(path, dev_name, flags & MS_REC);
+	if (flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE))
+		return do_change_type(path, flags);
+	if (flags & MS_MOVE)
+		return do_move_mount_old(path, dev_name);
+
+	// 一般新挂载走这个流程
+	return do_new_mount(path, type_page, sb_flags, mnt_flags, dev_name,
+			    data_page);
+}
+
+static int do_new_mount(struct path *path, const char *fstype, int sb_flags,
+			int mnt_flags, const char *name, void *data)
+{
+	struct file_system_type *type;
+	struct fs_context *fc;
+	const char *subtype = NULL;
+	int err = 0;
+
+	// 类型名不能为空
+	if (!fstype)
+		return -EINVAL;
+
+	// 通过类型名找类型结构，如果当前还没注册，可能加载对应的模块
+	type = get_fs_type(fstype);
+	// 不支持这种fs
+	if (!type)
+		return -ENODEV;
+
+	// 需要子类型
+	if (type->fs_flags & FS_HAS_SUBTYPE) {
+		subtype = strchr(fstype, '.');
+		if (subtype) {
+			subtype++;
+			if (!*subtype) {
+				put_filesystem(type);
+				return -EINVAL;
+			}
+		}
+	}
+
+	// 分配fs_context
+	fc = fs_context_for_mount(type, sb_flags);
+	put_filesystem(type);
+	if (IS_ERR(fc))
+		return PTR_ERR(fc);
+
+	if (subtype)
+		err = vfs_parse_fs_string(fc, "subtype",
+					  subtype, strlen(subtype));
+	if (!err && name)
+		err = vfs_parse_fs_string(fc, "source", name, strlen(name));
+	if (!err)
+		err = parse_monolithic_mount_data(fc, data);
+	if (!err && !mount_capable(fc))
+		err = -EPERM;
+	if (!err)
+		err = vfs_get_tree(fc);
+	if (!err)
+		err = do_new_mount_fc(fc, path, mnt_flags);
+
+	put_fs_context(fc);
+	return err;
+}
+
+struct fs_context *fs_context_for_mount(struct file_system_type *fs_type,
+					unsigned int sb_flags)
+{
+	return alloc_fs_context(fs_type, NULL, sb_flags, 0,
+					// mount类型
+					FS_CONTEXT_FOR_MOUNT);
+}
+
+static struct fs_context *alloc_fs_context(struct file_system_type *fs_type,
+				      struct dentry *reference,
+				      unsigned int sb_flags,
+				      unsigned int sb_flags_mask,
+				      enum fs_context_purpose purpose)
+{
+	int (*init_fs_context)(struct fs_context *);
+	struct fs_context *fc;
+	int ret = -ENOMEM;
+
+	// 分配一个对象
+	fc = kzalloc(sizeof(struct fs_context), GFP_KERNEL_ACCOUNT);
+	if (!fc)
+		return ERR_PTR(-ENOMEM);
+
+	fc->purpose	= purpose;
+	fc->sb_flags	= sb_flags;
+	fc->sb_flags_mask = sb_flags_mask;
+	// 如果fs是模块，则会增加模块的引用计数
+	fc->fs_type	= get_filesystem(fs_type);
+	// 证书
+	fc->cred	= get_current_cred();
+	// 网络ns ?
+	fc->net_ns	= get_net(current->nsproxy->net_ns);
+	// 日志前缀，就是fs的名字
+	fc->log.prefix	= fs_type->name;
+
+	mutex_init(&fc->uapi_mutex);
+
+	// 根据目的选择不同的user_ns
+	switch (purpose) {
+	case FS_CONTEXT_FOR_MOUNT:
+		fc->user_ns = get_user_ns(fc->cred->user_ns);
+		break;
+	case FS_CONTEXT_FOR_SUBMOUNT:
+		fc->user_ns = get_user_ns(reference->d_sb->s_user_ns);
+		break;
+	case FS_CONTEXT_FOR_RECONFIGURE:
+		atomic_inc(&reference->d_sb->s_active);
+		fc->user_ns = get_user_ns(reference->d_sb->s_user_ns);
+		fc->root = dget(reference);
+		break;
+	}
+
+	// 获取fs的init_fs_context函数
+	init_fs_context = fc->fs_type->init_fs_context;
+
+	// 如果fs没有指定init_fs_context，则使用老的
+	if (!init_fs_context)
+		init_fs_context = legacy_init_fs_context;
+
+	// 初始化上下文
+	ret = init_fs_context(fc);
+	if (ret < 0)
+		goto err_fc;
+	fc->need_free = true;
+	return fc;
+
+err_fc:
+	put_fs_context(fc);
+	return ERR_PTR(ret);
+}
+
+```
 ## mount_bdev
 mount_bdev是挂载需要硬盘的文件系统。
 
