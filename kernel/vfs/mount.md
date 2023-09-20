@@ -184,17 +184,24 @@ static int do_new_mount(struct path *path, const char *fstype, int sb_flags,
 	if (IS_ERR(fc))
 		return PTR_ERR(fc);
 
+	// 子类解析
 	if (subtype)
 		err = vfs_parse_fs_string(fc, "subtype",
 					  subtype, strlen(subtype));
+	// todo: what is source?
 	if (!err && name)
 		err = vfs_parse_fs_string(fc, "source", name, strlen(name));
+	// 解析选项
 	if (!err)
 		err = parse_monolithic_mount_data(fc, data);
 	if (!err && !mount_capable(fc))
 		err = -EPERM;
+
+	// 获取目录树,fs一般在这里面做fs的初始化,获取根节点等
 	if (!err)
 		err = vfs_get_tree(fc);
+
+	// 创建挂载相关的联系
 	if (!err)
 		err = do_new_mount_fc(fc, path, mnt_flags);
 
@@ -257,7 +264,7 @@ static struct fs_context *alloc_fs_context(struct file_system_type *fs_type,
 	// 获取fs的init_fs_context函数
 	init_fs_context = fc->fs_type->init_fs_context;
 
-	// 如果fs没有指定init_fs_context，则使用老的
+	// 如果fs没有指定init_fs_context，则使用老的兼容老的接口
 	if (!init_fs_context)
 		init_fs_context = legacy_init_fs_context;
 
@@ -265,6 +272,7 @@ static struct fs_context *alloc_fs_context(struct file_system_type *fs_type,
 	ret = init_fs_context(fc);
 	if (ret < 0)
 		goto err_fc;
+	// 需要释放
 	fc->need_free = true;
 	return fc;
 
@@ -273,6 +281,521 @@ err_fc:
 	return ERR_PTR(ret);
 }
 
+static int legacy_init_fs_context(struct fs_context *fc)
+{
+	// 分配一个legacy_fs_context
+	fc->fs_private = kzalloc(sizeof(struct legacy_fs_context), GFP_KERNEL);
+	if (!fc->fs_private)
+		return -ENOMEM;
+	// 操作函数,这个在后面会调用
+	fc->ops = &legacy_fs_context_ops;
+	return 0;
+}
+
+const struct fs_context_operations legacy_fs_context_ops = {
+	.free			= legacy_fs_context_free,
+	.dup			= legacy_fs_context_dup,
+	.parse_param		= legacy_parse_param,
+	.parse_monolithic	= legacy_parse_monolithic,
+	.get_tree		= legacy_get_tree,
+	.reconfigure		= legacy_reconfigure,
+};
+```
+## 获取树
+```c
+int vfs_get_tree(struct fs_context *fc)
+{
+	struct super_block *sb;
+	int error;
+
+	// 已经读取根节点
+	if (fc->root)
+		return -EBUSY;
+
+	// 调用具体文件系统的get_tree
+	error = fc->ops->get_tree(fc);
+	if (error < 0)
+		return error;
+
+	// 没获取到根目录,正常文件系统不会的
+	if (!fc->root) {
+		pr_err("Filesystem %s get_tree() didn't set fc->root\n",
+		       fc->fs_type->name);
+		/* We don't know what the locking state of the superblock is -
+		 * if there is a superblock.
+		 */
+		BUG();
+	}
+
+	// 超级块
+	sb = fc->root->d_sb;
+
+	// bdi是后端设备
+	WARN_ON(!sb->s_bdi);
+
+	/*
+	 * Write barrier is for super_cache_count(). We place it before setting
+	 * SB_BORN as the data dependency between the two functions is the
+	 * superblock structure contents that we just set up, not the SB_BORN
+	 * flag.
+	 */
+	smp_wmb();
+	sb->s_flags |= SB_BORN;
+
+	// 安全相关检查
+	error = security_sb_set_mnt_opts(sb, fc->security, 0, NULL);
+	if (unlikely(error)) {
+		fc_drop_locked(fc);
+		return error;
+	}
+
+	/*
+	 * 文件系统应该永远不设置s_maxbytes大于MAX_LFS_FILESIZE,大多数发行版的s_maxbytes是
+	 * unsigned long long, 打印异常对于一些违反规则的文件系统.
+	 */
+	WARN((sb->s_maxbytes < 0), "%s set sb->s_maxbytes to "
+		"negative value (%lld)\n", fc->fs_type->name, sb->s_maxbytes);
+
+	return 0;
+}
+
+static int legacy_get_tree(struct fs_context *fc)
+{
+	struct legacy_fs_context *ctx = fc->fs_private;
+	struct super_block *sb;
+	struct dentry *root;
+
+	// 调用老的mount接口
+	root = fc->fs_type->mount(fc->fs_type, fc->sb_flags,
+				      fc->source, ctx->legacy_data);
+	// 获取root出错
+	if (IS_ERR(root))
+		return PTR_ERR(root);
+
+	// 超级块不能为空
+	sb = root->d_sb;
+	BUG_ON(!sb);
+
+	// 设置fc的根节点
+	fc->root = root;
+	return 0;
+}
+```
+## 参数解析
+```c
+int parse_monolithic_mount_data(struct fs_context *fc, void *data)
+{
+	int (*monolithic_mount_data)(struct fs_context *, void *);
+
+	// parse_monolithic是fs自己全部解析参数
+	monolithic_mount_data = fc->ops->parse_monolithic;
+	if (!monolithic_mount_data)
+		// 没有指定,就使用通用的解析
+		monolithic_mount_data = generic_parse_monolithic;
+
+	return monolithic_mount_data(fc, data);
+}
+```
+
+## do_new_mount_fc
+```c
+static int do_new_mount_fc(struct fs_context *fc, struct path *mountpoint,
+			   unsigned int mnt_flags)
+{
+	struct vfsmount *mnt;
+	struct mountpoint *mp;
+	struct super_block *sb = fc->root->d_sb;
+	int error;
+
+	// 安全检查
+	error = security_sb_kern_mount(sb);
+	// todo: mount_too_revealing?
+	if (!error && mount_too_revealing(sb, &mnt_flags))
+		error = -EPERM;
+
+	if (unlikely(error)) {
+		fc_drop_locked(fc);
+		return error;
+	}
+
+	up_write(&sb->s_umount);
+	// 创建sruct mount结构, 最终返回的是mount->mnt
+	mnt = vfs_create_mount(fc);
+	if (IS_ERR(mnt))
+		return PTR_ERR(mnt);
+
+	// 检查时间是否过了最大值
+	mnt_warn_timestamp_expiry(mountpoint, mnt);
+
+	// 找mnt, 
+	// 注意:这里传的mountpoint是path,这命名真是混乱
+	mp = lock_mount(mountpoint);
+	if (IS_ERR(mp)) {
+		mntput(mnt);
+		return PTR_ERR(mp);
+	}
+	// 添加到mount的各种数据结构网中
+	// real_mount是返回vfsmnt对应的mount结构
+	error = do_add_mount(real_mount(mnt), mp, mountpoint, mnt_flags);
+	unlock_mount(mp);
+	if (error < 0)
+		mntput(mnt);
+	return error;
+}
+
+struct vfsmount *vfs_create_mount(struct fs_context *fc)
+{
+	struct mount *mnt;
+
+	if (!fc->root)
+		return ERR_PTR(-EINVAL);
+
+	mnt = alloc_vfsmnt(fc->source ?: "none");
+	if (!mnt)
+		return ERR_PTR(-ENOMEM);
+
+	if (fc->sb_flags & SB_KERNMOUNT)
+		mnt->mnt.mnt_flags = MNT_INTERNAL;
+
+	atomic_inc(&fc->root->d_sb->s_active);
+	mnt->mnt.mnt_sb		= fc->root->d_sb;
+	mnt->mnt.mnt_root	= dget(fc->root);
+	mnt->mnt_mountpoint	= mnt->mnt.mnt_root;
+	mnt->mnt_parent		= mnt;
+
+	lock_mount_hash();
+	list_add_tail(&mnt->mnt_instance, &mnt->mnt.mnt_sb->s_mounts);
+	unlock_mount_hash();
+	return &mnt->mnt;
+}
+
+static struct mountpoint *lock_mount(struct path *path)
+{
+	struct vfsmount *mnt;
+	// 目录项
+	struct dentry *dentry = path->dentry;
+retry:
+	inode_lock(dentry->d_inode);
+	// 判断目录是否不能挂载,若是直接报错
+	if (unlikely(cant_mount(dentry))) {
+		inode_unlock(dentry->d_inode);
+		return ERR_PTR(-ENOENT);
+	}
+	namespace_lock();
+	mnt = lookup_mnt(path);
+	if (likely(!mnt)) {
+		struct mountpoint *mp = get_mountpoint(dentry);
+		if (IS_ERR(mp)) {
+			namespace_unlock();
+			inode_unlock(dentry->d_inode);
+			return mp;
+		}
+		return mp;
+	}
+	namespace_unlock();
+	inode_unlock(path->dentry->d_inode);
+	path_put(path);
+	path->mnt = mnt;
+	dentry = path->dentry = dget(mnt->mnt_root);
+	goto retry;
+}
+```
+
+## do_add_mount
+```c
+static int do_add_mount(struct mount *newmnt, struct mountpoint *mp /*挂载点结构*/,
+			struct path *path /*挂载点信息*/, int mnt_flags)
+{
+	// 挂载点的mount结构
+	struct mount *parent = real_mount(path->mnt);
+
+	// 删除挂载时内部用到的标志
+	mnt_flags &= ~MNT_INTERNAL_FLAGS;
+
+	// 检查当前进程的命名空间与父空间是否相等
+	if (unlikely(!check_mnt(parent))) {
+		/* that's acceptable only for automounts done in private ns */
+		if (!(mnt_flags & MNT_SHRINKABLE))
+			return -EINVAL;
+		/* ... and for those we'd better have mountpoint still alive */
+		if (!parent->mnt_ns)
+			return -EINVAL;
+	}
+
+	// 一个文件系统不能在同一个挂载点上挂多次
+	if (path->mnt->mnt_sb == newmnt->mnt.mnt_sb &&
+	    path->mnt->mnt_root == path->dentry)
+		return -EBUSY;
+
+	// 根节点不能是软链接
+	if (d_is_symlink(newmnt->mnt.mnt_root))
+		return -EINVAL;
+
+	newmnt->mnt.mnt_flags = mnt_flags;
+	return graft_tree(newmnt, parent, mp);
+}
+
+static int graft_tree(struct mount *mnt, struct mount *p, struct mountpoint *mp)
+{
+	// 用户层不能挂载则出错
+	if (mnt->mnt.mnt_sb->s_flags & SB_NOUSER)
+		return -EINVAL;
+	
+	// 挂载点和fs根目录必需都是目录
+	if (d_is_dir(mp->m_dentry) !=
+	      d_is_dir(mnt->mnt.mnt_root))
+		return -ENOTDIR;
+
+	// 递规添加,这个是真正添加到挂载相关的结构里的
+	return attach_recursive_mnt(mnt, p, mp, false);
+}
+
+static int attach_recursive_mnt(struct mount *source_mnt,
+			struct mount *dest_mnt,
+			struct mountpoint *dest_mp,
+			bool moving)
+{
+	// 进行命名空间
+	struct user_namespace *user_ns = current->nsproxy->mnt_ns->user_ns;
+	HLIST_HEAD(tree_list);
+	// 父mount的命名空间
+	struct mnt_namespace *ns = dest_mnt->mnt_ns;
+	struct mountpoint *smp;
+	struct mount *child, *p;
+	struct hlist_node *n;
+	int err;
+
+	/* 
+	 * 先分配一个mountpint,因为有时一个新的挂载要放到其他挂载下面
+	 * 正常情况下用不到
+	 */
+	smp = get_mountpoint(source_mnt->mnt.mnt_root);
+	if (IS_ERR(smp))
+		return PTR_ERR(smp);
+
+	// 如果不可移动要统计当前ns里是否还有空闲容纳新挂载
+	if (!moving) {
+		err = count_mounts(ns, source_mnt);
+		if (err)
+			goto out;
+	}
+
+	// 有无shared标志
+	if (IS_MNT_SHARED(dest_mnt)) {
+		err = invent_group_ids(source_mnt, true);
+		if (err)
+			goto out;
+		err = propagate_mnt(dest_mnt, dest_mp, source_mnt, &tree_list);
+		lock_mount_hash();
+		if (err)
+			goto out_cleanup_ids;
+		for (p = source_mnt; p; p = next_mnt(p, source_mnt))
+			set_mnt_shared(p);
+	} else {
+		// 获取mount_lock写顺序锁
+		lock_mount_hash();
+	}
+	if (moving) {
+		unhash_mnt(source_mnt);
+		attach_mnt(source_mnt, dest_mnt, dest_mp);
+		touch_mnt_namespace(source_mnt->mnt_ns);
+	} else {
+		// 若有已挂载的ns,则先删除
+		if (source_mnt->mnt_ns) {
+			list_del_init(&source_mnt->mnt_ns->list);
+		}
+		// mnt设置挂载点
+		mnt_set_mountpoint(dest_mnt, dest_mp, source_mnt);
+		// 提交树
+		commit_tree(source_mnt);
+	}
+
+	// 没有share时,tree_list是空的.todo:后面再分析
+	hlist_for_each_entry_safe(child, n, &tree_list, mnt_hash) {
+		struct mount *q;
+		hlist_del_init(&child->mnt_hash);
+		q = __lookup_mnt(&child->mnt_parent->mnt,
+				 child->mnt_mountpoint);
+		if (q)
+			mnt_change_mountpoint(child, smp, q);
+		/* Notice when we are propagating across user namespaces */
+		if (child->mnt_parent->mnt_ns->user_ns != user_ns)
+			lock_mnt_tree(child);
+		child->mnt.mnt_flags &= ~MNT_LOCKED;
+		commit_tree(child);
+	}
+	put_mountpoint(smp);
+	unlock_mount_hash();
+
+	return 0;
+
+ out_cleanup_ids:
+	while (!hlist_empty(&tree_list)) {
+		child = hlist_entry(tree_list.first, struct mount, mnt_hash);
+		child->mnt_parent->mnt_ns->pending_mounts = 0;
+		umount_tree(child, UMOUNT_SYNC);
+	}
+	unlock_mount_hash();
+	cleanup_group_ids(source_mnt, NULL);
+ out:
+	ns->pending_mounts = 0;
+
+	read_seqlock_excl(&mount_lock);
+	put_mountpoint(smp);
+	read_sequnlock_excl(&mount_lock);
+
+	return err;
+}
+
+static struct mountpoint *get_mountpoint(struct dentry *dentry)
+{
+	struct mountpoint *mp, *new = NULL;
+	int ret;
+
+	// 已有挂载
+	if (d_mountpoint(dentry)) {
+		/* might be worth a WARN_ON() */
+		if (d_unlinked(dentry))
+			return ERR_PTR(-ENOENT);
+mountpoint:
+		read_seqlock_excl(&mount_lock);
+		// 在缓存里再查找
+		mp = lookup_mountpoint(dentry);
+		read_sequnlock_excl(&mount_lock);
+		if (mp)
+			goto done;
+	}
+
+	// 分配一个新mountpoint
+	if (!new)
+		new = kmalloc(sizeof(struct mountpoint), GFP_KERNEL);
+	if (!new)
+		return ERR_PTR(-ENOMEM);
+
+
+	// 设置DCACHE_MOUNTED标志
+	ret = d_set_mounted(dentry);
+
+	// 其它进程已经设置了标志, 则又去缓存里找
+	if (ret == -EBUSY)
+		goto mountpoint;
+
+	// 其它错误
+	mp = ERR_PTR(ret);
+	if (ret)
+		goto done;
+
+	/* Add the new mountpoint to the hash table */
+	read_seqlock_excl(&mount_lock);
+	// 设置dentry和数量
+	new->m_dentry = dget(dentry);
+	new->m_count = 1;
+	// 添加到mountpoint的哈希表里
+	hlist_add_head(&new->m_hash, mp_hash(dentry));
+	INIT_HLIST_HEAD(&new->m_list);
+	read_sequnlock_excl(&mount_lock);
+
+	mp = new;
+	new = NULL;
+done:
+	kfree(new);
+	return mp;
+}
+
+static struct mountpoint *lookup_mountpoint(struct dentry *dentry)
+{
+	struct hlist_head *chain = mp_hash(dentry);
+	struct mountpoint *mp;
+
+	hlist_for_each_entry(mp, chain, m_hash) {
+		if (mp->m_dentry == dentry) {
+			mp->m_count++;
+			return mp;
+		}
+	}
+	return NULL;
+}
+
+int count_mounts(struct mnt_namespace *ns, struct mount *mnt)
+{
+	unsigned int max = READ_ONCE(sysctl_mount_max);
+	unsigned int mounts = 0, old, pending, sum;
+	struct mount *p;
+
+	for (p = mnt; p; p = next_mnt(p, mnt))
+		mounts++;
+
+	old = ns->mounts;
+	pending = ns->pending_mounts;
+	sum = old + pending;
+	if ((old > sum) ||
+	    (pending > sum) ||
+	    (max < sum) ||
+	    (mounts > (max - sum)))
+		return -ENOSPC;
+
+	ns->pending_mounts = pending + mounts;
+	return 0;
+}
+
+void mnt_set_mountpoint(struct mount *mnt,
+			struct mountpoint *mp,
+			struct mount *child_mnt)
+{
+	// 挂载点挂载数量增加
+	mp->m_count++;
+	// mnt->mnt_count += 1
+	mnt_add_count(mnt, 1);
+	// 设置挂载点的dentry
+	child_mnt->mnt_mountpoint = mp->m_dentry;
+	// 设置父mnt
+	child_mnt->mnt_parent = mnt;
+	// 设置mountpoint
+	child_mnt->mnt_mp = mp;
+	// 添加到挂载点的列表里
+	hlist_add_head(&child_mnt->mnt_mp_list, &mp->m_list);
+}
+
+static void commit_tree(struct mount *mnt/*新挂载 mnt*/)
+{
+	// 父mnt
+	struct mount *parent = mnt->mnt_parent;
+	struct mount *m;
+	LIST_HEAD(head);
+	// 父ns
+	struct mnt_namespace *n = parent->mnt_ns;
+
+	// parent不能和mnt相等
+	BUG_ON(parent == mnt);
+
+	// 遍历mnt里所有子结点,设置mnt_ns为父节点
+	list_add_tail(&head, &mnt->mnt_list);
+	list_for_each_entry(m, &head, mnt_list)
+		m->mnt_ns = n;
+
+	// 把这些转到父ns的列表
+	list_splice(&head, n->list.prev);
+
+	// 递增之前待挂载数据
+	n->mounts += n->pending_mounts;
+	// 待挂载置0
+	n->pending_mounts = 0;
+
+	// 添加mnt到哈希表和父mnt的列表
+	__attach_mnt(mnt, parent);
+	// 递增ns->event, 然后唤醒等待poll的人
+	touch_mnt_namespace(n);
+}
+
+static void __attach_mnt(struct mount *mnt, struct mount *parent)
+{
+	// 挂到相应的哈希表上
+	hlist_add_head_rcu(&mnt->mnt_hash,
+				// 这里以parent和挂载点的地址做哈希
+			   m_hash(&parent->mnt, mnt->mnt_mountpoint));
+	// 添加到父目录的mounts里
+	list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
+}
 ```
 ## mount_bdev
 mount_bdev是挂载需要硬盘的文件系统。
