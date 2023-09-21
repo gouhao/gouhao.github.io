@@ -178,8 +178,9 @@ static int do_new_mount(struct path *path, const char *fstype, int sb_flags,
 		}
 	}
 
-	// 分配fs_context
+	// 分配fs_context,然后初始化里面的一些字段,主要是调用了init_fs_context
 	fc = fs_context_for_mount(type, sb_flags);
+	// 这个put对应的是最上面的get_fs_type, 在fs_context_for_mount里也会get一次.
 	put_filesystem(type);
 	if (IS_ERR(fc))
 		return PTR_ERR(fc);
@@ -191,13 +192,15 @@ static int do_new_mount(struct path *path, const char *fstype, int sb_flags,
 	// todo: what is source?
 	if (!err && name)
 		err = vfs_parse_fs_string(fc, "source", name, strlen(name));
-	// 解析选项
+	// 解析挂载选项,就是 -o 
 	if (!err)
 		err = parse_monolithic_mount_data(fc, data);
+	// 如果没出错的话,检查是否有CAP_SYS_ADMIN权限
 	if (!err && !mount_capable(fc))
 		err = -EPERM;
 
 	// 获取目录树,fs一般在这里面做fs的初始化,获取根节点等
+	// 具体文件系统在get_tree必须要设置fc->root
 	if (!err)
 		err = vfs_get_tree(fc);
 
@@ -334,10 +337,8 @@ int vfs_get_tree(struct fs_context *fc)
 	WARN_ON(!sb->s_bdi);
 
 	/*
-	 * Write barrier is for super_cache_count(). We place it before setting
-	 * SB_BORN as the data dependency between the two functions is the
-	 * superblock structure contents that we just set up, not the SB_BORN
-	 * flag.
+	 * 写屏障用于 super_cache_count() .我们把它放到设置SB_BORN之前, 是因为这2个函数
+	 * 的依赖关系是我们刚设置的结构体内容, 而不是SB_BORN标志.
 	 */
 	smp_wmb();
 	sb->s_flags |= SB_BORN;
@@ -395,6 +396,220 @@ int parse_monolithic_mount_data(struct fs_context *fc, void *data)
 
 	return monolithic_mount_data(fc, data);
 }
+
+int generic_parse_monolithic(struct fs_context *fc, void *data)
+{
+	char *options = data, *key;
+	int ret = 0;
+
+	// 没选项
+	if (!options)
+		return 0;
+
+	// 安全模块解析它自己的数据, 解析完存在fc->security里
+	ret = security_sb_eat_lsm_opts(options, &fc->security);
+	if (ret)
+		return ret;
+
+	// 选项以 , 分隔
+	while ((key = strsep(&options, ",")) != NULL) {
+		if (*key) {
+			size_t v_len = 0;
+			// 取值
+			char *value = strchr(key, '=');
+
+			if (value) {
+				// 值 和 key 不能相等
+				if (value == key)
+					continue;
+				// 把 = 设置成0, 同时指向实际的值
+				*value++ = 0;
+				v_len = strlen(value);
+			}
+			// 调用具体文件系统解析这个值
+			ret = vfs_parse_fs_string(fc, key, value, v_len);
+			// 解析出错,退出
+			if (ret < 0)
+				break;
+		}
+	}
+
+	return ret;
+}
+
+int vfs_parse_fs_string(struct fs_context *fc, const char *key,
+			const char *value, size_t v_size)
+{
+	int ret;
+
+	struct fs_parameter param = {
+		.key	= key, // key
+		.type	= fs_value_is_flag, // 值类型, 默认 fs_value_is_flag值未指定
+		.size	= v_size, // 长度
+	};
+
+	if (value) {
+		// 分配一个以0结尾的值
+		param.string = kmemdup_nul(value, v_size, GFP_KERNEL);
+		if (!param.string)
+			return -ENOMEM;
+		// 值类型 为 string
+		param.type = fs_value_is_string;
+	}
+
+	ret = vfs_parse_fs_param(fc, &param);
+	kfree(param.string);
+	return ret;
+}
+
+int vfs_parse_fs_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	int ret;
+
+	// 没有key肯定是不行
+	if (!param->key)
+		return invalf(fc, "Unnamed parameter\n");
+
+	// 先解析标志, 这里面的标志必须有
+	ret = vfs_parse_sb_flag(fc, param->key);
+	if (ret != -ENOPARAM)
+		return ret;
+
+	// 安全模块解析自己的参数
+	ret = security_fs_context_parse_param(fc, param);
+	if (ret != -ENOPARAM)
+		/* 
+		 * 参数属于 LSM 或者 LSM不允许, 所以不要传给FS
+		 */
+		return ret;
+
+	// 调用具体文件系统解析
+	if (fc->ops->parse_param) {
+		ret = fc->ops->parse_param(fc, param);
+		if (ret != -ENOPARAM)
+			return ret;
+	}
+
+	// 对source进行处理
+	if (strcmp(param->key, "source") == 0) {
+		if (param->type != fs_value_is_string)
+			return invalf(fc, "VFS: Non-string source");
+		if (fc->source)
+			return invalf(fc, "VFS: Multiple sources");
+		fc->source = param->string;
+		param->string = NULL;
+		return 0;
+	}
+
+	// 文件系统不认识,也出错
+	return invalf(fc, "%s: Unknown parameter '%s'",
+		      fc->fs_type->name, param->key);
+}
+
+
+static const struct constant_table common_set_sb_flag[] = {
+	{ "dirsync",	SB_DIRSYNC },
+	{ "lazytime",	SB_LAZYTIME },
+	{ "mand",	SB_MANDLOCK },
+	{ "ro",		SB_RDONLY },
+	{ "sync",	SB_SYNCHRONOUS },
+	{ },
+};
+
+static const struct constant_table common_clear_sb_flag[] = {
+	{ "async",	SB_SYNCHRONOUS },
+	{ "nolazytime",	SB_LAZYTIME },
+	{ "nomand",	SB_MANDLOCK },
+	{ "rw",		SB_RDONLY },
+	{ },
+};
+
+/*
+ * Check for a common mount option that manipulates s_flags.
+ */
+static int vfs_parse_sb_flag(struct fs_context *fc, const char *key)
+{
+	unsigned int token;
+
+	// 在common_set_sb_flag里找
+	token = lookup_constant(common_set_sb_flag, key, 0);
+	if (token) {
+		// 找到就写到sb_flags里
+		fc->sb_flags |= token;
+		fc->sb_flags_mask |= token;
+		return 0;
+	}
+
+	// 在common_clear_sb_flag里找,
+	token = lookup_constant(common_clear_sb_flag, key, 0);
+	if (token) {
+		// 这个表里的数据需要清除
+		fc->sb_flags &= ~token;
+		fc->sb_flags_mask |= token;
+		return 0;
+	}
+
+	return -ENOPARAM;
+}
+
+static int legacy_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	struct legacy_fs_context *ctx = fc->fs_private;
+	unsigned int size = ctx->data_size;
+	size_t len = 0;
+
+	if (strcmp(param->key, "source") == 0) {
+		if (param->type != fs_value_is_string)
+			return invalf(fc, "VFS: Legacy: Non-string source");
+		if (fc->source)
+			return invalf(fc, "VFS: Legacy: Multiple sources");
+		fc->source = param->string;
+		param->string = NULL;
+		return 0;
+	}
+
+	if (ctx->param_type == LEGACY_FS_MONOLITHIC_PARAMS)
+		return invalf(fc, "VFS: Legacy: Can't mix monolithic and individual options");
+
+	switch (param->type) {
+	case fs_value_is_string:
+		len = 1 + param->size;
+		fallthrough;
+	case fs_value_is_flag:
+		len += strlen(param->key);
+		break;
+	default:
+		return invalf(fc, "VFS: Legacy: Parameter type for '%s' not supported",
+			      param->key);
+	}
+
+	if (size + len + 2 > PAGE_SIZE)
+		return invalf(fc, "VFS: Legacy: Cumulative options too large");
+	if (strchr(param->key, ',') ||
+	    (param->type == fs_value_is_string &&
+	     memchr(param->string, ',', param->size)))
+		return invalf(fc, "VFS: Legacy: Option '%s' contained comma",
+			      param->key);
+	if (!ctx->legacy_data) {
+		ctx->legacy_data = kmalloc(PAGE_SIZE, GFP_KERNEL);
+		if (!ctx->legacy_data)
+			return -ENOMEM;
+	}
+
+	ctx->legacy_data[size++] = ',';
+	len = strlen(param->key);
+	memcpy(ctx->legacy_data + size, param->key, len);
+	size += len;
+	if (param->type == fs_value_is_string) {
+		ctx->legacy_data[size++] = '=';
+		memcpy(ctx->legacy_data + size, param->string, param->size);
+		size += param->size;
+	}
+	ctx->legacy_data[size] = '\0';
+	ctx->data_size = size;
+	ctx->param_type = LEGACY_FS_INDIVIDUAL_PARAMS;
+	return 0;
+}
 ```
 
 ## do_new_mount_fc
@@ -419,7 +634,7 @@ static int do_new_mount_fc(struct fs_context *fc, struct path *mountpoint,
 	}
 
 	up_write(&sb->s_umount);
-	// 创建sruct mount结构, 最终返回的是mount->mnt
+	// 创建sruct mount结构, 最终返回的vfsmount是mount->mnt
 	mnt = vfs_create_mount(fc);
 	if (IS_ERR(mnt))
 		return PTR_ERR(mnt);
@@ -447,28 +662,93 @@ struct vfsmount *vfs_create_mount(struct fs_context *fc)
 {
 	struct mount *mnt;
 
+	// 没根结点肯定错了
 	if (!fc->root)
 		return ERR_PTR(-EINVAL);
 
+	// 分配一个mount对象, 并初始化
 	mnt = alloc_vfsmnt(fc->source ?: "none");
 	if (!mnt)
 		return ERR_PTR(-ENOMEM);
 
+	// 在内核里调用kern_mount的挂载
 	if (fc->sb_flags & SB_KERNMOUNT)
 		mnt->mnt.mnt_flags = MNT_INTERNAL;
 
+	// 递增超级块的活跃计数
 	atomic_inc(&fc->root->d_sb->s_active);
+	// 设置超级块
 	mnt->mnt.mnt_sb		= fc->root->d_sb;
+	// 根结点
 	mnt->mnt.mnt_root	= dget(fc->root);
+	// 挂载点先设置成根
 	mnt->mnt_mountpoint	= mnt->mnt.mnt_root;
+	// 父目录先设置成自己
 	mnt->mnt_parent		= mnt;
 
+	// 加入超级块的s_mounts列表
 	lock_mount_hash();
 	list_add_tail(&mnt->mnt_instance, &mnt->mnt.mnt_sb->s_mounts);
 	unlock_mount_hash();
 	return &mnt->mnt;
 }
 
+
+static struct mount *alloc_vfsmnt(const char *name)
+{
+	struct mount *mnt = kmem_cache_zalloc(mnt_cache, GFP_KERNEL);
+	if (mnt) {
+		int err;
+
+		// 分配一个id, 并设置到mnt->mnt_id里
+		err = mnt_alloc_id(mnt);
+		if (err)
+			goto out_free_cache;
+
+		// 设置 mnt->mnt_devname
+		if (name) {
+			mnt->mnt_devname = kstrdup_const(name, GFP_KERNEL);
+			if (!mnt->mnt_devname)
+				goto out_free_id;
+		}
+
+		// 初始化引用计数相关, smp使用percpu
+#ifdef CONFIG_SMP
+		mnt->mnt_pcp = alloc_percpu(struct mnt_pcp);
+		if (!mnt->mnt_pcp)
+			goto out_free_devname;
+
+		this_cpu_add(mnt->mnt_pcp->mnt_count, 1);
+#else
+		mnt->mnt_count = 1;
+		mnt->mnt_writers = 0;
+#endif
+
+		// 初始化各种链表
+		INIT_HLIST_NODE(&mnt->mnt_hash);
+		INIT_LIST_HEAD(&mnt->mnt_child);
+		INIT_LIST_HEAD(&mnt->mnt_mounts);
+		INIT_LIST_HEAD(&mnt->mnt_list);
+		INIT_LIST_HEAD(&mnt->mnt_expire);
+		INIT_LIST_HEAD(&mnt->mnt_share);
+		INIT_LIST_HEAD(&mnt->mnt_slave_list);
+		INIT_LIST_HEAD(&mnt->mnt_slave);
+		INIT_HLIST_NODE(&mnt->mnt_mp_list);
+		INIT_LIST_HEAD(&mnt->mnt_umounting);
+		INIT_HLIST_HEAD(&mnt->mnt_stuck_children);
+	}
+	return mnt;
+
+#ifdef CONFIG_SMP
+out_free_devname:
+	kfree_const(mnt->mnt_devname);
+#endif
+out_free_id:
+	mnt_free_id(mnt);
+out_free_cache:
+	kmem_cache_free(mnt_cache, mnt);
+	return NULL;
+}
 static struct mountpoint *lock_mount(struct path *path)
 {
 	struct vfsmount *mnt;
