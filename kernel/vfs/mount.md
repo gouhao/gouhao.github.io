@@ -14,9 +14,10 @@ SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 	char *kernel_dev;
 	void *options;
 
-	// 从用户空间复制类型
+	// 从用户空间复制类型, 如果为空,返回NULL
 	kernel_type = copy_mount_string(type);
 	ret = PTR_ERR(kernel_type);
+	// 这里只判断错误,没有判断空
 	if (IS_ERR(kernel_type))
 		goto out_type;
 
@@ -66,7 +67,7 @@ int path_mount(const char *dev_name, struct path *path,
 	unsigned int mnt_flags = 0, sb_flags;
 	int ret;
 
-	// 先去掉魔数：0xC0ED0000
+	// 先去掉魔数：0xC0ED0000, 这个flags是从用户层传过来的
 	if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
 		flags &= ~MS_MGC_MSK;
 
@@ -189,7 +190,7 @@ static int do_new_mount(struct path *path, const char *fstype, int sb_flags,
 	if (subtype)
 		err = vfs_parse_fs_string(fc, "subtype",
 					  subtype, strlen(subtype));
-	// todo: what is source?
+	// 解析设备名, 会设置到fc->source里
 	if (!err && name)
 		err = vfs_parse_fs_string(fc, "source", name, strlen(name));
 	// 解析挂载选项,就是 -o 
@@ -204,7 +205,7 @@ static int do_new_mount(struct path *path, const char *fstype, int sb_flags,
 	if (!err)
 		err = vfs_get_tree(fc);
 
-	// 创建挂载相关的联系
+	// 创建挂载相关的联系, path是挂载点
 	if (!err)
 		err = do_new_mount_fc(fc, path, mnt_flags);
 
@@ -490,7 +491,7 @@ int vfs_parse_fs_param(struct fs_context *fc, struct fs_parameter *param)
 			return ret;
 	}
 
-	// 对source进行处理
+	// 设置设备源
 	if (strcmp(param->key, "source") == 0) {
 		if (param->type != fs_value_is_string)
 			return invalf(fc, "VFS: Non-string source");
@@ -642,7 +643,7 @@ static int do_new_mount_fc(struct fs_context *fc, struct path *mountpoint,
 	// 检查时间是否过了最大值
 	mnt_warn_timestamp_expiry(mountpoint, mnt);
 
-	// 找mnt, 
+	// 找path对应的mountpint, 如果没有会创建一个新的
 	// 注意:这里传的mountpoint是path,这命名真是混乱
 	mp = lock_mount(mountpoint);
 	if (IS_ERR(mp)) {
@@ -681,7 +682,7 @@ struct vfsmount *vfs_create_mount(struct fs_context *fc)
 	mnt->mnt.mnt_sb		= fc->root->d_sb;
 	// 根结点
 	mnt->mnt.mnt_root	= dget(fc->root);
-	// 挂载点先设置成根
+	// 挂载点先设置成自己的根
 	mnt->mnt_mountpoint	= mnt->mnt.mnt_root;
 	// 父目录先设置成自己
 	mnt->mnt_parent		= mnt;
@@ -705,7 +706,7 @@ static struct mount *alloc_vfsmnt(const char *name)
 		if (err)
 			goto out_free_cache;
 
-		// 设置 mnt->mnt_devname
+		// 设置 设备名
 		if (name) {
 			mnt->mnt_devname = kstrdup_const(name, GFP_KERNEL);
 			if (!mnt->mnt_devname)
@@ -762,8 +763,11 @@ retry:
 		return ERR_PTR(-ENOENT);
 	}
 	namespace_lock();
+	// 找到path是第1个挂载的mnt
 	mnt = lookup_mnt(path);
+	// 一般情况下目录上都没有挂载,所以是空的
 	if (likely(!mnt)) {
+		// 给dentry创建一个mountpoint对象
 		struct mountpoint *mp = get_mountpoint(dentry);
 		if (IS_ERR(mp)) {
 			namespace_unlock();
@@ -772,12 +776,49 @@ retry:
 		}
 		return mp;
 	}
+
+	// 走到这儿表示已经有挂载了
 	namespace_unlock();
 	inode_unlock(path->dentry->d_inode);
 	path_put(path);
+
+	// 设置为找到的mnt
 	path->mnt = mnt;
+	// 把dentry设置为找到的根
 	dentry = path->dentry = dget(mnt->mnt_root);
+	// 继续找, 因为要一直前进到最后一个挂载的
 	goto retry;
+}
+
+struct vfsmount *lookup_mnt(const struct path *path)
+{
+	struct mount *child_mnt;
+	struct vfsmount *m;
+	unsigned seq;
+
+	rcu_read_lock();
+	do {
+		seq = read_seqbegin(&mount_lock);
+		// 找到path上的第1个挂载的mnt
+		child_mnt = __lookup_mnt(path->mnt, path->dentry);
+		m = child_mnt ? &child_mnt->mnt : NULL;
+		// 递增m的引用计数, 递增成功返回true
+	} while (!legitimize_mnt(m, seq));
+	rcu_read_unlock();
+	return m;
+}
+
+struct mount *__lookup_mnt(struct vfsmount *mnt, struct dentry *dentry)
+{
+	// 以mnt, dentry估key进行哈希, 表里存的都是 struct mount
+	struct hlist_head *head = m_hash(mnt, dentry);
+	struct mount *p;
+
+	// 找到dentry上的第1个挂载的mnt
+	hlist_for_each_entry_rcu(p, head, mnt_hash)
+		if (&p->mnt_parent->mnt == mnt && p->mnt_mountpoint == dentry)
+			return p;
+	return NULL;
 }
 ```
 
@@ -802,7 +843,7 @@ static int do_add_mount(struct mount *newmnt, struct mountpoint *mp /*挂载点�
 			return -EINVAL;
 	}
 
-	// 一个文件系统不能在同一个挂载点上挂多次
+	// 一个文件系统不能在自己的根上挂载挂多次
 	if (path->mnt->mnt_sb == newmnt->mnt.mnt_sb &&
 	    path->mnt->mnt_root == path->dentry)
 		return -EBUSY;
@@ -932,9 +973,9 @@ static struct mountpoint *get_mountpoint(struct dentry *dentry)
 	struct mountpoint *mp, *new = NULL;
 	int ret;
 
-	// 已有挂载
+	// 已有挂载, 判断dentry有无DCACHE_MOUNTED标志
 	if (d_mountpoint(dentry)) {
-		/* might be worth a WARN_ON() */
+		// dentry没有被链接到vfs系统里,出错?
 		if (d_unlinked(dentry))
 			return ERR_PTR(-ENOENT);
 mountpoint:
@@ -942,11 +983,12 @@ mountpoint:
 		// 在缓存里再查找
 		mp = lookup_mountpoint(dentry);
 		read_sequnlock_excl(&mount_lock);
+		// 找到了
 		if (mp)
 			goto done;
 	}
-
-	// 分配一个新mountpoint
+	// 走到这儿是没找到对应的mountpoint对象
+	// 分配一个新的
 	if (!new)
 		new = kmalloc(sizeof(struct mountpoint), GFP_KERNEL);
 	if (!new)
@@ -984,9 +1026,11 @@ done:
 
 static struct mountpoint *lookup_mountpoint(struct dentry *dentry)
 {
+	// 这个是mountpoint的哈希表
 	struct hlist_head *chain = mp_hash(dentry);
 	struct mountpoint *mp;
 
+	// 返回dentry对应的mountpoint
 	hlist_for_each_entry(mp, chain, m_hash) {
 		if (mp->m_dentry == dentry) {
 			mp->m_count++;
@@ -1047,9 +1091,9 @@ static void commit_tree(struct mount *mnt/*新挂载 mnt*/)
 
 	// parent不能和mnt相等
 	BUG_ON(parent == mnt);
-
-	// 遍历mnt里所有子结点,设置mnt_ns为父节点
+	// 先把mnt_list添加到head里
 	list_add_tail(&head, &mnt->mnt_list);
+	// 遍历mnt里所有子结点,设置mnt_ns为父节点
 	list_for_each_entry(m, &head, mnt_list)
 		m->mnt_ns = n;
 
