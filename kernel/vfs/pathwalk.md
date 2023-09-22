@@ -638,7 +638,7 @@ static const char *step_into(struct nameidata *nd, int flags,
 		}
 
 		// 这里把相关信息设置后就直接返回
-		nd->path = path;
+		nd->path = path; // 这个相当于memcpy
 		nd->inode = inode;
 		nd->seq = seq;
 		return NULL;
@@ -664,7 +664,9 @@ static inline int handle_mounts(struct nameidata *nd, struct dentry *dentry,
 	bool jumped;
 	int ret;
 
+	// 先设置成path的mnt
 	path->mnt = nd->path.mnt;
+	// 找到的目录
 	path->dentry = dentry;
 	if (nd->flags & LOOKUP_RCU) {
 		unsigned int seq = *seqp;
@@ -705,10 +707,12 @@ static inline int handle_mounts(struct nameidata *nd, struct dentry *dentry,
 static inline int traverse_mounts(struct path *path, bool *jumped,
 				  int *count, unsigned lookup_flags)
 {
+	// dentry的标志
 	unsigned flags = smp_load_acquire(&path->dentry->d_flags);
 
-	/* fastpath */
-	// todo: DCACHE_MANAGED_DENTRY是DCACHE_MOUNTED和其它几个标志的组合
+	// dentry没有挂载
+	// DCACHE_MANAGED_DENTRY是DCACHE_MOUNTED和其它几个标志的组合,
+	// dentry有DCACHE_MOUNTED就表示这是个挂载点
 	if (likely(!(flags & DCACHE_MANAGED_DENTRY))) {
 		*jumped = false;
 		if (unlikely(d_flags_negative(flags)))
