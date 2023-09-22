@@ -105,4 +105,11 @@ struct ext4_allocation_request {
 	/* flags. see above EXT4_MB_HINT_* */
 	unsigned int flags;
 };
+
+struct ext4_iloc
+{
+	struct buffer_head *bh; // block数据
+	unsigned long offset; // 偏移
+	ext4_group_t block_group; // 块组描述
+};
 ```
