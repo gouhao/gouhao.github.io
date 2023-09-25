@@ -384,10 +384,8 @@ Writing superblocks and filesystem accounting information: done
         workloads on very fast disks, at the cost of increasing latency.
 
   journal_ioprio=prio
-        The I/O priority (from 0 to 7, where 0 is the highest priority) which
-        should be used for I/O operations submitted by kjournald2 during a
-        commit operation.  This defaults to 3, which is a slightly higher
-        priority than the default I/O priority.
+	IO优先级（从0到7，0是最高的优先级），这个被用到io操作提交时，通过kjournald2在一个
+	commit操作里。默认是3，这是一个比默认优先级稍微高的优先级。
 
   auto_da_alloc(*), noauto_da_alloc
         Many broken applications don't use fsync() when replacing existing
@@ -403,45 +401,30 @@ Writing superblocks and filesystem accounting information: done
         system crashes before the delayed allocation blocks are forced to disk.
 
   noinit_itable
-        Do not initialize any uninitialized inode table blocks in the
-        background.  This feature may be used by installation CD's so that the
-        install process can complete as quickly as possible; the inode table
-        initialization process would then be deferred until the next time the
-        file system is unmounted.
+	不要在后台初始化未初始化的inode-table。这个特性被用到安装cd里，以至于安装进程能够尽
+	快的完成。inode-table初始化进程将会延迟到下一次卸载的时候。
 
   init_itable=n
-        The lazy itable init code will wait n times the number of milliseconds
-        it took to zero out the previous block group's inode table.  This
-        minimizes the impact on the system performance while file system's
-        inode table is being initialized.
+	延迟inode-table初始化代码将等待n次相当数量的毫秒。它将把之前的块组inode-table写0。
+	当inode-table已经初始化时，这将对系统性能影响最小。
 
   discard, nodiscard(*)
-        Controls whether ext4 should issue discard/TRIM commands to the
-        underlying block device when blocks are freed.  This is useful for SSD
-        devices and sparse/thinly-provisioned LUNs, but it is off by default
-        until sufficient testing has been done.
+	控制ext4是否应该发布discar/TRIP命令到下层设备当块释放的时候。这个对ssd设备和sparse
+	luns 很有用。但是它默认是关的，直到充分的测试完成之后。
 
   nouid32
-        Disables 32-bit UIDs and GIDs.  This is for interoperability  with
-        older kernels which only store and expect 16-bit values.
+        禁用32位的uid和gid。这是为了兼容老内核，老内核只存储16位数据。
 
   block_validity(*), noblock_validity
-        These options enable or disable the in-kernel facility for tracking
-        filesystem metadata blocks within internal data structures.  This
-        allows multi- block allocator and other routines to notice bugs or
-        corrupted allocation bitmaps which cause blocks to be allocated which
-        overlap with filesystem metadata blocks.
+	这个选项使能或禁用内核内的设施，为了跟踪文件系统元数据块，在内部数据结构里。这允许多
+	块分配器或其它函数注意到bug，或者毁坏的分配位图导致块分配覆盖文件系统的元数据。
 
   dioread_lock, dioread_nolock
-        Controls whether or not ext4 should use the DIO read locking. If the
-        dioread_nolock option is specified ext4 will allocate uninitialized
-        extent before buffer write and convert the extent to initialized after
-        IO completes. This approach allows ext4 code to avoid using inode
-        mutex, which improves scalability on high speed storages. However this
-        does not work with data journaling and dioread_nolock option will be
-        ignored with kernel warning. Note that dioread_nolock code path is only
-        used for extent-based files.  Because of the restrictions this options
-        comprises it is off by default (e.g. dioread_lock).
+	控制ext4是否应该使唤DIO读锁。如果dioread_nolock选项被指定，ext4将在buffer write之前
+	分配未初始化的extent，并且在io完成后把extent转换成已初始化的。这个方法允许ext4代码避免
+	使用inode互斥锁，在高速存储里可以提高可伸缩性。然后，这不能和data日志一起工作，dioread_nolock
+	将会被kernel警告忽略。注意：dioread_nolock代码只是被用于extent-basedfiles.因为这个
+	限制，这个选项默认是关的（也就是默认是dioread_lock）。
 
   max_dir_size_kb=n
         This limits the size of directories so that any attempt to expand them
@@ -455,16 +438,12 @@ Writing superblocks and filesystem accounting information: done
         Enable 64-bit inode version support. This option is off by default.
 
   dax
-        Use direct access (no page cache).  See
-        Documentation/filesystems/dax.txt.  Note that this option is
-        incompatible with data=journal.
+        使用直接访问（没有page-cache)。详情查看Documentation/filesystems/dax.txt。
+	注意：这个选项和data=journal不兼容。
 
   inlinecrypt
-        When possible, encrypt/decrypt the contents of encrypted files using the
-        blk-crypto framework rather than filesystem-layer encryption. This
-        allows the use of inline encryption hardware. The on-disk format is
-        unaffected. For more details, see
-        Documentation/block/inline-encryption.rst.
+	当使能时，内容的加解密使用blk-crypto框架而不是文件系统层的加解密。这允许使用内联加密
+	的硬件。盘上格式不影响。详情查看：Documentation/block/inline-encryption.rst.
 ```
 
 ### 4.3 dumpe2fs
@@ -920,193 +899,11 @@ $ hexdump ext4img -n 2048
 ```
 
 ```c
-static __le32 ext4_superblock_csum(struct super_block *sb,
-				   struct ext4_super_block *es)
-{
-	struct ext4_sb_info *sbi = EXT4_SB(sb);
-	int offset = offsetof(struct ext4_super_block, s_checksum);
-	__u32 csum;
-
-	csum = ext4_chksum(sbi, ~0, (char *)es, offset);
-
-	return cpu_to_le32(csum);
-}
-
-static inline u32 ext4_chksum(struct ext4_sb_info *sbi, u32 crc,
-			      const void *address, unsigned int length)
-{
-	struct {
-		struct shash_desc shash;
-		char ctx[4];
-	} desc;
-
-	BUG_ON(crypto_shash_descsize(sbi->s_chksum_driver)!=sizeof(desc.ctx));
-
-	desc.shash.tfm = sbi->s_chksum_driver;
-	*(u32 *)desc.ctx = crc;
-
-	BUG_ON(crypto_shash_update(&desc.shash, address, length));
-
-	return *(u32 *)desc.ctx;
-}
-```
-```c
 struct ext4_super_block {
-	__le32	s_inodes_count;		/* Inodes count */
-	__le32	s_blocks_count_lo;	/* Blocks count */
-	__le32	s_r_blocks_count_lo;	/* Reserved blocks count */
-	__le32	s_free_blocks_count_lo;	/* Free blocks count */
-	__le32	s_free_inodes_count;	/* Free inodes count */
-	__le32	s_first_data_block;	/* First Data Block */
-	__le32	s_log_block_size;	/* Block size */
-	__le32	s_log_cluster_size;	/* Allocation cluster size */
-	__le32	s_blocks_per_group;	/* # Blocks per group */
-	__le32	s_clusters_per_group;	/* # Clusters per group */
-	__le32	s_inodes_per_group;	/* # Inodes per group */
-	__le32	s_mtime;		/* Mount time */
-	__le32	s_wtime;		/* Write time */
-/*52*/	__le16	s_mnt_count;		/* Mount count */
-	__le16	s_max_mnt_count;	/* Maximal mount count */
-	__le16	s_magic;		/* Magic signature */
-	__le16	s_state;		/* File system state */
-	__le16	s_errors;		/* Behaviour when detecting errors */
-	__le16	s_minor_rev_level;	/* minor revision level */
-	__le32	s_lastcheck;		/* time of last check */
-	__le32	s_checkinterval;	/* max. time between checks */
-	__le32	s_creator_os;		/* OS */
-	__le32	s_rev_level;		/* Revision level */
-	__le16	s_def_resuid;		/* Default uid for reserved blocks */
-	__le16	s_def_resgid;		/* Default gid for reserved blocks */
-	/*
-	 * These fields are for EXT4_DYNAMIC_REV superblocks only.
-	 *
-	 * Note: the difference between the compatible feature set and
-	 * the incompatible feature set is that if there is a bit set
-	 * in the incompatible feature set that the kernel doesn't
-	 * know about, it should refuse to mount the filesystem.
-	 *
-	 * e2fsck's requirements are more strict; if it doesn't know
-	 * about a feature in either the compatible or incompatible
-	 * feature set, it must abort and not try to meddle with
-	 * things it doesn't understand...
-	 */
-	__le32	s_first_ino;		/* First non-reserved inode */
-	__le16  s_inode_size;		/* size of inode structure */
-	__le16	s_block_group_nr;	/* block group # of this superblock */
-	__le32	s_feature_compat;	/* compatible feature set */
-	__le32	s_feature_incompat;	/* incompatible feature set */
-	__le32	s_feature_ro_compat;	/* readonly-compatible feature set */
-/*104*/	__u8	s_uuid[16];		/* 128-bit uuid for volume */
-	char	s_volume_name[16];	/* volume name */
-	char	s_last_mounted[64] __nonstring;	/* directory where last mounted */
-/*200*/	__le32	s_algorithm_usage_bitmap; /* For compression */
-	/*
-	 * Performance hints.  Directory preallocation should only
-	 * happen if the EXT4_FEATURE_COMPAT_DIR_PREALLOC flag is on.
-	 */
-	__u8	s_prealloc_blocks;	/* Nr of blocks to try to preallocate*/
-	__u8	s_prealloc_dir_blocks;	/* Nr to preallocate for dirs */
-	__le16	s_reserved_gdt_blocks;	/* Per group desc for online growth */
-	/*
-	 * Journaling support valid if EXT4_FEATURE_COMPAT_HAS_JOURNAL set.
-	 */
-	__u8	s_journal_uuid[16];	/* uuid of journal superblock */
-/*224*/	__le32	s_journal_inum;		/* inode number of journal file */
-	__le32	s_journal_dev;		/* device number of journal file */
-	__le32	s_last_orphan;		/* start of list of inodes to delete */
-	__le32	s_hash_seed[4];		/* HTREE hash seed */
-	__u8	s_def_hash_version;	/* Default hash version to use */
-	__u8	s_jnl_backup_type;
-	__le16  s_desc_size;		/* size of group descriptor */
-	__le32	s_default_mount_opts;
-	__le32	s_first_meta_bg;	/* First metablock block group */
-	__le32	s_mkfs_time;		/* When the filesystem was created */
-/*268*/	__le32	s_jnl_blocks[17];	/* Backup of the journal inode */
-	/* 64bit support valid if EXT4_FEATURE_COMPAT_64BIT */
-	__le32	s_blocks_count_hi;	/* Blocks count */
-	__le32	s_r_blocks_count_hi;	/* Reserved blocks count */
-	__le32	s_free_blocks_count_hi;	/* Free blocks count */
-	__le16	s_min_extra_isize;	/* All inodes have at least # bytes */
-	__le16	s_want_extra_isize; 	/* New inodes should reserve # bytes */
-	__le32	s_flags;		/* Miscellaneous flags */
-	__le16  s_raid_stride;		/* RAID stride */
-	__le16  s_mmp_update_interval;  /* # seconds to wait in MMP checking */
-	__le64  s_mmp_block;            /* Block for multi-mount protection */
-	__le32  s_raid_stripe_width;    /* blocks on all data disks (N*stride)*/
-	__u8	s_log_groups_per_flex;  /* FLEX_BG group size */
-	__u8	s_checksum_type;	/* metadata checksum algorithm used */
-	__u8	s_encryption_level;	/* versioning level for encryption */
-	__u8	s_reserved_pad;		/* Padding to next 32bits */
-	__le64	s_kbytes_written;	/* nr of lifetime kilobytes written */
-	__le32	s_snapshot_inum;	/* Inode number of active snapshot */
-	__le32	s_snapshot_id;		/* sequential ID of active snapshot */
-	__le64	s_snapshot_r_blocks_count; /* reserved blocks for active
-					      snapshot's future use */
-	__le32	s_snapshot_list;	/* inode number of the head of the
-					   on-disk snapshot list */
-#define EXT4_S_ERR_START offsetof(struct ext4_super_block, s_error_count)
-	__le32	s_error_count;		/* number of fs errors */
-	__le32	s_first_error_time;	/* first time an error happened */
-	__le32	s_first_error_ino;	/* inode involved in first error */
-	__le64	s_first_error_block;	/* block involved of first error */
-/*424*/	__u8	s_first_error_func[32] __nonstring;	/* function where the error happened */
-	__le32	s_first_error_line;	/* line number where error happened */
-	__le32	s_last_error_time;	/* most recent time of an error */
-	__le32	s_last_error_ino;	/* inode involved in last error */
-	__le32	s_last_error_line;	/* line number where error happened */
-	__le64	s_last_error_block;	/* block involved of last error */
-	__u8	s_last_error_func[32] __nonstring;	/* function where the error happened */
-#define EXT4_S_ERR_END offsetof(struct ext4_super_block, s_mount_opts)
-	__u8	s_mount_opts[64];
-	__le32	s_usr_quota_inum;	/* inode for tracking user quota */
-	__le32	s_grp_quota_inum;	/* inode for tracking group quota */
-	__le32	s_overhead_clusters;	/* overhead blocks/clusters in fs */
-	__le32	s_backup_bgs[2];	/* groups with sparse_super2 SBs */
-	__u8	s_encrypt_algos[4];	/* Encryption algorithms in use  */
-	__u8	s_encrypt_pw_salt[16];	/* Salt used for string2key algorithm */
-	__le32	s_lpf_ino;		/* Location of the lost+found inode */
-	__le32	s_prj_quota_inum;	/* inode for tracking project quota */
-	__le32	s_checksum_seed;	/* crc32c(uuid) if csum_seed set */
-	__u8	s_wtime_hi;
-	__u8	s_mtime_hi;
-	__u8	s_mkfs_time_hi;
-	__u8	s_lastcheck_hi;
-	__u8	s_first_error_time_hi;
-	__u8	s_last_error_time_hi;
-	__u8	s_first_error_errcode;
-	__u8    s_last_error_errcode;
-	__le16  s_encoding;		/* Filename charset encoding */
-	__le16  s_encoding_flags;	/* Filename charset encoding flags */
+	...
+	...
 /*640*/	__le32	s_reserved[95];		/* Padding to the end of the block */
 /*1020*/__le32	s_checksum;		/* crc32c(superblock) */
 };
 ```
-
-```
-struct ext4_group_desc
-{
-	__le32	bg_block_bitmap_lo;	/* Blocks bitmap block */
-	__le32	bg_inode_bitmap_lo;	/* Inodes bitmap block */
-	__le32	bg_inode_table_lo;	/* Inodes table block */
-	__le16	bg_free_blocks_count_lo;/* Free blocks count */
-	__le16	bg_free_inodes_count_lo;/* Free inodes count */
-	__le16	bg_used_dirs_count_lo;	/* Directories count */
-	__le16	bg_flags;		/* EXT4_BG_flags (INODE_UNINIT, etc) */
-	__le32  bg_exclude_bitmap_lo;   /* Exclude bitmap for snapshots */
-	__le16  bg_block_bitmap_csum_lo;/* crc32c(s_uuid+grp_num+bbitmap) LE */
-	__le16  bg_inode_bitmap_csum_lo;/* crc32c(s_uuid+grp_num+ibitmap) LE */
-	__le16  bg_itable_unused_lo;	/* Unused inodes count */
-	__le16  bg_checksum;		/* crc16(sb_uuid+group+desc) */
-	__le32	bg_block_bitmap_hi;	/* Blocks bitmap block MSB */
-	__le32	bg_inode_bitmap_hi;	/* Inodes bitmap block MSB */
-	__le32	bg_inode_table_hi;	/* Inodes table block MSB */
-	__le16	bg_free_blocks_count_hi;/* Free blocks count MSB */
-	__le16	bg_free_inodes_count_hi;/* Free inodes count MSB */
-	__le16	bg_used_dirs_count_hi;	/* Directories count MSB */
-	__le16  bg_itable_unused_hi;    /* Unused inodes count MSB */
-	__le32  bg_exclude_bitmap_hi;   /* Exclude bitmap block MSB */
-	__le16  bg_block_bitmap_csum_hi;/* crc32c(s_uuid+grp_num+bbitmap) BE */
-	__le16  bg_inode_bitmap_csum_hi;/* crc32c(s_uuid+grp_num+ibitmap) BE */
-	__u32   bg_reserved;
-};
-```
+从结构体里可知，s_checksum存储在超级块的最后4字节（起点1020），从裸数据里看出，s_checksum=0x352dca96，与上面读出的是相同的。
