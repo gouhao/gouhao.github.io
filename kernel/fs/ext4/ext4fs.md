@@ -362,43 +362,29 @@ Writing superblocks and filesystem accounting information: done
 	mmap第1次写时分配。
 
   max_batch_time=usec
-        Maximum amount of time ext4 should wait for additional filesystem
-        operations to be batch together with a synchronous write operation.
-        Since a synchronous write operation is going to force a commit and then
-        a wait for the I/O complete, it doesn't cost much, and can be a huge
-        throughput win, we wait for a small amount of time to see if any other
-        transactions can piggyback on the synchronous write.   The algorithm
-        used is designed to automatically tune for the speed of the disk, by
-        measuring the amount of time (on average) that it takes to finish
-        committing a transaction.  Call this time the "commit time".  If the
-        time that the transaction has been running is less than the commit
-        time, ext4 will try sleeping for the commit time to see if other
-        operations will join the transaction.   The commit time is capped by
-        the max_batch_time, which defaults to 15000us (15ms).   This
-        optimization can be turned off entirely by setting max_batch_time to 0.
+	ext4需要等待其它文件系统操作和写操作同一批的最大等待时间。因为一个同步写操作将会强制一个
+	提交，并且等待io完成。它不会花费很多，并且能赢得巨大的吞吐量，我们等待一个小的时间来看其他
+	事务能否背着同步写。这个算法被用来自动调节磁盘的速度，通过测量事务完成时间的总数平均值，这
+	个时间叫做"commit time"。如果事务已经运行的时间小于提交时间，ext4将会尝试睡眠提交时间来看
+	是否有其它操作加入事务。提交时间以max_batch_time为上限，默认是15000us（15毫秒）。可以将
+	max_batch_time设置为0来关闭这个优化。
 
   min_batch_time=usec
-        This parameter sets the commit time (as described above) to be at least
-        min_batch_time.  It defaults to zero microseconds.  Increasing this
-        parameter may improve the throughput of multi-threaded, synchronous
-        workloads on very fast disks, at the cost of increasing latency.
+	这个设置提交时间（像上面描述的）至少为min_batch_time。默认是0微秒。增加这个值可以在
+	非常快速磁盘上，提高多线程的吞吐量，同步的负载。代价是会增加延迟。
 
   journal_ioprio=prio
 	IO优先级（从0到7，0是最高的优先级），这个被用到io操作提交时，通过kjournald2在一个
 	commit操作里。默认是3，这是一个比默认优先级稍微高的优先级。
 
   auto_da_alloc(*), noauto_da_alloc
-        Many broken applications don't use fsync() when replacing existing
-        files via patterns such as fd = open("foo.new")/write(fd,..)/close(fd)/
-        rename("foo.new", "foo"), or worse yet, fd = open("foo",
-        O_TRUNC)/write(fd,..)/close(fd).  If auto_da_alloc is enabled, ext4
-        will detect the replace-via-rename and replace-via-truncate patterns
-        and force that any delayed allocation blocks are allocated such that at
-        the next journal commit, in the default data=ordered mode, the data
-        blocks of the new file are forced to disk before the rename() operation
-        is committed.  This provides roughly the same level of guarantees as
-        ext3, and avoids the "zero-length" problem that can happen when a
-        system crashes before the delayed allocation blocks are forced to disk.
+	很多坏程序都不使用fsync当替换已存在文件时，通过这样的模式：fd = open("foo.new")/
+	write(fd,..)/close(fd)/rename("foo.new", "foo"),或才其它更坏的情况。fd = 
+	open("foo",O_TRUNC)/write(fd,..)/close(fd). 如果auto_da_alloc使能，ext4将
+	检测通过rename替换和通过truncate替换模式，并且强制任何延迟块分配在下次日志提交时是被
+	分配的。在默认的data=ordered模式，新文件的数据块被强制写入磁盘在rename操作被提交之前。
+	这像ext3那样提供了一个粗略的相同等级，并且避免0长度问题发生，当一个系统在延迟分配块被强制
+	写入磁盘之前系统崩溃。
 
   noinit_itable
 	不要在后台初始化未初始化的inode-table。这个特性被用到安装cd里，以至于安装进程能够尽
@@ -427,15 +413,14 @@ Writing superblocks and filesystem accounting information: done
 	限制，这个选项默认是关的（也就是默认是dioread_lock）。
 
   max_dir_size_kb=n
-        This limits the size of directories so that any attempt to expand them
-        beyond the specified limit in kilobytes will cause an ENOSPC error.
-        This is useful in memory constrained environments, where a very large
-        directory can cause severe performance problems or even provoke the Out
-        Of Memory killer.  (For example, if there is only 512mb memory
+	这个限制目录的尺寸，因此任何想扩展目录超过了指定大小kb，将会报ENOSPC错误。这对内存被约束的
+	环境很有用，一个非常大的目录可能会导致严重的性能问题或导致oom-killer。（比如，只有512M的
+	内存可用，一个176MB的目录可能会严重的影响系统性能。
+	For example, if there is only 512mb memory
         available, a 176mb directory may seriously cramp the system's style.)
 
   i_version
-        Enable 64-bit inode version support. This option is off by default.
+	使能64位inode版本支持。这个选项默认关闭
 
   dax
         使用直接访问（没有page-cache)。详情查看Documentation/filesystems/dax.txt。
