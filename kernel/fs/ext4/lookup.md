@@ -18,6 +18,14 @@ struct fscrypt_str {
 	unsigned char *name; // 名称
 	u32 len; // 长度
 };
+
+struct ext4_dir_entry_2 {
+	__le32	inode;			/* inode号 */
+	__le16	rec_len;		/* entry长度 */
+	__u8	name_len;		/* 文件长度 */
+	__u8	file_type;		/* 文件类型 */
+	char	name[EXT4_NAME_LEN];	/* 文件名 */
+};
 ```
 
 ## ext4_lookup
@@ -180,13 +188,14 @@ static struct buffer_head *__ext4_find_entry(struct inode *dir,
 		goto restart;
 	}
 
-	// dir_dx是使用哈希表存储目录entry项. todo: 后面看
+	// dir_dx是使用哈希表存储目录entry项.
 	if (is_dx(dir)) {
 		ret = ext4_dx_find_entry(dir, fname, res_dir);
 		/*
-		 * On success, or if the error was file not found,
-		 * return.  Otherwise, fall back to doing a search the
-		 * old fashioned way.
+		 * 成功时, 或者错误是文件未找到, 则返回.
+		 * 否则, 退回到老的查找方式
+		 * 
+		 * ERR_BAD_DX_DIR是错误的哈希目录,这种情况也退回到普通查找
 		 */
 		if (!IS_ERR(ret) || PTR_ERR(ret) != ERR_BAD_DX_DIR)
 			goto cleanup_and_exit;
@@ -262,7 +271,7 @@ restart:
 		}
 		// 设置校验标志
 		set_buffer_verified(bh);
-		// 找文件名
+		// 找文件名, 如果找到了res_dir会带回找到的结果
 		i = search_dirblock(bh, dir, fname,
 			    block << EXT4_BLOCK_SIZE_BITS(sb), res_dir);
 		if (i == 1) {
@@ -406,4 +415,667 @@ int ext4_dirblock_csum_verify(struct inode *inode, struct buffer_head *bh)
 
 	return 1;
 }
+
+static inline int search_dirblock(struct buffer_head *bh,
+				  struct inode *dir,
+				  struct ext4_filename *fname,
+				  unsigned int offset,
+				  struct ext4_dir_entry_2 **res_dir)
+{
+	return ext4_search_dir(bh, bh->b_data, dir->i_sb->s_blocksize, dir,
+			       fname, offset, res_dir);
+}
+
+int ext4_search_dir(struct buffer_head *bh, char *search_buf, int buf_size,
+		    struct inode *dir, struct ext4_filename *fname,
+		    unsigned int offset, struct ext4_dir_entry_2 **res_dir)
+{
+	struct ext4_dir_entry_2 * de;
+	char * dlimit;
+	int de_len;
+
+	// 文件的目录项是按照 ext4_dir_entry_2 在磁盘上来布局的
+	de = (struct ext4_dir_entry_2 *)search_buf;
+	// 结尾
+	dlimit = search_buf + buf_size;
+	while ((char *) de < dlimit) {
+		/* 这些代码经常被指数级的执行, 做最小的检查 */
+		if ((char *) de + de->name_len <= dlimit &&
+			// 比较文件名是否相同
+		    ext4_match(dir, fname, de)) {
+			/* 找到一个匹配的, 为了确定,做一个全面检查 */
+			if (ext4_check_dir_entry(dir, NULL, de, bh, search_buf,
+						 buf_size, offset))
+				return -1;
+			*res_dir = de;
+			return 1;
+		}
+		/* 获取当前entry的长度, 这个包装函数是为了阻止坏块的循环 */
+		de_len = ext4_rec_len_from_disk(de->rec_len,
+						dir->i_sb->s_blocksize);
+		if (de_len <= 0)
+			return -1;
+		// 获取下一个entry
+		offset += de_len;
+		de = (struct ext4_dir_entry_2 *) ((char *) de + de_len);
+	}
+	return 0;
+}
+
+static inline bool ext4_match(const struct inode *parent,
+			      const struct ext4_filename *fname,
+			      const struct ext4_dir_entry_2 *de)
+{
+	struct fscrypt_name f;
+#ifdef CONFIG_UNICODE
+	const struct qstr entry = {.name = de->name, .len = de->name_len};
+#endif
+
+	// 没有inode肯定不匹配
+	if (!de->inode)
+		return false;
+
+	// 把2个name放到临时变量里
+	f.usr_fname = fname->usr_fname;
+	f.disk_name = fname->disk_name;
+#ifdef CONFIG_FS_ENCRYPTION
+	f.crypto_buf = fname->crypto_buf;
+#endif
+
+#ifdef CONFIG_UNICODE
+	if (parent->i_sb->s_encoding && IS_CASEFOLDED(parent)) {
+		if (fname->cf_name.name) {
+			struct qstr cf = {.name = fname->cf_name.name,
+					  .len = fname->cf_name.len};
+			return !ext4_ci_compare(parent, &cf, &entry, true);
+		}
+		return !ext4_ci_compare(parent, fname->usr_fname, &entry,
+					false);
+	}
+#endif
+
+	return fscrypt_match_name(&f, de->name, de->name_len);
+}
+
+static inline bool fscrypt_match_name(const struct fscrypt_name *fname,
+				      const u8 *de_name, u32 de_name_len)
+{
+	// 长度不相等的, 肯定错了
+	if (de_name_len != fname->disk_name.len)
+		return false;
+	// 比较名称是否相同
+	return !memcmp(de_name, fname->disk_name.name, fname->disk_name.len);
+}
+
+#define ext4_check_dir_entry(dir, filp, de, bh, buf, size, offset)	\
+	unlikely(__ext4_check_dir_entry(__func__, __LINE__, (dir), (filp), \
+					(de), (bh), (buf), (size), (offset)))
+
+int __ext4_check_dir_entry(const char *function, unsigned int line,
+			   struct inode *dir, struct file *filp,
+			   struct ext4_dir_entry_2 *de,
+			   struct buffer_head *bh, char *buf, int size,
+			   unsigned int offset)
+{
+	const char *error_msg = NULL;
+	// 文件名长度
+	const int rlen = ext4_rec_len_from_disk(de->rec_len,
+						dir->i_sb->s_blocksize);
+	// 下一个entry距离buf的距离
+	const int next_offset = ((char *) de - buf) + rlen;
+
+	// entry长度小于文件名是1的长度
+	if (unlikely(rlen < EXT4_DIR_REC_LEN(1)))
+		error_msg = "rec_len is smaller than minimal";
+	// entry长度不是4的倍数
+	else if (unlikely(rlen % 4 != 0))
+		error_msg = "rec_len % 4 != 0";
+	// entry长度小于文件名长度
+	else if (unlikely(rlen < EXT4_DIR_REC_LEN(de->name_len)))
+		error_msg = "rec_len is too small for name_len";
+	// 下一个entry如果大于size, 说明当前检查的entry超过界限了
+	else if (unlikely(next_offset > size))
+		error_msg = "directory entry overrun";
+	// 下一个entry大于末尾只能存放一个的目录长度,且next不是size.
+	// todo: 这个为什么出错??
+	else if (unlikely(next_offset > size - EXT4_DIR_REC_LEN(1) &&
+			  next_offset != size))
+		error_msg = "directory entry too close to block end";
+	// inode号大于文件系统支持的inode总数
+	else if (unlikely(le32_to_cpu(de->inode) >
+			le32_to_cpu(EXT4_SB(dir->i_sb)->s_es->s_inodes_count)))
+		error_msg = "inode out of bounds";
+	else
+		// 除了上述情况就是正常的
+		return 0;
+
+	// 打印错误日志
+	if (filp)
+		ext4_error_file(filp, function, line, bh->b_blocknr,
+				"bad entry in directory: %s - offset=%u, "
+				"inode=%u, rec_len=%d, name_len=%d, size=%d",
+				error_msg, offset, le32_to_cpu(de->inode),
+				rlen, de->name_len, size);
+	else
+		ext4_error_inode(dir, function, line, bh->b_blocknr,
+				"bad entry in directory: %s - offset=%u, "
+				"inode=%u, rec_len=%d, name_len=%d, size=%d",
+				 error_msg, offset, le32_to_cpu(de->inode),
+				 rlen, de->name_len, size);
+
+	return 1;
+}
+
+struct dx_root
+{
+	// 假的 '.', '..' 目录
+	struct fake_dirent dot;
+	char dot_name[4];
+	struct fake_dirent dotdot;
+	char dotdot_name[4];
+
+	// 根节点信息
+	struct dx_root_info
+	{
+		__le32 reserved_zero;
+		u8 hash_version;
+		u8 info_length; /* 8 */
+		u8 indirect_levels;
+		u8 unused_flags;
+	}
+	info;
+
+	// entry数量
+	struct dx_entry	entries[];
+};
+
+struct fake_dirent
+{
+	__le32 inode;
+	__le16 rec_len;
+	u8 name_len;
+	u8 file_type;
+};
+
+struct dx_node
+{
+	// 为什么需要一个假的dirent来占位
+	struct fake_dirent fake;
+	// entry数组
+	struct dx_entry	entries[];
+};
+
+
+struct dx_frame
+{
+	struct buffer_head *bh;
+	struct dx_entry *entries;
+	struct dx_entry *at;
+};
+
+struct dx_map_entry
+{
+	u32 hash;
+	u16 offs;
+	u16 size;
+};
+
+struct dx_hash_info
+{
+	u32		hash; // 哈希值
+	u32		minor_hash; // 最小哈希值
+	int		hash_version; // 哈希版本
+	u32		*seed; // 种子
+};
+
+static struct buffer_head * ext4_dx_find_entry(struct inode *dir,
+			struct ext4_filename *fname,
+			struct ext4_dir_entry_2 **res_dir)
+{
+	struct super_block * sb = dir->i_sb;
+	// EXT4_HTREE_LEVEL 3
+	struct dx_frame frames[EXT4_HTREE_LEVEL], *frame;
+	struct buffer_head *bh;
+	ext4_lblk_t block;
+	int retval;
+
+#ifdef CONFIG_FS_ENCRYPTION
+	*res_dir = NULL;
+#endif
+	// 根据文件名的哈希值, 找到中间的索引节点, frame返回的是最后一层的索引节点
+	frame = dx_probe(fname, dir, NULL, frames);
+	if (IS_ERR(frame))
+		return (struct buffer_head *) frame;
+	do {
+		// 所在的块号
+		block = dx_get_block(frame->at);
+		// 读取块, 类型是目录哈希树
+		bh = ext4_read_dirblock(dir, block, DIRENT_HTREE);
+		if (IS_ERR(bh))
+			goto errout;
+
+		// 根据文件名在块内搜索目标文件名
+		retval = search_dirblock(bh, dir, fname,
+					 block << EXT4_BLOCK_SIZE_BITS(sb),
+					 res_dir);
+		// 成功
+		if (retval == 1)
+			goto success;
+			
+		// 没有找到
+		brelse(bh);
+
+		// 返回-1是出错
+		if (retval == -1) {
+			bh = ERR_PTR(ERR_BAD_DX_DIR);
+			goto errout;
+		}
+
+		// 取下一个节点再试一次
+		retval = ext4_htree_next_block(dir, fname->hinfo.hash, frame,
+					       frames, NULL);
+		// 小于0是读取bh出错,
+		if (retval < 0) {
+			ext4_warning_inode(dir,
+				"error %d reading directory index block",
+				retval);
+			bh = ERR_PTR(retval);
+			goto errout;
+		}
+	} while (retval == 1);
+
+	bh = NULL;
+errout:
+	dxtrace(printk(KERN_DEBUG "%s not found\n", fname->usr_fname->name));
+success:
+	dx_release(frames);
+	return bh;
+}
+
+static int ext4_htree_next_block(struct inode *dir, __u32 hash,
+				 struct dx_frame *frame,
+				 struct dx_frame *frames,
+				 __u32 *start_hash)
+{
+	struct dx_frame *p;
+	struct buffer_head *bh;
+	int num_frames = 0;
+	__u32 bhash;
+
+	p = frame;
+	/*
+	 * Find the next leaf page by incrementing the frame pointer.
+	 * If we run out of entries in the interior node, loop around and
+	 * increment pointer in the parent node.  When we break out of
+	 * this loop, num_frames indicates the number of interior
+	 * nodes need to be read.
+	 */
+	while (1) {
+		// 下一节点没有超界
+		if (++(p->at) < p->entries + dx_get_count(p->entries))
+			break;
+		// 已找到头
+		if (p == frames)
+			return 0;
+		num_frames++;
+		// frame退回到上一层
+		p--;
+	}
+
+	/*
+	 * If the hash is 1, then continue only if the next page has a
+	 * continuation hash of any value.  This is used for readdir
+	 * handling.  Otherwise, check to see if the hash matches the
+	 * desired contiuation hash.  If it doesn't, return since
+	 * there's no point to read in the successive index pages.
+	 */
+	// 获取at的哈希
+	bhash = dx_get_hash(p->at);
+	// 开始哈希
+	if (start_hash)
+		*start_hash = bhash;
+	// todo: what ?
+	if ((hash & 1) == 0) {
+		if ((bhash & ~1) != hash)
+			return 0;
+	}
+	/*
+	 * If the hash is HASH_NB_ALWAYS, we always go to the next
+	 * block so no check is necessary
+	 */
+	// 读出所有中间节点的新的at节点
+	while (num_frames--) {
+		// 读at
+		bh = ext4_read_dirblock(dir, dx_get_block(p->at), INDEX);
+		if (IS_ERR(bh))
+			return PTR_ERR(bh);
+		// p指向下一个
+		p++;
+		// 先释放之前的bh
+		brelse(p->bh);
+		// 设置新值
+		p->bh = bh;
+		// 设置新的at及entries值
+		p->at = p->entries = ((struct dx_node *) bh->b_data)->entries;
+	}
+	return 1;
+}
+
+static struct dx_frame *
+dx_probe(struct ext4_filename *fname, struct inode *dir,
+	 struct dx_hash_info *hinfo, struct dx_frame *frame_in)
+{
+	unsigned count, indirect;
+	struct dx_entry *at, *entries, *p, *q, *m;
+	struct dx_root *root;
+	struct dx_frame *frame = frame_in;
+	struct dx_frame *ret_err = ERR_PTR(ERR_BAD_DX_DIR);
+	u32 hash;
+
+	// frame_in全部清空
+	memset(frame_in, 0, EXT4_HTREE_LEVEL * sizeof(frame_in[0]));
+	// 读块, 第0个块, 块类型是索引
+	frame->bh = ext4_read_dirblock(dir, 0, INDEX);
+	// 读失败, 直接返回
+	if (IS_ERR(frame->bh))
+		return (struct dx_frame *) frame->bh;
+
+	// 第0个块是根节点
+	root = (struct dx_root *) frame->bh->b_data;
+	// 哈希类型目前只支持这4种
+	if (root->info.hash_version != DX_HASH_TEA &&
+	    root->info.hash_version != DX_HASH_HALF_MD4 &&
+	    root->info.hash_version != DX_HASH_LEGACY) {
+		ext4_warning_inode(dir, "Unrecognised inode hash code %u",
+				   root->info.hash_version);
+		goto fail;
+	}
+	// 取fname里的hinfo
+	if (fname)
+		hinfo = &fname->hinfo;
+	// 设置哈希版本
+	hinfo->hash_version = root->info.hash_version;
+	// todo: why ?
+	if (hinfo->hash_version <= DX_HASH_TEA)
+		hinfo->hash_version += EXT4_SB(dir->i_sb)->s_hash_unsigned;
+	// 从超级块里取哈希种子
+	hinfo->seed = EXT4_SB(dir->i_sb)->s_hash_seed;
+	// 有文件名,则对文件名进行哈希, 结果保存在hinfo里
+	if (fname && fname_name(fname))
+		ext4fs_dirhash(dir, fname_name(fname), fname_len(fname), hinfo);
+	// 文件名对应的哈希值
+	hash = hinfo->hash;
+
+	// 未使用的标志被用了, 则错误
+	if (root->info.unused_flags & 1) {
+		ext4_warning_inode(dir, "Unimplemented hash flags: %#06x",
+				   root->info.unused_flags);
+		goto fail;
+	}
+
+	// 间接层数
+	indirect = root->info.indirect_levels;
+	// 间接层数不能大于最大值
+	if (indirect >= ext4_dir_htree_level(dir->i_sb)) {
+		ext4_warning(dir->i_sb,
+			     "Directory (ino: %lu) htree depth %#06x exceed"
+			     "supported value", dir->i_ino,
+			     ext4_dir_htree_level(dir->i_sb));
+		if (ext4_dir_htree_level(dir->i_sb) < EXT4_HTREE_LEVEL) {
+			ext4_warning(dir->i_sb, "Enable large directory "
+						"feature to access it");
+		}
+		goto fail;
+	}
+
+	// root->info+info_len就是root->entries.
+	// 每一个entry
+	entries = (struct dx_entry *)(((char *)&root->info) +
+				      root->info.info_length);
+
+	// entries数量和root的限制不一样
+	if (dx_get_limit(entries) != dx_root_limit(dir,
+						   root->info.info_length)) {
+		ext4_warning_inode(dir, "dx entry: limit %u != root limit %u",
+				   dx_get_limit(entries),
+				   dx_root_limit(dir, root->info.info_length));
+		goto fail;
+	}
+
+	dxtrace(printk("Look up %x", hash));
+	while (1) {
+		// 获取entry的数量
+		count = dx_get_count(entries);
+		// 没有entry或者超过发限制, 则失败
+		if (!count || count > dx_get_limit(entries)) {
+			ext4_warning_inode(dir,
+					   "dx entry: count %u beyond limit %u",
+					   count, dx_get_limit(entries));
+			goto fail;
+		}
+
+		// p是下一个entry
+		p = entries + 1;
+		// q是最后一个entry
+		q = entries + count - 1;
+		// 使用二分法查找
+		while (p <= q) {
+
+			// 取中间值
+			m = p + (q - p) / 2;
+			dxtrace(printk(KERN_CONT "."));
+			// dx_get_hash: entry->hash
+
+			// 小于中间值向左, 反之向右
+			if (dx_get_hash(m) > hash)
+				q = m - 1;
+			else
+				p = m + 1;
+		}
+
+		if (0) { // linear search cross check
+			unsigned n = count - 1;
+			at = entries;
+			while (n--)
+			{
+				dxtrace(printk(KERN_CONT ","));
+				if (dx_get_hash(++at) > hash)
+				{
+					at--;
+					break;
+				}
+			}
+			assert (at == p - 1);
+		}
+
+		// 最左小于目标哈希的entry
+		at = p - 1;
+		dxtrace(printk(KERN_CONT " %x->%u\n",
+			       at == entries ? 0 : dx_get_hash(at),
+			       dx_get_block(at)));
+		// 设置该层的entries起点
+		frame->entries = entries;
+		// 设置最接近目标的entry
+		frame->at = at;
+		// 如果所有层都已读取,则返回
+		if (!indirect--)
+			// 这里返回的frame是最后一层的指针
+			return frame;
+		// 指向下个frame
+		frame++;
+		// 读取at所在的块
+		frame->bh = ext4_read_dirblock(dir, dx_get_block(at), INDEX);
+		if (IS_ERR(frame->bh)) {
+			ret_err = (struct dx_frame *) frame->bh;
+			frame->bh = NULL;
+			goto fail;
+		}
+		// 第二层的第一个节点就是 dx_node了
+		entries = ((struct dx_node *) frame->bh->b_data)->entries;
+
+		// 两个限制数量要相同
+		if (dx_get_limit(entries) != dx_node_limit(dir)) {
+			ext4_warning_inode(dir,
+				"dx entry: limit %u != node limit %u",
+				dx_get_limit(entries), dx_node_limit(dir));
+			goto fail;
+		}
+	}
+
+	// 走到这儿表示失败了, 都成功就从上面 `return frame了`
+
+fail:
+	// 释放frame的资源
+	while (frame >= frame_in) {
+		brelse(frame->bh);
+		frame--;
+	}
+
+	// 这种情况是文件系统有问题了
+	if (ret_err == ERR_PTR(ERR_BAD_DX_DIR))
+		ext4_warning_inode(dir,
+			"Corrupt directory, running e2fsck is recommended");
+	return ret_err;
+}
+
+struct fake_dirent
+{
+	__le32 inode;
+	__le16 rec_len;
+	u8 name_len;
+	u8 file_type;
+};
+
+struct dx_countlimit
+{
+	__le16 limit; // entry最大限制
+	__le16 count; // 当前存的数量?
+};
+
+struct dx_entry
+{
+	__le32 hash; // entry 哈希值
+	__le32 block; // 块号
+};
+
+static inline unsigned dx_root_limit(struct inode *dir, unsigned infosize)
+{
+	// 根节点,先减去存放 '.', '..'的长度, 再减去存放info本身的长度, 就是剩余的空间
+	unsigned entry_space = dir->i_sb->s_blocksize - EXT4_DIR_REC_LEN(1) -
+		EXT4_DIR_REC_LEN(2) - infosize;
+
+	// 如果还有元数据校验, 则还要减去dx_tail的空间
+	if (ext4_has_metadata_csum(dir->i_sb))
+		entry_space -= sizeof(struct dx_tail);
+	// 返回能够存放dx_entry的数量
+	return entry_space / sizeof(struct dx_entry);
+}
+
+static inline unsigned dx_node_limit(struct inode *dir)
+{
+	// 和上面dx_root_limit的限制类似, 可是它为什么要减去一个rec_len(0)呢?
+	unsigned entry_space = dir->i_sb->s_blocksize - EXT4_DIR_REC_LEN(0);
+
+	if (ext4_has_metadata_csum(dir->i_sb))
+		entry_space -= sizeof(struct dx_tail);
+	return entry_space / sizeof(struct dx_entry);
+}
+
+static inline unsigned dx_get_limit(struct dx_entry *entries)
+{
+	// 能存放entry的最大数量
+	return le16_to_cpu(((struct dx_countlimit *) entries)->limit);
+}
+
+static inline unsigned dx_get_count(struct dx_entry *entries)
+{
+	return le16_to_cpu(((struct dx_countlimit *) entries)->count);
+}
+
+#define ext4_read_dirblock(inode, block, type) \
+	__ext4_read_dirblock((inode), (block), (type), __func__, __LINE__)
+
+static struct buffer_head *__ext4_read_dirblock(struct inode *inode,
+						ext4_lblk_t block,
+						dirblock_type_t type,
+						const char *func,
+						unsigned int line)
+{
+	struct buffer_head *bh;
+	struct ext4_dir_entry *dirent;
+	int is_dx_block = 0;
+
+	if (ext4_simulate_fail(inode->i_sb, EXT4_SIM_DIRBLOCK_EIO))
+		bh = ERR_PTR(-EIO);
+	else
+		bh = ext4_bread(NULL, inode, block, 0);
+	if (IS_ERR(bh)) {
+		__ext4_warning(inode->i_sb, func, line,
+			       "inode #%lu: lblock %lu: comm %s: "
+			       "error %ld reading directory block",
+			       inode->i_ino, (unsigned long)block,
+			       current->comm, PTR_ERR(bh));
+
+		return bh;
+	}
+	if (!bh && (type == INDEX || type == DIRENT_HTREE)) {
+		ext4_error_inode(inode, func, line, block,
+				 "Directory hole found for htree %s block",
+				 (type == INDEX) ? "index" : "leaf");
+		return ERR_PTR(-EFSCORRUPTED);
+	}
+	if (!bh)
+		return NULL;
+	dirent = (struct ext4_dir_entry *) bh->b_data;
+	/* Determine whether or not we have an index block */
+	if (is_dx(inode)) {
+		if (block == 0)
+			is_dx_block = 1;
+		else if (ext4_rec_len_from_disk(dirent->rec_len,
+						inode->i_sb->s_blocksize) ==
+			 inode->i_sb->s_blocksize)
+			is_dx_block = 1;
+	}
+	if (!is_dx_block && type == INDEX) {
+		ext4_error_inode(inode, func, line, block,
+		       "directory leaf block found instead of index block");
+		brelse(bh);
+		return ERR_PTR(-EFSCORRUPTED);
+	}
+	if (!ext4_has_metadata_csum(inode->i_sb) ||
+	    buffer_verified(bh))
+		return bh;
+
+	/*
+	 * An empty leaf block can get mistaken for a index block; for
+	 * this reason, we can only check the index checksum when the
+	 * caller is sure it should be an index block.
+	 */
+	if (is_dx_block && type == INDEX) {
+		if (ext4_dx_csum_verify(inode, dirent) &&
+		    !ext4_simulate_fail(inode->i_sb, EXT4_SIM_DIRBLOCK_CRC))
+			set_buffer_verified(bh);
+		else {
+			ext4_error_inode_err(inode, func, line, block,
+					     EFSBADCRC,
+					     "Directory index failed checksum");
+			brelse(bh);
+			return ERR_PTR(-EFSBADCRC);
+		}
+	}
+	if (!is_dx_block) {
+		if (ext4_dirblock_csum_verify(inode, bh) &&
+		    !ext4_simulate_fail(inode->i_sb, EXT4_SIM_DIRBLOCK_CRC))
+			set_buffer_verified(bh);
+		else {
+			ext4_error_inode_err(inode, func, line, block,
+					     EFSBADCRC,
+					     "Directory block failed checksum");
+			brelse(bh);
+			return ERR_PTR(-EFSBADCRC);
+		}
+	}
+	return bh;
+}
 ```
+
