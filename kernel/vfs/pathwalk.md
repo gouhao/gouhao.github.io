@@ -591,7 +591,7 @@ static bool choose_mountpoint(struct mount *m, const struct path *root,
 static bool choose_mountpoint_rcu(struct mount *m, const struct path *root,
 				  struct path *path, unsigned *seqp)
 {
-	// 判断m != m->mnt_parent;
+	// 判断 m != m->mnt_parent;
 	while (mnt_has_parent(m)) {
 		// 文件系统挂载点的dentry
 		struct dentry *mountpoint = m->mnt_mountpoint;

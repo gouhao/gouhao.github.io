@@ -1131,15 +1131,15 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 {
 	struct block_device *bdev;
 	struct super_block *s;
-    // 初始模式为读，执行
+	// 初始模式为读，执行
 	fmode_t mode = FMODE_READ | FMODE_EXCL;
 	int error = 0;
 
-    // 如果不是只读就加入写标志
+	// 如果不是只读就加入写标志
 	if (!(flags & SB_RDONLY))
 		mode |= FMODE_WRITE;
 
-    // 获取块设备
+	// 获取块设备
 	bdev = blkdev_get_by_path(dev_name, mode, fs_type);
 	if (IS_ERR(bdev))
 		return ERR_CAST(bdev);
@@ -1149,7 +1149,7 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 	 * will protect the lockfs code from trying to start a snapshot
 	 * while we are mounting
 	 */
-    // todo: 没看懂
+	// todo: 没看懂
 	mutex_lock(&bdev->bd_fsfreeze_mutex);
 	if (bdev->bd_fsfreeze_count > 0) {
 		mutex_unlock(&bdev->bd_fsfreeze_mutex);
@@ -1157,7 +1157,7 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 		goto error_bdev;
 	}
 
-    // 获取/创建超级块
+	// 获取/创建超级块
 	s = sget(fs_type, test_bdev_super, set_bdev_super, flags | SB_NOSEC,
 		 bdev);
 	mutex_unlock(&bdev->bd_fsfreeze_mutex);
@@ -1166,7 +1166,7 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 
 	if (s->s_root) { // 这个分支是设备已经挂载
         
-        // 如果已挂载的模块和要求的模式不一样，则返回EBUSY
+        	// 如果已挂载的模块和要求的模式不一样，则返回EBUSY
 		if ((flags ^ s->s_flags) & SB_RDONLY) {
 			deactivate_locked_super(s);
 			error = -EBUSY;
@@ -1180,30 +1180,30 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 		 * s_umount temporarily.  This is safe as we're
 		 * holding an active reference.
 		 */
-        // todo: 没看懂，为要先释放锁，再加锁
+        	// todo: 没看懂，为要先释放锁，再加锁
 		up_write(&s->s_umount);
 		blkdev_put(bdev, mode);
 		down_write(&s->s_umount);
 	} else { // 这个分支是设备没有挂载
 		s->s_mode = mode; // 设置超级块模式
 		snprintf(s->s_id, sizeof(s->s_id), "%pg", bdev);
-        // 设置超级块大小
+        	// 设置超级块大小
 		sb_set_blocksize(s, block_size(bdev));
 
-        // 调用特定文件系统的fill_super来填充超级块
+        	// 调用特定文件系统的fill_super来填充超级块
 		error = fill_super(s, data, flags & SB_SILENT ? 1 : 0);
 		if (error) {
 			deactivate_locked_super(s);
 			goto error;
 		}
 
-        // 激活超级块
+		// 激活超级块
 		s->s_flags |= SB_ACTIVE;
-        // 设置块设备的超级块指针
+		// 设置块设备的超级块指针
 		bdev->bd_super = s;
 	}
 
-    // 返回根节点dentry
+	// 返回根节点dentry
 	return dget(s->s_root);
 
 error_s:

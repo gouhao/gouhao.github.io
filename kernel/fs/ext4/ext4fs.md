@@ -688,7 +688,7 @@ $ hexdump -s 139520 -n 256 img
 struct ext4_inode {
 	__le16	i_mode;	// 文件模式：0x41ed
 	__le16	i_uid;	// uid: 0x0000，也就是root用户
-	__le32	i_size_lo; // 文件大小：0x00000001，注意：ext4是小端，高16位在后。
+	__le32	i_size_lo; // 文件大小：0x00001000，注意：ext4是小端，高16位在后。
 	__le32	i_atime; // 访问时间：0x6509a90f=1695131919=2023年 09月 19日 星期二 21:58:39 CST
 	__le32	i_ctime; // 元数据修改时间：0x6509a920
 	__le32	i_mtime; // 内容修改时间：0x6509a920
