@@ -1025,7 +1025,8 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		if (retval != -ENOSPC)
 			goto out;
 
-		// 处理索引相关
+		// 走到这儿说明没空间了,
+		// 没空间且只有一个块时, 如果dir_index打开,转换成dir_index
 		if (blocks == 1 && !dx_fallback &&
 		    ext4_has_feature_dir_index(sb)) {
 			retval = make_indexed_dir(handle, &fname, dir,
@@ -1063,6 +1064,270 @@ out:
 	// 添加成功，修改inode状态
 	if (retval == 0)
 		ext4_set_inode_state(inode, EXT4_STATE_NEWENTRY);
+	return retval;
+}
+
+static int add_dirent_to_buf(handle_t *handle, struct ext4_filename *fname,
+			     struct inode *dir,
+			     struct inode *inode, struct ext4_dir_entry_2 *de,
+			     struct buffer_head *bh)
+{
+	unsigned int	blocksize = dir->i_sb->s_blocksize;
+	int		csum_size = 0;
+	int		err, err2;
+
+	// 有元数据校验和
+	if (ext4_has_metadata_csum(inode->i_sb))
+		csum_size = sizeof(struct ext4_dir_entry_tail);
+
+	// de为空, 找目录de
+	if (!de) {
+		err = ext4_find_dest_de(dir, inode, bh, bh->b_data,
+					blocksize - csum_size, fname, &de);
+		if (err)
+			return err;
+	}
+	BUFFER_TRACE(bh, "get_write_access");
+	// 获取写权限
+	err = ext4_journal_get_write_access(handle, bh);
+	if (err) {
+		ext4_std_error(dir->i_sb, err);
+		return err;
+	}
+
+	// 插入dentry
+	ext4_insert_dentry(inode, de, blocksize, fname);
+
+	// 先更新时间
+	dir->i_mtime = dir->i_ctime = current_time(dir);
+	ext4_update_dx_flag(dir);
+	// 更新版本号 todo: what
+	inode_inc_iversion(dir);
+	// inode标脏
+	err2 = ext4_mark_inode_dirty(handle, dir);
+	BUFFER_TRACE(bh, "call ext4_handle_dirty_metadata");
+	err = ext4_handle_dirty_dirblock(handle, dir, bh);
+	if (err)
+		ext4_std_error(dir->i_sb, err);
+	return err ? err : err2;
+}
+
+int ext4_find_dest_de(struct inode *dir, struct inode *inode,
+		      struct buffer_head *bh,
+		      void *buf, int buf_size,
+		      struct ext4_filename *fname,
+		      struct ext4_dir_entry_2 **dest_de)
+{
+	struct ext4_dir_entry_2 *de;
+	// 文件名对应的entry长度
+	unsigned short reclen = EXT4_DIR_REC_LEN(fname_len(fname));
+	int nlen, rlen;
+	unsigned int offset = 0;
+	char *top;
+
+	// 头entry
+	de = (struct ext4_dir_entry_2 *)buf;
+
+	// 末尾
+	top = buf + buf_size - reclen;
+	while ((char *) de <= top) {
+		// 检查de是否合法
+		if (ext4_check_dir_entry(dir, NULL, de, bh,
+					 buf, buf_size, offset))
+			return -EFSCORRUPTED;
+		// 该文件已存在
+		if (ext4_match(dir, fname, de))
+			return -EEXIST;
+		// de结构长度
+		nlen = EXT4_DIR_REC_LEN(de->name_len);
+		// 真实长度
+		rlen = ext4_rec_len_from_disk(de->rec_len, buf_size);
+		// 如果inode为空,表示这个entry被删了, 如果文件被删了, de的长度必须大于新插入的de才行.
+		// 如果inode不为空, (rlen - nlen)就表示这个de还剩的空间, 如果还能放下新entry, 则存之.
+		if ((de->inode ? rlen - nlen : rlen) >= reclen)
+			break;
+		// 下一个结点
+		de = (struct ext4_dir_entry_2 *)((char *)de + rlen);
+		offset += rlen;
+	}
+	// de最多就等于top, 大于top肯定就错了
+	if ((char *) de > top)
+		return -ENOSPC;
+	// 目标位置
+	*dest_de = de;
+	return 0;
+}
+
+void ext4_insert_dentry(struct inode *inode,
+			struct ext4_dir_entry_2 *de,
+			int buf_size,
+			struct ext4_filename *fname)
+{
+
+	int nlen, rlen;
+
+	// de已使用长度
+	nlen = EXT4_DIR_REC_LEN(de->name_len);
+	// de原来的长度
+	rlen = ext4_rec_len_from_disk(de->rec_len, buf_size);
+
+	// 如果de现在有文件
+	if (de->inode) {
+		// 则从当前de后面存
+		struct ext4_dir_entry_2 *de1 =
+			(struct ext4_dir_entry_2 *)((char *)de + nlen);
+		// 新de1的盘上空间为原来de,剩余的空闲
+		de1->rec_len = ext4_rec_len_to_disk(rlen - nlen, buf_size);
+		// 修改原de的空间
+		de->rec_len = ext4_rec_len_to_disk(nlen, buf_size);
+		// 使用de1存放
+		de = de1;
+	}
+	// 类型暂设为未知
+	de->file_type = EXT4_FT_UNKNOWN;
+	// inode
+	de->inode = cpu_to_le32(inode->i_ino);
+	// 根据mode设置文件类型
+	ext4_set_de_type(inode->i_sb, de, inode->i_mode);
+	// 文件名长度
+	de->name_len = fname_len(fname);
+	// 把文件名复制到de->name里
+	memcpy(de->name, fname_name(fname), fname_len(fname));
+}
+
+static inline void ext4_update_dx_flag(struct inode *inode)
+{
+	// 如果没有index特性, 但是有EXT4_INODE_INDEX标志
+	if (!ext4_has_feature_dir_index(inode->i_sb) &&
+	    ext4_test_inode_flag(inode, EXT4_INODE_INDEX)) {
+		// 有dir_index就必须要有元数据校验和吗?
+		WARN_ON_ONCE(ext4_has_feature_metadata_csum(inode->i_sb));
+		// 清除标志
+		ext4_clear_inode_flag(inode, EXT4_INODE_INDEX);
+	}
+}
+
+int ext4_handle_dirty_dirblock(handle_t *handle,
+			       struct inode *inode,
+			       struct buffer_head *bh)
+{
+	// 给dir_block设置校验值
+	ext4_dirblock_csum_set(inode, bh);
+	// 日志相关, 标脏元数据
+	return ext4_handle_dirty_metadata(handle, inode, bh);
+}
+
+static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
+			    struct inode *dir,
+			    struct inode *inode, struct buffer_head *bh)
+{
+	struct buffer_head *bh2;
+	struct dx_root	*root;
+	struct dx_frame	frames[EXT4_HTREE_LEVEL], *frame;
+	struct dx_entry *entries;
+	struct ext4_dir_entry_2	*de, *de2;
+	char		*data2, *top;
+	unsigned	len;
+	int		retval;
+	unsigned	blocksize;
+	ext4_lblk_t  block;
+	struct fake_dirent *fde;
+	int csum_size = 0;
+
+	if (ext4_has_metadata_csum(inode->i_sb))
+		csum_size = sizeof(struct ext4_dir_entry_tail);
+
+	blocksize =  dir->i_sb->s_blocksize;
+	dxtrace(printk(KERN_DEBUG "Creating index: inode %lu\n", dir->i_ino));
+	BUFFER_TRACE(bh, "get_write_access");
+	retval = ext4_journal_get_write_access(handle, bh);
+	if (retval) {
+		ext4_std_error(dir->i_sb, retval);
+		brelse(bh);
+		return retval;
+	}
+	root = (struct dx_root *) bh->b_data;
+
+	/* The 0th block becomes the root, move the dirents out */
+	fde = &root->dotdot;
+	de = (struct ext4_dir_entry_2 *)((char *)fde +
+		ext4_rec_len_from_disk(fde->rec_len, blocksize));
+	if ((char *) de >= (((char *) root) + blocksize)) {
+		EXT4_ERROR_INODE(dir, "invalid rec_len for '..'");
+		brelse(bh);
+		return -EFSCORRUPTED;
+	}
+	len = ((char *) root) + (blocksize - csum_size) - (char *) de;
+
+	/* Allocate new block for the 0th block's dirents */
+	bh2 = ext4_append(handle, dir, &block);
+	if (IS_ERR(bh2)) {
+		brelse(bh);
+		return PTR_ERR(bh2);
+	}
+	ext4_set_inode_flag(dir, EXT4_INODE_INDEX);
+	data2 = bh2->b_data;
+
+	memcpy(data2, de, len);
+	de = (struct ext4_dir_entry_2 *) data2;
+	top = data2 + len;
+	while ((char *)(de2 = ext4_next_entry(de, blocksize)) < top)
+		de = de2;
+	de->rec_len = ext4_rec_len_to_disk(data2 + (blocksize - csum_size) -
+					   (char *) de, blocksize);
+
+	if (csum_size)
+		ext4_initialize_dirent_tail(bh2, blocksize);
+
+	/* Initialize the root; the dot dirents already exist */
+	de = (struct ext4_dir_entry_2 *) (&root->dotdot);
+	de->rec_len = ext4_rec_len_to_disk(blocksize - EXT4_DIR_REC_LEN(2),
+					   blocksize);
+	memset (&root->info, 0, sizeof(root->info));
+	root->info.info_length = sizeof(root->info);
+	root->info.hash_version = EXT4_SB(dir->i_sb)->s_def_hash_version;
+	entries = root->entries;
+	dx_set_block(entries, 1);
+	dx_set_count(entries, 1);
+	dx_set_limit(entries, dx_root_limit(dir, sizeof(root->info)));
+
+	/* Initialize as for dx_probe */
+	fname->hinfo.hash_version = root->info.hash_version;
+	if (fname->hinfo.hash_version <= DX_HASH_TEA)
+		fname->hinfo.hash_version += EXT4_SB(dir->i_sb)->s_hash_unsigned;
+	fname->hinfo.seed = EXT4_SB(dir->i_sb)->s_hash_seed;
+	ext4fs_dirhash(dir, fname_name(fname), fname_len(fname), &fname->hinfo);
+
+	memset(frames, 0, sizeof(frames));
+	frame = frames;
+	frame->entries = entries;
+	frame->at = entries;
+	frame->bh = bh;
+
+	retval = ext4_handle_dirty_dx_node(handle, dir, frame->bh);
+	if (retval)
+		goto out_frames;	
+	retval = ext4_handle_dirty_dirblock(handle, dir, bh2);
+	if (retval)
+		goto out_frames;	
+
+	de = do_split(handle,dir, &bh2, frame, &fname->hinfo);
+	if (IS_ERR(de)) {
+		retval = PTR_ERR(de);
+		goto out_frames;
+	}
+
+	retval = add_dirent_to_buf(handle, fname, dir, inode, de, bh2);
+out_frames:
+	/*
+	 * Even if the block split failed, we have to properly write
+	 * out all the changes we did so far. Otherwise we can end up
+	 * with corrupted filesystem.
+	 */
+	if (retval)
+		ext4_mark_inode_dirty(handle, dir);
+	dx_release(frames);
+	brelse(bh2);
 	return retval;
 }
 ```
