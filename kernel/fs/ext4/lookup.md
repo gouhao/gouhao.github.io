@@ -589,21 +589,6 @@ struct dx_root
 	struct dx_entry	entries[];
 };
 
-struct fake_dirent
-{
-	__le32 inode;
-	__le16 rec_len;
-	u8 name_len;
-	u8 file_type;
-};
-
-struct dx_node
-{
-	// 为什么需要一个假的dirent来占位
-	struct fake_dirent fake;
-	// entry数组
-	struct dx_entry	entries[];
-};
 
 
 struct dx_frame
@@ -796,7 +781,8 @@ static inline unsigned dx_root_limit(struct inode *dir, unsigned infosize)
 
 static inline unsigned dx_node_limit(struct inode *dir)
 {
-	// 和上面dx_root_limit的限制类似, 可是它为什么要减去一个rec_len(0)呢?
+	// 和上面dx_root_limit的限制类似, 第0个位置要保存`struct dx_node`,
+	// 所以要减去一个rec_len(0)的长度
 	unsigned entry_space = dir->i_sb->s_blocksize - EXT4_DIR_REC_LEN(0);
 
 	if (ext4_has_metadata_csum(dir->i_sb))
