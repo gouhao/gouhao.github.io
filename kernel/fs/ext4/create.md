@@ -969,12 +969,12 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		return -EINVAL;
 #endif
 
-	// 设置文件名相关
+	// 把文件名相关的内容设置到fname里
 	retval = ext4_fname_setup_filename(dir, &dentry->d_name, 0, &fname);
 	if (retval)
 		return retval;
 
-	// 有内联数据，todo: 内联数据后面再看
+	// 有内联数据, 则先尝试加到内联数据里，todo: 内联数据后面再看
 	if (ext4_has_inline_data(dir)) {
 		retval = ext4_try_add_inline_entry(handle, &fname, dir, inode);
 		if (retval < 0)
@@ -985,20 +985,27 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		}
 	}
 
-	// 目录索引
+	// 如果当前目录是dir_index
 	if (is_dx(dir)) {
+		// 添加目录
 		retval = ext4_dx_add_entry(handle, &fname, dir, inode);
 		if (!retval || (retval != ERR_BAD_DX_DIR))
 			goto out;
-		/* Can we just ignore htree data? */
+		
+		// 走到这儿表示哈希树有问题
+
+		// 如果有校验和就错了
 		if (ext4_has_metadata_csum(sb)) {
 			EXT4_ERROR_INODE(dir,
 				"Directory has corrupted htree index.");
 			retval = -EFSCORRUPTED;
 			goto out;
 		}
+		// 清除inode的index标志
 		ext4_clear_inode_flag(dir, EXT4_INODE_INDEX);
+		// dx需要回退
 		dx_fallback++;
+		// 父目录inode标脏
 		retval = ext4_mark_inode_dirty(handle, dir);
 		if (unlikely(retval))
 			goto out;
@@ -1338,6 +1345,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	if (retval)
 		goto out_frames;	
 
+	// 把de里的entry做分割
 	de = do_split(handle,dir, &bh2, frame, &fname->hinfo);
 	if (IS_ERR(de)) {
 		retval = PTR_ERR(de);
@@ -1469,10 +1477,14 @@ static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 		swap(*bh, bh2);
 		de = de2;
 	}
+	// 把新块插入
 	dx_insert_block(frame, hash2 + continued, newblock);
+
+	// block标脏
 	err = ext4_handle_dirty_dirblock(handle, dir, bh2);
 	if (err)
 		goto journal_error;
+	// 索引结点标脏
 	err = ext4_handle_dirty_dx_node(handle, dir, frame->bh);
 	if (err)
 		goto journal_error;
