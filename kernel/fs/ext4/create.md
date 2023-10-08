@@ -35,6 +35,7 @@ retry:
 		// 创建成功，设置各种函数表
 		inode->i_op = &ext4_file_inode_operations;
 		inode->i_fop = &ext4_file_operations;
+		// 设置mapping函数
 		ext4_set_aops(inode);
 		// 添加到目录
 		err = ext4_add_nondir(handle, dentry, &inode);
@@ -931,7 +932,7 @@ static int ext4_add_nondir(handle_t *handle,
 }
 ```
 
-### 3.1 ext4_add_entry
+## 4. ext4_add_entry
 ```c
 static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 			  struct inode *inode)
@@ -954,7 +955,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 
 	sb = dir->i_sb;
 	blocksize = sb->s_blocksize;
-	// 文件名不能为0
+	// 文件名不能为空
 	if (!dentry->d_name.len)
 		return -EINVAL;
 
@@ -1013,8 +1014,10 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 	// 目录当前块数
 	blocks = dir->i_size >> sb->s_blocksize_bits;
 	for (block = 0; block < blocks; block++) {
-		// 读取目录数据块
+		// 读取目录数据块, 这个函数在读块时,还会对块的校验和进行校验
 		bh = ext4_read_dirblock(dir, block, DIRENT);
+
+		// 新目录, 分配一个块
 		if (bh == NULL) {
 			bh = ext4_bread(handle, dir, block,
 					EXT4_GET_BLOCKS_CREATE);
@@ -1057,9 +1060,10 @@ add_to_new_block:
 	de = (struct ext4_dir_entry_2 *) bh->b_data;
 	// 新块inode数为0
 	de->inode = 0;
+	// 因为是新块,所以rec_len是整个块的长度(不包括校验和)
 	de->rec_len = ext4_rec_len_to_disk(blocksize - csum_size, blocksize);
 
-	// 校验和
+	// 如果开启校验和的话, 则初始化校验和
 	if (csum_size)
 		ext4_initialize_dirent_tail(bh, blocksize);
 
@@ -1087,7 +1091,7 @@ static int add_dirent_to_buf(handle_t *handle, struct ext4_filename *fname,
 	if (ext4_has_metadata_csum(inode->i_sb))
 		csum_size = sizeof(struct ext4_dir_entry_tail);
 
-	// de为空, 找目录de
+	// de为空, 找目标de
 	if (!de) {
 		err = ext4_find_dest_de(dir, inode, bh, bh->b_data,
 					blocksize - csum_size, fname, &de);
@@ -1107,12 +1111,14 @@ static int add_dirent_to_buf(handle_t *handle, struct ext4_filename *fname,
 
 	// 先更新时间
 	dir->i_mtime = dir->i_ctime = current_time(dir);
+	// 清除父目录EXT4_INODE_INDEX标志
 	ext4_update_dx_flag(dir);
 	// 更新版本号 todo: what
 	inode_inc_iversion(dir);
-	// inode标脏
+	// 父目录标脏
 	err2 = ext4_mark_inode_dirty(handle, dir);
 	BUFFER_TRACE(bh, "call ext4_handle_dirty_metadata");
+	// bh标脏
 	err = ext4_handle_dirty_dirblock(handle, dir, bh);
 	if (err)
 		ext4_std_error(dir->i_sb, err);
@@ -1224,396 +1230,6 @@ int ext4_handle_dirty_dirblock(handle_t *handle,
 	return ext4_handle_dirty_metadata(handle, inode, bh);
 }
 
-static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
-			    struct inode *dir,
-			    struct inode *inode, struct buffer_head *bh)
-{
-	struct buffer_head *bh2;
-	struct dx_root	*root;
-	// EXT4_HTREE_LEVEL 3
-	struct dx_frame	frames[EXT4_HTREE_LEVEL], *frame;
-	struct dx_entry *entries;
-	struct ext4_dir_entry_2	*de, *de2;
-	char		*data2, *top;
-	unsigned	len;
-	int		retval;
-	unsigned	blocksize;
-	ext4_lblk_t  block;
-	struct fake_dirent *fde;
-	int csum_size = 0;
-
-	// 如果有校验和特性,需要预留出来大小
-	if (ext4_has_metadata_csum(inode->i_sb))
-		csum_size = sizeof(struct ext4_dir_entry_tail);
-
-	// 块大小
-	blocksize =  dir->i_sb->s_blocksize;
-	dxtrace(printk(KERN_DEBUG "Creating index: inode %lu\n", dir->i_ino));
-	BUFFER_TRACE(bh, "get_write_access");
-	// 日志
-	retval = ext4_journal_get_write_access(handle, bh);
-	if (retval) {
-		ext4_std_error(dir->i_sb, retval);
-		brelse(bh);
-		return retval;
-	}
-	// 这个bh就是第一个块的数据
-	root = (struct dx_root *) bh->b_data;
-
-	// '..'
-	fde = &root->dotdot;
-	// 第1个de
-	de = (struct ext4_dir_entry_2 *)((char *)fde +
-		ext4_rec_len_from_disk(fde->rec_len, blocksize));
-	if ((char *) de >= (((char *) root) + blocksize)) {
-		EXT4_ERROR_INODE(dir, "invalid rec_len for '..'");
-		brelse(bh);
-		return -EFSCORRUPTED;
-	}
-	// 剩余空间的长度
-	len = ((char *) root) + (blocksize - csum_size) - (char *) de;
-
-	// 分配一个新块来存放第0个块里的数据
-	bh2 = ext4_append(handle, dir, &block);
-	if (IS_ERR(bh2)) {
-		brelse(bh);
-		return PTR_ERR(bh2);
-	}
-	// 给目录设置index标志
-	ext4_set_inode_flag(dir, EXT4_INODE_INDEX);
-	data2 = bh2->b_data;
-	
-	// 把原来de的数据写到新块里
-	memcpy(data2, de, len);
-	// 新块的头结点
-	de = (struct ext4_dir_entry_2 *) data2;
-	// 最后一个节点
-	top = data2 + len;
-	// 找到最后一个节点
-	while ((char *)(de2 = ext4_next_entry(de, blocksize)) < top)
-		de = de2;
-	// 最后一个结点的rec_len设置为其余所剩空间的
-	de->rec_len = ext4_rec_len_to_disk(data2 + (blocksize - csum_size) -
-					   (char *) de, blocksize);
-
-	// 如果有校验和,则初始化最后的校验和空间
-	if (csum_size)
-		ext4_initialize_dirent_tail(bh2, blocksize);
-
-	// '..'entry
-	de = (struct ext4_dir_entry_2 *) (&root->dotdot);
-	// 它的长度是2
-	de->rec_len = ext4_rec_len_to_disk(blocksize - EXT4_DIR_REC_LEN(2),
-					   blocksize);
-	// 清空info
-	memset (&root->info, 0, sizeof(root->info));
-	// info长度就是info结构体的长度
-	root->info.info_length = sizeof(root->info);
-	// 哈希版本
-	root->info.hash_version = EXT4_SB(dir->i_sb)->s_def_hash_version;
-	// entry数组的第1个元素
-	entries = root->entries;
-	// 第1个索引的块号为1
-	dx_set_block(entries, 1);
-	// 数量也为1
-	dx_set_count(entries, 1);
-	// 最大能存放的entry数
-	dx_set_limit(entries, dx_root_limit(dir, sizeof(root->info)));
-
-	// 初始化哈希版本?
-	fname->hinfo.hash_version = root->info.hash_version;
-	if (fname->hinfo.hash_version <= DX_HASH_TEA)
-		fname->hinfo.hash_version += EXT4_SB(dir->i_sb)->s_hash_unsigned;
-	// 哈希种子
-	fname->hinfo.seed = EXT4_SB(dir->i_sb)->s_hash_seed;
-	// 计算要添加文件的哈希值
-	ext4fs_dirhash(dir, fname_name(fname), fname_len(fname), &fname->hinfo);
-
-	memset(frames, 0, sizeof(frames));
-	// 因为此时只有一个块, 所以直使用
-	frame = frames;
-	frame->entries = entries;
-	frame->at = entries;
-	frame->bh = bh;
-
-	// 标脏,这个函数里会计算索引的校验和
-	retval = ext4_handle_dirty_dx_node(handle, dir, frame->bh);
-	if (retval)
-		goto out_frames;	
-	// 标脏,这个函数里会计算目录块的校验和
-	retval = ext4_handle_dirty_dirblock(handle, dir, bh2);
-	if (retval)
-		goto out_frames;	
-
-	// 把de里的entry做分割
-	de = do_split(handle,dir, &bh2, frame, &fname->hinfo);
-	if (IS_ERR(de)) {
-		retval = PTR_ERR(de);
-		goto out_frames;
-	}
-
-	retval = add_dirent_to_buf(handle, fname, dir, inode, de, bh2);
-out_frames:
-	/*
-	 * Even if the block split failed, we have to properly write
-	 * out all the changes we did so far. Otherwise we can end up
-	 * with corrupted filesystem.
-	 */
-	if (retval)
-		ext4_mark_inode_dirty(handle, dir);
-	dx_release(frames);
-	brelse(bh2);
-	return retval;
-}
-
-static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
-			struct buffer_head **bh,struct dx_frame *frame,
-			struct dx_hash_info *hinfo)
-{
-	unsigned blocksize = dir->i_sb->s_blocksize;
-	unsigned count, continued;
-	struct buffer_head *bh2;
-	ext4_lblk_t newblock;
-	u32 hash2;
-	struct dx_map_entry *map;
-	char *data1 = (*bh)->b_data, *data2;
-	unsigned split, move, size;
-	struct ext4_dir_entry_2 *de = NULL, *de2;
-	int	csum_size = 0;
-	int	err = 0, i;
-
-	// 校验和
-	if (ext4_has_metadata_csum(dir->i_sb))
-		csum_size = sizeof(struct ext4_dir_entry_tail);
-
-	// 分配一个新块
-	bh2 = ext4_append(handle, dir, &newblock);
-	if (IS_ERR(bh2)) {
-		brelse(*bh);
-		*bh = NULL;
-		return (struct ext4_dir_entry_2 *) bh2;
-	}
-
-	// 日志相关
-	BUFFER_TRACE(*bh, "get_write_access");
-	err = ext4_journal_get_write_access(handle, *bh);
-	if (err)
-		goto journal_error;
-
-	BUFFER_TRACE(frame->bh, "get_write_access");
-	err = ext4_journal_get_write_access(handle, frame->bh);
-	if (err)
-		goto journal_error;
-
-	// 新分配块的数据
-	data2 = bh2->b_data;
-
-	// 在末尾做映射entry?
-	map = (struct dx_map_entry *) (data2 + blocksize);
-	// 新块对data1做映射, 返回值是已映射的数量
-	count = dx_make_map(dir, (struct ext4_dir_entry_2 *) data1,
-			     blocksize, hinfo, map);
-	// map后退count个数量
-	map -= count;
-	// 按哈希大小值来排序
-	dx_sort_map(map, count);
-	
-	
-	size = 0;
-	move = 0;
-	// todo: ?
-	for (i = count-1; i >= 0; i--) {
-		/* is more than half of this entry in 2nd half of the block? */
-		if (size + map[i].size/2 > blocksize/2)
-			break;
-		size += map[i].size;
-		move++;
-	}
-	/*
-	 * map index at which we will split
-	 *
-	 * If the sum of active entries didn't exceed half the block size, just
-	 * split it in half by count; each resulting block will have at least
-	 * half the space free.
-	 */
-	// 确定裁剪位置
-	if (i > 0)
-		split = count - move;
-	else
-		split = count/2;
-
-	// what ?
-	hash2 = map[split].hash;
-	continued = hash2 == map[split - 1].hash;
-	dxtrace(printk(KERN_INFO "Split block %lu at %x, %i/%i\n",
-			(unsigned long)dx_get_block(frame->at),
-					hash2, split, count-split));
-
-	// 从data1里给data2移动一些数据
-	de2 = dx_move_dirents(data1, data2, map + split, count - split,
-			      blocksize);
-	// 把data1里的空闲重新高速的更紧凑一些
-	de = dx_pack_dirents(data1, blocksize);
-	// 重新计算两个entry的末尾空间
-	de->rec_len = ext4_rec_len_to_disk(data1 + (blocksize - csum_size) -
-					   (char *) de,
-					   blocksize);
-	de2->rec_len = ext4_rec_len_to_disk(data2 + (blocksize - csum_size) -
-					    (char *) de2,
-					    blocksize);
-	// 重新初始化两个块的末尾
-	if (csum_size) {
-		ext4_initialize_dirent_tail(*bh, blocksize);
-		ext4_initialize_dirent_tail(bh2, blocksize);
-	}
-
-	dxtrace(dx_show_leaf(dir, hinfo, (struct ext4_dir_entry_2 *) data1,
-			blocksize, 1));
-	dxtrace(dx_show_leaf(dir, hinfo, (struct ext4_dir_entry_2 *) data2,
-			blocksize, 1));
-
-	/* Which block gets the new entry? */
-	if (hinfo->hash >= hash2) {
-		swap(*bh, bh2);
-		de = de2;
-	}
-	// 把新块插入
-	dx_insert_block(frame, hash2 + continued, newblock);
-
-	// block标脏
-	err = ext4_handle_dirty_dirblock(handle, dir, bh2);
-	if (err)
-		goto journal_error;
-	// 索引结点标脏
-	err = ext4_handle_dirty_dx_node(handle, dir, frame->bh);
-	if (err)
-		goto journal_error;
-	brelse(bh2);
-	dxtrace(dx_show_index("frame", frame->entries));
-	return de;
-
-journal_error:
-	brelse(*bh);
-	brelse(bh2);
-	*bh = NULL;
-	ext4_std_error(dir->i_sb, err);
-	return ERR_PTR(err);
-}
-
-static struct ext4_dir_entry_2* dx_pack_dirents(char *base, unsigned blocksize)
-{
-	struct ext4_dir_entry_2 *next, *to, *prev, *de = (struct ext4_dir_entry_2 *) base;
-	unsigned rec_len = 0;
-
-	prev = to = de;
-	while ((char*)de < base + blocksize) {
-		// 保存下一个节点
-		next = ext4_next_entry(de, blocksize);
-
-		// de没被删除,且有文件名
-		if (de->inode && de->name_len) {
-			// de长度
-			rec_len = EXT4_DIR_REC_LEN(de->name_len);
-			// de如果在to后面,则移到to的位置上
-			if (de > to)
-				memmove(to, de, rec_len);
-			// 设置to的长度
-			to->rec_len = ext4_rec_len_to_disk(rec_len, blocksize);
-			prev = to;
-			// to递增
-			to = (struct ext4_dir_entry_2 *) (((char *) to) + rec_len);
-		}
-		// 下个节点
-		de = next;
-	}
-	return prev;
-}
-
-static struct ext4_dir_entry_2 *
-dx_move_dirents(char *from, char *to, struct dx_map_entry *map, int count,
-		unsigned blocksize)
-{
-	unsigned rec_len = 0;
-
-	while (count--) {
-		// 从from里取一个entry
-		struct ext4_dir_entry_2 *de = (struct ext4_dir_entry_2 *)
-						(from + (map->offs<<2));
-		rec_len = EXT4_DIR_REC_LEN(de->name_len);
-		// 把entry得到到to里
-		memcpy (to, de, rec_len);
-		// 设置to的rec_len
-		((struct ext4_dir_entry_2 *) to)->rec_len =
-				ext4_rec_len_to_disk(rec_len, blocksize);
-		// 设置inode为0,就相当于删除了这个inode
-		de->inode = 0;
-		// map和to都递增
-		map++;
-		to += rec_len;
-	}
-	// 返回to的最后一个节点
-	return (struct ext4_dir_entry_2 *) (to - rec_len);
-}
-
-static void dx_sort_map (struct dx_map_entry *map, unsigned count)
-{
-	struct dx_map_entry *p, *q, *top = map + count - 1;
-	int more;
-	// 对哈希值进行排序
-	while (count > 2) {
-		count = count*10/13;
-		if (count - 9 < 2) /* 9, 10 -> 11 */
-			count = 11;
-		for (p = top, q = p - count; q >= map; p--, q--)
-			if (p->hash < q->hash)
-				swap(*p, *q);
-	}
-	// what?
-	do {
-		more = 0;
-		q = top;
-		while (q-- > map) {
-			if (q[1].hash >= q[0].hash)
-				continue;
-			swap(*(q+1), *q);
-			more = 1;
-		}
-	} while(more);
-}
-
-static int dx_make_map(struct inode *dir, struct ext4_dir_entry_2 *de,
-		       unsigned blocksize, struct dx_hash_info *hinfo,
-		       struct dx_map_entry *map_tail)
-{
-	int count = 0;
-	char *base = (char *) de;
-	struct dx_hash_info h = *hinfo;
-
-	// 遍历所有entry
-	while ((char *) de < base + blocksize) {
-		// 有文件名且有inode
-		if (de->name_len && de->inode) {
-			// 计算文件名的哈希
-			ext4fs_dirhash(dir, de->name, de->name_len, &h);
-			// 设置映射指向的对应哈希值
-			map_tail--;
-			map_tail->hash = h.hash;
-			map_tail->offs = ((char *) de - base)>>2;
-			map_tail->size = le16_to_cpu(de->rec_len);
-			count++;
-			cond_resched();
-		}
-		// 下个节点
-		de = ext4_next_entry(de, blocksize);
-	}
-	return count;
-}
-
-static inline void dx_set_block(struct dx_entry *entry, ext4_lblk_t value)
-{
-	entry->block = cpu_to_le32(value);
-}
-
 static struct buffer_head *ext4_append(handle_t *handle,
 					struct inode *inode,
 					ext4_lblk_t *block)
@@ -1627,7 +1243,7 @@ static struct buffer_head *ext4_append(handle_t *handle,
 		      EXT4_SB(inode->i_sb)->s_max_dir_size_kb)))
 		return ERR_PTR(-ENOSPC);
 
-	// 文件大小转换成块号
+	// 文件大小转换成块号, 因为块是从0开始的,所以这个刚好是新块的块号
 	*block = inode->i_size >> inode->i_sb->s_blocksize_bits;
 
 	// 读块,如果块不存在,则分配新块
@@ -1652,7 +1268,7 @@ static struct buffer_head *ext4_append(handle_t *handle,
 void ext4_initialize_dirent_tail(struct buffer_head *bh,
 				 unsigned int blocksize)
 {
-	// 找到末尾的空闲
+	// 找到末尾的校验和空间
 	struct ext4_dir_entry_tail *t = EXT4_DIRENT_TAIL(bh->b_data, blocksize);
 
 	// 清0

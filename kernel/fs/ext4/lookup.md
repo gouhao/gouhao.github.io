@@ -566,53 +566,6 @@ int __ext4_check_dir_entry(const char *function, unsigned int line,
 	return 1;
 }
 
-struct dx_root
-{
-	// 假的 '.', '..' 目录
-	struct fake_dirent dot;
-	char dot_name[4];
-	struct fake_dirent dotdot;
-	char dotdot_name[4];
-
-	// 根节点信息
-	struct dx_root_info
-	{
-		__le32 reserved_zero;
-		u8 hash_version;
-		u8 info_length; /* 8 */
-		u8 indirect_levels;
-		u8 unused_flags;
-	}
-	info;
-
-	// entry数量
-	struct dx_entry	entries[];
-};
-
-
-
-struct dx_frame
-{
-	struct buffer_head *bh;
-	struct dx_entry *entries;
-	struct dx_entry *at;
-};
-
-struct dx_map_entry
-{
-	u32 hash;
-	u16 offs;
-	u16 size;
-};
-
-struct dx_hash_info
-{
-	u32		hash; // 哈希值
-	u32		minor_hash; // 最小哈希值
-	int		hash_version; // 哈希版本
-	u32		*seed; // 种子
-};
-
 static struct buffer_head * ext4_dx_find_entry(struct inode *dir,
 			struct ext4_filename *fname,
 			struct ext4_dir_entry_2 **res_dir)
@@ -746,38 +699,7 @@ static int ext4_htree_next_block(struct inode *dir, __u32 hash,
 	return 1;
 }
 
-struct fake_dirent
-{
-	__le32 inode;
-	__le16 rec_len;
-	u8 name_len;
-	u8 file_type;
-};
 
-struct dx_countlimit
-{
-	__le16 limit; // entry最大限制
-	__le16 count; // 当前存的数量?
-};
-
-struct dx_entry
-{
-	__le32 hash; // entry 哈希值
-	__le32 block; // 块号
-};
-
-static inline unsigned dx_root_limit(struct inode *dir, unsigned infosize)
-{
-	// 根节点,先减去存放 '.', '..'的长度, 再减去存放info本身的长度, 就是剩余的空间
-	unsigned entry_space = dir->i_sb->s_blocksize - EXT4_DIR_REC_LEN(1) -
-		EXT4_DIR_REC_LEN(2) - infosize;
-
-	// 如果还有元数据校验, 则还要减去dx_tail的空间
-	if (ext4_has_metadata_csum(dir->i_sb))
-		entry_space -= sizeof(struct dx_tail);
-	// 返回能够存放dx_entry的数量
-	return entry_space / sizeof(struct dx_entry);
-}
 
 static inline unsigned dx_node_limit(struct inode *dir)
 {
