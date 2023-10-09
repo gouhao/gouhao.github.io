@@ -105,6 +105,7 @@ struct dx_hash_info
 ```
 ## 1. make_indexed_dir
 ```c
+// 这个bh是第0块的bh
 static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 			    struct inode *dir,
 			    struct inode *inode, struct buffer_head *bh)
@@ -138,14 +139,15 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 		brelse(bh);
 		return retval;
 	}
-	// 这个bh就是第一个块的数据, 第一块现在要用来做根节点
+	// 第0块现在要用来做根节点
 	root = (struct dx_root *) bh->b_data;
 
 	// '..'
 	fde = &root->dotdot;
-	// 第1个de
+	// 普通块里，前两个entry是'.'和'..', 所以'..'之后就是第1个真正的entry
 	de = (struct ext4_dir_entry_2 *)((char *)fde +
 		ext4_rec_len_from_disk(fde->rec_len, blocksize));
+	// 第一个entry杂可能大于块大小？
 	if ((char *) de >= (((char *) root) + blocksize)) {
 		EXT4_ERROR_INODE(dir, "invalid rec_len for '..'");
 		brelse(bh);
@@ -164,26 +166,26 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	ext4_set_inode_flag(dir, EXT4_INODE_INDEX);
 	data2 = bh2->b_data;
 	
-	// 把原来de的数据写到新块里
+	// 把第0块的数据复制到第1块里
 	memcpy(data2, de, len);
-	// 新块的头结点
+	// 第1块的头结点
 	de = (struct ext4_dir_entry_2 *) data2;
-	// 最后一个节点
+	// 第1块最后一个节点
 	top = data2 + len;
-	// 找到最后一个节点
+	// 找到第1块最后一个节点
 	while ((char *)(de2 = ext4_next_entry(de, blocksize)) < top)
 		de = de2;
 	// 最后一个结点的rec_len设置为其余所剩空间的
 	de->rec_len = ext4_rec_len_to_disk(data2 + (blocksize - csum_size) -
 					   (char *) de, blocksize);
 
-	// 如果有校验和,则初始化最后的校验和空间
+	// 如果有校验和,则初始化第1块最后的校验和空间
 	if (csum_size)
 		ext4_initialize_dirent_tail(bh2, blocksize);
 
 	// '..'entry
 	de = (struct ext4_dir_entry_2 *) (&root->dotdot);
-	// 它的长度是2
+	// '..'的长度是2，所以剩余空间就是块大小减2
 	de->rec_len = ext4_rec_len_to_disk(blocksize - EXT4_DIR_REC_LEN(2),
 					   blocksize);
 	// 清空info

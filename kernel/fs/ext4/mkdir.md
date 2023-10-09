@@ -109,6 +109,7 @@ int ext4_init_new_dir(handle_t *handle, struct inode *dir,
 	if (IS_ERR(dir_block))
 		return PTR_ERR(dir_block);
 	de = (struct ext4_dir_entry_2 *)dir_block->b_data;
+	// 初始化 '.'和'..'的entry
 	ext4_init_dot_dotdot(inode, de, blocksize, csum_size, dir->i_ino, 0);
 	set_nlink(inode, 2);
 	if (csum_size)
