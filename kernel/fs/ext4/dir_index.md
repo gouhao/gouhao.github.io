@@ -500,7 +500,7 @@ dx_probe(struct ext4_filename *fname, struct inode *dir,
 
 	// frame_in全部清空
 	memset(frame_in, 0, EXT4_HTREE_LEVEL * sizeof(frame_in[0]));
-	// 读块, 第0个块, 块类型是索引
+	// 读第0块, 0块是根节点
 	frame->bh = ext4_read_dirblock(dir, 0, INDEX);
 	// 读失败, 直接返回
 	if (IS_ERR(frame->bh))
@@ -532,7 +532,7 @@ dx_probe(struct ext4_filename *fname, struct inode *dir,
 	// 文件名对应的哈希值
 	hash = hinfo->hash;
 
-	// 未使用的标志被用了, 则错误
+	// 使用了未使用的字段, 则错误
 	if (root->info.unused_flags & 1) {
 		ext4_warning_inode(dir, "Unimplemented hash flags: %#06x",
 				   root->info.unused_flags);
@@ -620,14 +620,14 @@ dx_probe(struct ext4_filename *fname, struct inode *dir,
 		dxtrace(printk(KERN_CONT " %x->%u\n",
 			       at == entries ? 0 : dx_get_hash(at),
 			       dx_get_block(at)));
-		// 设置该层的entries起点
+		// 设置该层的entry头
 		frame->entries = entries;
-		// 设置最接近目标的entry
+		// 设置entry所在的链头(小于目标哈希的节点)
 		frame->at = at;
 		// 如果所有层都已读取,则返回
 		if (!indirect--)
 			// 这里返回的frame是最后一层的指针
-			return frame;
+			return frame;最接近目标的
 		// 指向下个frame
 		frame++;
 		// 读取at所在的块

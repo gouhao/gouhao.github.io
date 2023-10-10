@@ -152,10 +152,8 @@ static struct buffer_head *__ext4_find_entry(struct inode *dir,
 	ext4_lblk_t start, block;
 	// 文件名
 	const u8 *name = fname->usr_fname->name;
-	size_t ra_max = 0;	/* Number of bh's in the readahead
-				   buffer, bh_use[] */
-	size_t ra_ptr = 0;	/* Current index into readahead
-				   buffer */
+	size_t ra_max = 0;	/* 预读的bh数量, bh_use[] */
+	size_t ra_ptr = 0;	// 预读的下标
 	ext4_lblk_t  nblocks;
 	int i, namelen, retval;
 
@@ -180,10 +178,11 @@ static struct buffer_head *__ext4_find_entry(struct inode *dir,
 		}
 	}
 
-	// '.', '..', 只在第一个块里有.
+	// '.'和'..'在第0个块里, 所以直接去下面搜索
 	if ((namelen <= 2) && (name[0] == '.') &&
 	    (name[1] == '.' || name[1] == '\0')) {
 		block = start = 0;
+		// '.', '..', 只可能有一个块
 		nblocks = 1;
 		goto restart;
 	}
@@ -210,11 +209,13 @@ static struct buffer_head *__ext4_find_entry(struct inode *dir,
 		ret = NULL;
 		goto cleanup_and_exit;
 	}
-	// 开始查找的块,保存上一次查找的值,加速查找
+	// 开始查找的块,从上一次查找的地方开始找, 根据局部性原理可以加速查找
 	start = EXT4_I(dir)->i_dir_start_lookup;
-	// 如果到最后一个块,则再从0开始
+	// 如果上一次已经找到最后一个// 判断最多预读多少块块,则再从头开始再找
 	if (start >= nblocks)
 		start = 0;
+
+	// block记录的是当前块?
 	block = start;
 restart:
 	do {
@@ -224,18 +225,20 @@ restart:
 		// 第1次进来的时候 ra_ptr, ra_max都是0
 		if (ra_ptr >= ra_max) {
 			ra_ptr = 0;
-			// 判断最多预读多少块
+			
 			if (block < start)
+				// 如果小于start说明已经读到末尾,又从头读了, 所以
+				// 只需读'start-block'个块就行
 				ra_max = start - block;
 			else
 				// 刚开始进来的时候,block==start, 所以ra_max=nblocks
 				ra_max = nblocks - block;
-			// 取与数组的最小值
+			// 取与8的最小值, 最多预读8个
 			ra_max = min(ra_max, ARRAY_SIZE(bh_use));
 
-			// 批量读取ra_max个块
+			// 给bh_use批量读取ra_max个块
 			retval = ext4_bread_batch(dir, block, ra_max,
-						  false /* wait */, bh_use);
+						  false /* 不等待 */, bh_use);
 			// 读块出错
 			if (retval) {
 				ret = ERR_PTR(retval);
@@ -271,7 +274,7 @@ restart:
 		}
 		// 设置校验标志
 		set_buffer_verified(bh);
-		// 找文件名, 如果找到了res_dir会带回找到的结果
+		// 在bh里查找文件名, 如果找到了res_dir会带回找到的结果
 		i = search_dirblock(bh, dir, fname,
 			    block << EXT4_BLOCK_SIZE_BITS(sb), res_dir);
 		if (i == 1) {
@@ -309,6 +312,7 @@ restart:
 
 	// 如果目录大小变了,再找一次
 	if (block < nblocks) {
+		// 这里把start设为0, 说明只需要再查找新增加的块就行
 		start = 0;
 		goto restart;
 	}
