@@ -1046,7 +1046,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		}
 		brelse(bh);
 	}
-	// 走到这儿表示当前目录的数据块都没空间
+	// 走到这儿表示当前目录的数据块都没空间, 非dix_index的流程
 
 	// 添加一个新块
 	bh = ext4_append(handle, dir, &block);
@@ -1111,7 +1111,7 @@ static int add_dirent_to_buf(handle_t *handle, struct ext4_filename *fname,
 
 	// 先更新时间
 	dir->i_mtime = dir->i_ctime = current_time(dir);
-	// 清除父目录EXT4_INODE_INDEX标志
+	// 如果没有dir_index特性, 则清除父目录EXT4_INODE_INDEX标志
 	ext4_update_dx_flag(dir);
 	// 更新版本号 todo: what
 	inode_inc_iversion(dir);

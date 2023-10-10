@@ -183,7 +183,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	if (csum_size)
 		ext4_initialize_dirent_tail(bh2, blocksize);
 
-	// '..'entry
+	// '..'entry, root是第0块
 	de = (struct ext4_dir_entry_2 *) (&root->dotdot);
 	// '..'的长度是2，所以剩余空间就是块大小减2
 	de->rec_len = ext4_rec_len_to_disk(blocksize - EXT4_DIR_REC_LEN(2),
@@ -194,10 +194,11 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	root->info.info_length = sizeof(root->info);
 	// 哈希版本
 	root->info.hash_version = EXT4_SB(dir->i_sb)->s_def_hash_version;
-	// entry数组的第1个元素
+	// 第0块的第一个元素
 	entries = root->entries;
 	// 第1个索引的块号为1
 	dx_set_block(entries, 1);
+	// 第0块不存储哈希值,存储hash的地方用来存count和limit元数据
 	// 数量也为1
 	dx_set_count(entries, 1);
 	// 根节点最大能存放的entry数
@@ -213,11 +214,11 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	ext4fs_dirhash(dir, fname_name(fname), fname_len(fname), &fname->hinfo);
 
 	memset(frames, 0, sizeof(frames));
-	// 因为此时只有一个块, 所以直使用
+	// 因为此时只有一个块, 所以直使用第一个frame
 	frame = frames;
 	frame->entries = entries;
 	frame->at = entries;
-	// 这里是原始的bh
+	// 这里是第0个bh
 	frame->bh = bh;
 
 	// 标脏,这个函数里会计算索引的校验和
@@ -229,14 +230,15 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	if (retval)
 		goto out_frames;	
 
-	// 把de里的entry做分割
+	// 把de里的entry做分割, bh2是第1个块, 现在第1个块里存放的是原来第0个块上的数据
+	// do_split是新分配一个块,然后把一个满块分割成2个块
 	de = do_split(handle,dir, &bh2, frame, &fname->hinfo);
 	if (IS_ERR(de)) {
 		retval = PTR_ERR(de);
 		goto out_frames;
 	}
 
-	// 然后给bh2里加新的entry
+	// 把新文件名加到第1块里
 	retval = add_dirent_to_buf(handle, fname, dir, inode, de, bh2);
 out_frames:
 	// 即使失败也需要标脏, 否则文件系统可能会错误
@@ -305,7 +307,7 @@ again:
 	if (err != -ENOSPC)
 		goto cleanup;
 
-	// 走到这儿说明没空间了
+	// 走到这儿说明at也没空间了
 	err = 0;
 	/* Block full, should compress but for now just split */
 	dxtrace(printk(KERN_DEBUG "using %u of %u node entries\n",
@@ -514,7 +516,7 @@ dx_probe(struct ext4_filename *fname, struct inode *dir,
 				   root->info.hash_version);
 		goto fail;
 	}
-	// 取fname里的hinfo, 这个是父目录的hinfo
+	// 取fname里的hinfo
 	if (fname)
 		hinfo = &fname->hinfo;
 	// 设置哈希版本
@@ -554,11 +556,11 @@ dx_probe(struct ext4_filename *fname, struct inode *dir,
 	}
 
 	// root->info+info_len就是root->entries.
-	// 第一个entry保存的是管理信息？
+	// 第一个entry保存的是管理信息
 	entries = (struct dx_entry *)(((char *)&root->info) +
 				      root->info.info_length);
 
-	// entries数量和root的限制不一样
+	// entries数量和root的限制不一样, 一般情况下都一样
 	if (dx_get_limit(entries) != dx_root_limit(dir,
 						   root->info.info_length)) {
 		ext4_warning_inode(dir, "dx entry: limit %u != root limit %u",
@@ -764,16 +766,19 @@ static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 
 	// 分割点的哈希值
 	hash2 = map[split].hash;
+	// 为了解决哈希冲突?
 	continued = hash2 == map[split - 1].hash;
 	dxtrace(printk(KERN_INFO "Split block %lu at %x, %i/%i\n",
 			(unsigned long)dx_get_block(frame->at),
 					hash2, split, count-split));
 
-	// 从data1里给data2移动一些数据
+	// 从data1里给data2移动map + split之后的数据
 	de2 = dx_move_dirents(data1, data2, map + split, count - split,
 			      blocksize);
-	// 把data1里的空闲重新高速的更紧凑一些
+	// 因为上面从data1里给data2移动了一些数据, data1里有些地方已经空了, 
+	// 所以把这些空间压缩一下, 弄的更紧凑一些
 	de = dx_pack_dirents(data1, blocksize);
+
 	// 重新计算两个entry的末尾空间
 	de->rec_len = ext4_rec_len_to_disk(data1 + (blocksize - csum_size) -
 					   (char *) de,
@@ -797,7 +802,7 @@ static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 		swap(*bh, bh2);
 		de = de2;
 	}
-	// 把新块插入
+	// 把新块插入到 frame->at+1 的地方
 	dx_insert_block(frame, hash2 + continued, newblock);
 
 	// block标脏
@@ -860,12 +865,12 @@ dx_move_dirents(char *from, char *to, struct dx_map_entry *map, int count,
 		struct ext4_dir_entry_2 *de = (struct ext4_dir_entry_2 *)
 						(from + (map->offs<<2));
 		rec_len = EXT4_DIR_REC_LEN(de->name_len);
-		// 把entry得到到to里
+		// 把entry从from移动到to里
 		memcpy (to, de, rec_len);
 		// 设置to的rec_len
 		((struct ext4_dir_entry_2 *) to)->rec_len =
 				ext4_rec_len_to_disk(rec_len, blocksize);
-		// 设置inode为0, todo: 为什么inode设置为0?
+		// 把from里的inode为0, 这相当于把from里的entry删了
 		de->inode = 0;
 		// map和to都递增
 		map++;
