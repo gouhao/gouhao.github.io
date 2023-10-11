@@ -147,7 +147,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	// 普通块里，前两个entry是'.'和'..', 所以'..'之后就是第1个真正的entry
 	de = (struct ext4_dir_entry_2 *)((char *)fde +
 		ext4_rec_len_from_disk(fde->rec_len, blocksize));
-	// 第一个entry杂可能大于块大小？
+	// 第一个entry杂可能大于块大小?
 	if ((char *) de >= (((char *) root) + blocksize)) {
 		EXT4_ERROR_INODE(dir, "invalid rec_len for '..'");
 		brelse(bh);
@@ -156,7 +156,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	// 剩余空间的长度
 	len = ((char *) root) + (blocksize - csum_size) - (char *) de;
 
-	// 分配一个新块来存放第0个块里的数据
+	// 分配一个新块来存放第0个块里的数据, 块号从block里返回
 	bh2 = ext4_append(handle, dir, &block);
 	if (IS_ERR(bh2)) {
 		brelse(bh);
@@ -164,6 +164,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	}
 	// 给目录设置index标志
 	ext4_set_inode_flag(dir, EXT4_INODE_INDEX);
+	// data2是新分配的块，即第1块
 	data2 = bh2->b_data;
 	
 	// 把第0块的数据复制到第1块里
@@ -186,6 +187,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	// '..'entry, root是第0块
 	de = (struct ext4_dir_entry_2 *) (&root->dotdot);
 	// '..'的长度是2，所以剩余空间就是块大小减2
+	// todo: root里不是还有info吗？为什么只减2个？
 	de->rec_len = ext4_rec_len_to_disk(blocksize - EXT4_DIR_REC_LEN(2),
 					   blocksize);
 	// 清空info
@@ -194,11 +196,13 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	root->info.info_length = sizeof(root->info);
 	// 哈希版本
 	root->info.hash_version = EXT4_SB(dir->i_sb)->s_def_hash_version;
-	// 第0块的第一个元素
+
+
+	// 第0块的第一个元素，第0个entry不存储哈希值(todo: why?),
+	// 存储hash的地方用来存count和limit元数据
 	entries = root->entries;
 	// 第1个索引的块号为1
 	dx_set_block(entries, 1);
-	// 第0块不存储哈希值,存储hash的地方用来存count和limit元数据
 	// 数量也为1
 	dx_set_count(entries, 1);
 	// 根节点最大能存放的entry数
@@ -217,6 +221,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	// 因为此时只有一个块, 所以直使用第一个frame
 	frame = frames;
 	frame->entries = entries;
+	// 新文件要插入的地方，经过上面设置entries指向第1个块，第1个块就是要插入的地方
 	frame->at = entries;
 	// 这里是第0个bh
 	frame->bh = bh;
@@ -230,8 +235,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	if (retval)
 		goto out_frames;	
 
-	// 把de里的entry做分割, bh2是第1个块, 现在第1个块里存放的是原来第0个块上的数据
-	// do_split是新分配一个块,然后把一个满块分割成2个块
+	// bh2的数据就是原来第0块里的entry数据，这里面的entry已经满了，所以把bh2里的entry做分割
 	de = do_split(handle,dir, &bh2, frame, &fname->hinfo);
 	if (IS_ERR(de)) {
 		retval = PTR_ERR(de);
@@ -689,6 +693,7 @@ static void dx_insert_block(struct dx_frame *frame, u32 hash, ext4_lblk_t block)
 	dx_set_count(entries, count + 1);
 }
 
+// do_split是新分配一个块,然后把一个满块分割成2个块
 static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 			struct buffer_head **bh,struct dx_frame *frame,
 			struct dx_hash_info *hinfo)
@@ -709,7 +714,7 @@ static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 	if (ext4_has_metadata_csum(dir->i_sb))
 		csum_size = sizeof(struct ext4_dir_entry_tail);
 
-	// 给目录分配一个新块
+	// 给目录分配一个新块，newblock返回的是新块号
 	bh2 = ext4_append(handle, dir, &newblock);
 	if (IS_ERR(bh2)) {
 		brelse(*bh);
@@ -731,12 +736,12 @@ static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 	// 新分配块的数据
 	data2 = bh2->b_data;
 
-	// 在末尾做映射entry?
+	// 利用尾部的空间数据做映射entry?
 	map = (struct dx_map_entry *) (data2 + blocksize);
 	// 给原来的数据做映射
 	count = dx_make_map(dir, (struct ext4_dir_entry_2 *) data1,
 			     blocksize, hinfo, map);
-	// map后退count个数量
+	// map后退count个数量，即映射后map的起点
 	map -= count;
 	// 按哈希大小值来排序map
 	dx_sort_map(map, count);
@@ -744,7 +749,8 @@ static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 	
 	size = 0;
 	move = 0;
-	// todo: ?
+	
+	// 确定要移动的数量
 	for (i = count-1; i >= 0; i--) {
 		// 检查是否有entry一半超过了blocksize?
 		if (size + map[i].size/2 > blocksize/2)
@@ -797,7 +803,7 @@ static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 	dxtrace(dx_show_leaf(dir, hinfo, (struct ext4_dir_entry_2 *) data2,
 			blocksize, 1));
 
-	// 如果要加入的项大于分割点,则加到右边
+	// 如果要加入的项大于分割点,则加到新分配的块里
 	if (hinfo->hash >= hash2) {
 		swap(*bh, bh2);
 		de = de2;
@@ -926,7 +932,7 @@ static int dx_make_map(struct inode *dir, struct ext4_dir_entry_2 *de,
 			// 设置映射指向的对应哈希值
 			map_tail--;
 			map_tail->hash = h.hash;
-			// todo: 为啥要右移2位?
+			// todo: 偏移为啥要除以4?
 			map_tail->offs = ((char *) de - base)>>2;
 			map_tail->size = le16_to_cpu(de->rec_len);
 			count++;
