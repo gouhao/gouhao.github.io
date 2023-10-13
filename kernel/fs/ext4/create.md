@@ -1017,7 +1017,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		// 读取目录数据块, 这个函数在读块时,还会对块的校验和进行校验
 		bh = ext4_read_dirblock(dir, block, DIRENT);
 
-		// 新目录, 分配一个块
+		// 如果块为空，分配一个块。todo: bh为什么会为NULL?
 		if (bh == NULL) {
 			bh = ext4_bread(handle, dir, block,
 					EXT4_GET_BLOCKS_CREATE);
@@ -1031,12 +1031,12 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		// 添加到数据块里
 		retval = add_dirent_to_buf(handle, &fname, dir, inode,
 					   NULL, bh);
-		// 除了没空间之外，直接返回
+		// 除了没空间之外，不管是错误还是成功都直接返回
 		if (retval != -ENOSPC)
 			goto out;
 
 		// 走到这儿说明没空间了,
-		// 没空间且只有一个块时, 如果dir_index打开,转换成dir_index
+		// 没空间且只有一个块时, 如果dx没有回退且dir_index打开,转换成dir_index，这个if应该放到循环外面
 		if (blocks == 1 && !dx_fallback &&
 		    ext4_has_feature_dir_index(sb)) {
 			retval = make_indexed_dir(handle, &fname, dir,
@@ -1077,7 +1077,17 @@ out:
 		ext4_set_inode_state(inode, EXT4_STATE_NEWENTRY);
 	return retval;
 }
+```
+主流程：  
+1. 尝试内联存储  
+2. 如果是dir_index，则添加，如果添加失败，则需要回退到普通存储  
+3. 普通存储：先在现在数据块里存储  
+4. 第3步如果失败，则判断当前是否只有一个数据块，如果是，且没有dir_index回退，则把普通存储转换成dir_index  
+5. 如果普通存储失败且是没空闲，则分配一个新块来存储
 
+
+## 把entry添加到数据块里
+```c
 static int add_dirent_to_buf(handle_t *handle, struct ext4_filename *fname,
 			     struct inode *dir,
 			     struct inode *inode, struct ext4_dir_entry_2 *de,
@@ -1106,12 +1116,13 @@ static int add_dirent_to_buf(handle_t *handle, struct ext4_filename *fname,
 		return err;
 	}
 
-	// 插入dentry
+	// 插入dentry到de的位置
 	ext4_insert_dentry(inode, de, blocksize, fname);
 
 	// 先更新时间
 	dir->i_mtime = dir->i_ctime = current_time(dir);
-	// 如果没有dir_index特性, 则清除父目录EXT4_INODE_INDEX标志
+	// 如果没有dir_index特性, 则清除父目录EXT4_INODE_INDEX标志，
+	// todo: 为什么每次添加entry都要执行这个操作
 	ext4_update_dx_flag(dir);
 	// 更新版本号 todo: what
 	inode_inc_iversion(dir);
@@ -1153,17 +1164,18 @@ int ext4_find_dest_de(struct inode *dir, struct inode *inode,
 			return -EEXIST;
 		// de结构长度
 		nlen = EXT4_DIR_REC_LEN(de->name_len);
-		// 真实长度
+		// 剩余空间长度
 		rlen = ext4_rec_len_from_disk(de->rec_len, buf_size);
-		// 如果inode为空,表示这个entry被删了, 如果文件被删了, de的长度必须大于新插入的de才行.
+		// 如果inode为空,表示这个entry被删了, 如果文件被删了, de的rlen可以全部使用
 		// 如果inode不为空, (rlen - nlen)就表示这个de还剩的空间, 如果还能放下新entry, 则存之.
 		if ((de->inode ? rlen - nlen : rlen) >= reclen)
+			// 进到这里表示能存下，直接退出
 			break;
 		// 下一个结点
 		de = (struct ext4_dir_entry_2 *)((char *)de + rlen);
 		offset += rlen;
 	}
-	// de最多就等于top, 大于top肯定就错了
+	// de最多就等于top, 大于top肯定就错了，说明没空间了
 	if ((char *) de > top)
 		return -ENOSPC;
 	// 目标位置
@@ -1181,26 +1193,26 @@ void ext4_insert_dentry(struct inode *inode,
 
 	// de已使用长度
 	nlen = EXT4_DIR_REC_LEN(de->name_len);
-	// de原来的长度
+	// de总共的长度
 	rlen = ext4_rec_len_from_disk(de->rec_len, buf_size);
 
-	// 如果de现在有文件
+	// 如果de现在有文件，则在当前de后面存
 	if (de->inode) {
-		// 则从当前de后面存
+		// 原来de的长度是nlen, 前进nlen个长度就是下一个entry
 		struct ext4_dir_entry_2 *de1 =
 			(struct ext4_dir_entry_2 *)((char *)de + nlen);
 		// 新de1的盘上空间为原来de,剩余的空闲
 		de1->rec_len = ext4_rec_len_to_disk(rlen - nlen, buf_size);
-		// 修改原de的空间
+		// 修改原de的rec_len空间
 		de->rec_len = ext4_rec_len_to_disk(nlen, buf_size);
 		// 使用de1存放
 		de = de1;
 	}
 	// 类型暂设为未知
 	de->file_type = EXT4_FT_UNKNOWN;
-	// inode
+	// 设置inode号
 	de->inode = cpu_to_le32(inode->i_ino);
-	// 根据mode设置文件类型
+	// 根据mode设置文件类型，这里面设置的就是file_type
 	ext4_set_de_type(inode->i_sb, de, inode->i_mode);
 	// 文件名长度
 	de->name_len = fname_len(fname);
@@ -1229,7 +1241,9 @@ int ext4_handle_dirty_dirblock(handle_t *handle,
 	// 日志相关, 标脏元数据
 	return ext4_handle_dirty_metadata(handle, inode, bh);
 }
+```
 
+```c
 static struct buffer_head *ext4_append(handle_t *handle,
 					struct inode *inode,
 					ext4_lblk_t *block)
