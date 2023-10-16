@@ -21,16 +21,6 @@ struct ext4_es_tree {
 	struct extent_status *cache_es;	// 最近访问的extent
 };
 
-struct ext4_ext_path {
-	ext4_fsblk_t			p_block; // 逻辑块
-	__u16				p_depth; // 当前深度
-	__u16				p_maxdepth; // 最大深度
-	struct ext4_extent		*p_ext; // 所在的extent
-	struct ext4_extent_idx		*p_idx; // 所在的索引, 这个和p_ext互斥, 有我无它
-	struct ext4_extent_header	*p_hdr; // 头部
-	struct buffer_head		*p_bh; // bh引用
-};
-
 struct ext4_extent_idx {
 	__le32	ei_block;	/* index covers logical blocks from 'block' */
 	__le32	ei_leaf_lo;	/* pointer to the physical block of the next *

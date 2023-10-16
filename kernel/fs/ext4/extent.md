@@ -3,6 +3,33 @@
 
 extent 使用b+树来存储, 中间存的都是索引结点, 只有叶子里存的是extent. 根结点存在inode->i_data里.
 
+## 0. struct
+```c
+struct ext4_extent_header {
+	__le16	eh_magic; // 魔数：0xf30a，这是写死的
+	__le16	eh_entries; // 块已有的entry数量
+	__le16	eh_max;	// 块最大可放entry数量
+	__le16	eh_depth; // 树深度。根节点是第0层
+	__le32	eh_generation; // 树的年代
+};
+
+struct ext4_ext_path {
+	ext4_fsblk_t			p_block; // 逻辑块
+	__u16				p_depth; // 当前深度
+	__u16				p_maxdepth; // 当前层级到最后一层的深度
+	struct ext4_extent		*p_ext; // 所在的extent
+	struct ext4_extent_idx		*p_idx; // 所在的索引, 这个和p_ext互斥, 有我无它
+	struct ext4_extent_header	*p_hdr; // 头部
+	struct buffer_head		*p_bh; // bh引用
+};
+
+struct ext4_extent {
+		__le32	ee_block; // 逻辑块起点
+		__le16	ee_len;	// extent长度
+		__le16	ee_start_hi; // 物理块号高16位
+		__le32	ee_start_lo; // 物理块号的低32位
+	};
+```
 ## 1. ext4_find_extent
 这个函数找的索引和extent都最接近目标块, 且块号都小于目标. 通过这个函数可以找到从根通往目标的路径.
 ```c
@@ -47,7 +74,7 @@ ext4_find_extent(struct inode *inode, ext4_lblk_t block,
 	}
 	if (!path) {
 		// 分配path. depth从0开始, 所以要 +1.
-		// todo: 这里为啥是 +2, 多分配一个块
+		// todo: 这里为啥是 +2, 多分配一个块？有可能要增加层级吗？
 		path = kcalloc(depth + 2, sizeof(struct ext4_ext_path),
 				gfp_flags);
 		if (unlikely(!path))
@@ -55,7 +82,7 @@ ext4_find_extent(struct inode *inode, ext4_lblk_t block,
 		// path0里存最大深度
 		path[0].p_maxdepth = depth + 1;
 	}
-	// 第0层是i_data里的header, 也就是根结点
+	// 第0层是i_data里的header, 也就是根结点，根节点没有bh
 	path[0].p_hdr = eh;
 	path[0].p_bh = NULL;
 

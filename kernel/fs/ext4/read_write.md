@@ -547,12 +547,12 @@ static int ext4_write_begin(struct file *file, struct address_space *mapping,
 
 	// 要写入的页号
 	index = pos >> PAGE_SHIFT;
-	// 写入的偏移
+	// 页面内偏移
 	from = pos & (PAGE_SIZE - 1);
 	// 写入的结尾
 	to = from + len;
 
-	// 如果inode有EXT4_STATE_MAY_INLINE_DATA标志，则写入内部数据？
+	// 如果inode有EXT4_STATE_MAY_INLINE_DATA标志，则尝试写入内部数据
 	// todo: 后面再看
 	if (ext4_test_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA)) {
 		ret = ext4_try_to_write_inline_data(mapping, inode, pos, len,

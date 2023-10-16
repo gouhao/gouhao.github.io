@@ -3,6 +3,11 @@
 
 ## 1. ext4_get_block
 ```c
+/*
+iblock: 要映射的逻辑块
+bh: 把iblock给bh映射
+create: 是否创建
+*/
 int ext4_get_block(struct inode *inode, sector_t iblock,
 		   struct buffer_head *bh, int create)
 {
@@ -14,6 +19,7 @@ int ext4_get_block(struct inode *inode, sector_t iblock,
 static int _ext4_get_block(struct inode *inode, sector_t iblock,
 			   struct buffer_head *bh, int flags)
 {
+	// 结果保存在这个里面
 	struct ext4_map_blocks map;
 	int ret = 0;
 
@@ -56,7 +62,7 @@ map_bh(struct buffer_head *bh, struct super_block *sb, sector_t block)
 	set_buffer_mapped(bh);
 	// 块设置
 	bh->b_bdev = sb->s_bdev;
-	// 逻辑块
+	// 物理块
 	bh->b_blocknr = block;
 	// 块大小
 	bh->b_size = sb->s_blocksize;
@@ -194,7 +200,7 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
 		    ext4_es_scan_range(inode, &ext4_es_is_delayed, map->m_lblk,
 				       map->m_lblk + map->m_len - 1))
 			status |= EXTENT_STATUS_DELAYED;
-		// 插入extent
+		// 把extent插入es树
 		ret = ext4_es_insert_extent(inode, map->m_lblk,
 					    map->m_len, map->m_pblk, status);
 		if (ret < 0)
@@ -424,7 +430,7 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 
 		// 如果目标block在extent的范围内, 尽量直接用当前的extent
 		if (in_range(map->m_lblk, ee_block, ee_len)) {
-			// 新块的物理块
+			// 目标物理块起点
 			newblock = map->m_lblk - ee_block + ee_start;
 			// 从目标块开始到extent结尾,可用的块数量
 			allocated = ee_len - (map->m_lblk - ee_block);
