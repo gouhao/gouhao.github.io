@@ -1098,12 +1098,15 @@ static ext4_fsblk_t ext4_ext_find_goal(struct inode *inode,
 		 * especially if the latter case turns out to be
 		 * common.
 		 */
+		// path里最后一个节点所在的ext
 		ex = path[depth].p_ext;
 		if (ex) {
+			// 物理块
 			ext4_fsblk_t ext_pblk = ext4_ext_pblock(ex);
+			// 逻辑块
 			ext4_lblk_t ext_block = le32_to_cpu(ex->ee_block);
 
-			
+			// 以已分配的物理块为目标块
 			if (block > ext_block)
 				// 目标块大于extent起始块
 
@@ -1114,13 +1117,15 @@ static ext4_fsblk_t ext4_ext_find_goal(struct inode *inode,
 				return ext_pblk - (ext_block - block);
 		}
 
+		// 走到这儿表示ex为空
+
 		/* 索引是空的, 从索引开始的地方找一个*/
 		// 如果有bh, 则以bh所在的块为起点
 		if (path[depth].p_bh)
 			return path[depth].p_bh->b_blocknr;
 	}
 
-	// 如果找失败了, 则从inode所在块组里找一个块
+	// 如果上面都找失败了, 则从inode所在块组里找一个块
 	return ext4_inode_to_goal_block(inode);
 }
 
