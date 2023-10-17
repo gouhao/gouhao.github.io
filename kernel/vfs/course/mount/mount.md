@@ -530,6 +530,7 @@ struct mount *__lookup_mnt(struct vfsmount *mnt, struct dentry *dentry)
 static int do_add_mount(struct mount *newmnt, struct mountpoint *mp /*挂载点结构*/,
 			struct path *path /*挂载点信息*/, int mnt_flags)
 {
+	struct mount *parent = real_mount(path->mnt);
 	...
 
 	// 一个文件系统不能在自己的根上挂载挂多次
@@ -638,21 +639,7 @@ static void commit_tree(struct mount *mnt/*新挂载 mnt*/)
 	// 父ns
 	struct mnt_namespace *n = parent->mnt_ns;
 
-	// parent不能和mnt相等
-	BUG_ON(parent == mnt);
-	// 先把mnt_list添加到head里
-	list_add_tail(&head, &mnt->mnt_list);
-	// 遍历mnt里所有子结点,设置mnt_ns为父节点
-	list_for_each_entry(m, &head, mnt_list)
-		m->mnt_ns = n;
-
-	// 把这些转到父ns的列表
-	list_splice(&head, n->list.prev);
-
-	// 递增之前待挂载数据
-	n->mounts += n->pending_mounts;
-	// 待挂载置0
-	n->pending_mounts = 0;
+	...
 
 	// 添加mnt到哈希表和父mnt的列表
 	__attach_mnt(mnt, parent);

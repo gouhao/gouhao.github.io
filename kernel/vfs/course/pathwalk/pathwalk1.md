@@ -37,6 +37,7 @@ struct nameidata {
 	umode_t		dir_mode;
 } __randomize_layout;
 
+// fs/namei.c
 // 一般会调set_nameidata来设置nd
 static void set_nameidata(struct nameidata *p, int dfd, struct filename *name)
 {
@@ -59,11 +60,12 @@ static void set_nameidata(struct nameidata *p, int dfd, struct filename *name)
 ## 2. path_lookupat
 遍历路径的代码大多入口是path_lookupat。
 ```c
+// fs/namei.c
 // nd是上层函数传过来的，会设置好要找的文件名，开始的路径，和一些标志等
 static int path_lookupat(struct nameidata *nd, unsigned flags, struct path *path)
 {
 	// 先根据要找的文件路径初始化nd中的数据, 返回值是要找的文件名
-	const char *s = path_init(nd, flags);
+	const char *s = path_init(nd, flags); 
 	int err;
 
 	...
@@ -92,6 +94,7 @@ link_path_walk是主要的遍历过程，在这函数里会根据每个目录的
 
 ## 3. path_init
 ```c
+// fs/namei.c
 static const char *path_init(struct nameidata *nd, unsigned flags)
 {
 	int error;
@@ -213,6 +216,7 @@ static int nd_jump_root(struct nameidata *nd)
 path_init把nd里开始查找的dentry, inode, 文件系统相关信息设置好之后，就由link_path_walk来遍历路径中的每个节点。
 
 ```c
+// fs/namei.c
 static int link_path_walk(const char *name, struct nameidata *nd)
 {
 	int depth = 0;
@@ -355,6 +359,7 @@ OK: // 遍历完成
 
 ## 5. walk_component
 ```c
+// fs/namei.c
 static const char *walk_component(struct nameidata *nd, int flags)
 {
 	struct dentry *dentry;
