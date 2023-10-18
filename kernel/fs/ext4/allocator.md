@@ -1452,6 +1452,136 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 ```
 
 
-
+## ext4_mb_init_group
 ```c
+
+struct ext4_buddy {
+	struct page *bd_buddy_page; // buddy所在的页
+	void *bd_buddy; // buddy所在的地址
+	struct page *bd_bitmap_page; // 位图所在的页
+	void *bd_bitmap; // 位图所在地址
+	struct ext4_group_info *bd_info; // 组信息
+	struct super_block *bd_sb; // 超级块
+	__u16 bd_blkbits; // 块大小，2的幂
+	ext4_group_t bd_group; // 组号
+};
+
+static noinline_for_stack
+int ext4_mb_init_group(struct super_block *sb, ext4_group_t group, gfp_t gfp)
+{
+
+	struct ext4_group_info *this_grp;
+	struct ext4_buddy e4b;
+	struct page *page;
+	int ret = 0;
+
+	might_sleep();
+	mb_debug(sb, "init group %u\n", group);
+	// 获取组信息
+	this_grp = ext4_get_group_info(sb, group);
+	/*
+	 * This ensures that we don't reinit the buddy cache
+	 * page which map to the group from which we are already
+	 * allocating. If we are looking at the buddy cache we would
+	 * have taken a reference using ext4_mb_load_buddy and that
+	 * would have pinned buddy page to page cache.
+	 * The call to ext4_mb_get_buddy_page_lock will mark the
+	 * page accessed.
+	 */
+	// 获取/分配 buddy页和位图页
+	ret = ext4_mb_get_buddy_page_lock(sb, group, &e4b, gfp);
+	if (ret || !EXT4_MB_GRP_NEED_INIT(this_grp)) {
+		/*
+		 * somebody initialized the group
+		 * return without doing anything
+		 */
+		goto err;
+	}
+
+	// 位图页
+	page = e4b.bd_bitmap_page;
+	// 初始化位图
+	ret = ext4_mb_init_cache(page, NULL, gfp);
+	if (ret)
+		goto err;
+	// 页不是最新则出错
+	if (!PageUptodate(page)) {
+		ret = -EIO;
+		goto err;
+	}
+
+	// buddy 页有可能和位图页的块，在一个page里，如果是这样就不用再初始化位图页
+	if (e4b.bd_buddy_page == NULL) {
+		/*
+		 * If both the bitmap and buddy are in
+		 * the same page we don't need to force
+		 * init the buddy
+		 */
+		ret = 0;
+		goto err;
+	}
+	
+	page = e4b.bd_buddy_page;
+	// 初始化buddy所在的页
+	ret = ext4_mb_init_cache(page, e4b.bd_bitmap, gfp);
+	if (ret)
+		goto err;
+	// 页不是最新
+	if (!PageUptodate(page)) {
+		ret = -EIO;
+		goto err;
+	}
+err:
+	ext4_mb_put_buddy_page_lock(&e4b);
+	return ret;
+}
+
+static int ext4_mb_get_buddy_page_lock(struct super_block *sb,
+		ext4_group_t group, struct ext4_buddy *e4b, gfp_t gfp)
+{
+	// ext4专门用一个inode来管理buddy-cache，这个inode是内存里的，并不在磁盘上存储
+	// inode号是EXT4_BAD_INO，这个inode是在文件系统挂载时生成的
+	struct inode *inode = EXT4_SB(sb)->s_buddy_cache;
+	int block, pnum, poff;
+	int blocks_per_page;
+	struct page *page;
+
+	e4b->bd_buddy_page = NULL;
+	e4b->bd_bitmap_page = NULL;
+
+	// 每页存的块，比如64k页，块大小4k，则一页里可以放16个块。通常页大小是4k
+	blocks_per_page = PAGE_SIZE / sb->s_blocksize;
+	/*
+	 * buddy缓存存储块位图和buddy信息在连续的块上。所以每个组需要2个块。
+	 */
+	block = group * 2;
+
+	// 根据块号算出页号
+	pnum = block / blocks_per_page;
+	// 块所在页内偏移
+	poff = block % blocks_per_page;
+
+	// 获取/分配pnum对应的页
+	page = find_or_create_page(inode->i_mapping, pnum, gfp);
+	if (!page)
+		return -ENOMEM;
+	BUG_ON(page->mapping != inode->i_mapping);
+	e4b->bd_bitmap_page = page;
+	e4b->bd_bitmap = page_address(page) + (poff * sb->s_blocksize);
+
+	if (blocks_per_page >= 2) {
+		/* buddy and bitmap are on the same page */
+		return 0;
+	}
+
+	block++;
+	pnum = block / blocks_per_page;
+	page = find_or_create_page(inode->i_mapping, pnum, gfp);
+	if (!page)
+		return -ENOMEM;
+	BUG_ON(page->mapping != inode->i_mapping);
+	e4b->bd_buddy_page = page;
+	return 0;
+}
 ```
+
