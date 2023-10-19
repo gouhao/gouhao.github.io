@@ -649,11 +649,12 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 
 	// 每页能放几个组的buddy信息，如上注释是 blocks_per_page/2
 	groups_per_page = blocks_per_page >> 1;
+	// 如果块大小和页大小相同时, 经过上面计算groups_per_page是0, 所以最小为1
 	if (groups_per_page == 0)
 		groups_per_page = 1;
 
-	/* allocate buffer_heads to read bitmaps */
 	if (groups_per_page > 1) {
+		// 如果每页存多个组, 则要动态分配bh指针数组
 		i = sizeof(struct buffer_head *) * groups_per_page;
 		bh = kzalloc(i, gfp);
 		if (bh == NULL) {
@@ -1566,20 +1567,28 @@ static int ext4_mb_get_buddy_page_lock(struct super_block *sb,
 	if (!page)
 		return -ENOMEM;
 	BUG_ON(page->mapping != inode->i_mapping);
+
 	e4b->bd_bitmap_page = page;
+	// 位图对应的内存，因为一个页可能存多个块，所以要加上偏移
 	e4b->bd_bitmap = page_address(page) + (poff * sb->s_blocksize);
 
+	// 如果一页里存的块大于2, 说明位图和buddy在一个页里存着, 就不用下面的计算了
 	if (blocks_per_page >= 2) {
-		/* buddy and bitmap are on the same page */
 		return 0;
 	}
 
+	// 走到这儿说明一页里只存一个块
+
+	// 第二个块是buddy
 	block++;
+	// 块所在的页, 这个页号和块号是一样的
 	pnum = block / blocks_per_page;
+	// 找到buddy页
 	page = find_or_create_page(inode->i_mapping, pnum, gfp);
 	if (!page)
 		return -ENOMEM;
 	BUG_ON(page->mapping != inode->i_mapping);
+	// 记录buddy页
 	e4b->bd_buddy_page = page;
 	return 0;
 }
