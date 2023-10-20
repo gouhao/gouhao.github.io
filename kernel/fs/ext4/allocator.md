@@ -664,13 +664,16 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 	} else
 		bh = &bhs;
 
+	// page里的第一个组号
 	first_group = page->index * blocks_per_page / 2;
 
-	/* read all groups the page covers into the cache */
+	// 遍历页里面的每个组
 	for (i = 0, group = first_group; i < groups_per_page; i++, group++) {
+		// 超过最后一个组
 		if (group >= ngroups)
 			break;
 
+		// 获取组信息
 		grinfo = ext4_get_group_info(sb, group);
 		/*
 		 * If page is uptodate then we came here after online resize
@@ -678,10 +681,12 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 		 * we must skip all initialized uptodate buddies on the page,
 		 * which may be currently in use by an allocating task.
 		 */
+		// 页是最新的，且当前group不需要初始化，则继续
 		if (PageUptodate(page) && !EXT4_MB_GRP_NEED_INIT(grinfo)) {
 			bh[i] = NULL;
 			continue;
 		}
+		// 读组的位图
 		bh[i] = ext4_read_block_bitmap_nowait(sb, group, false);
 		if (IS_ERR(bh[i])) {
 			err = PTR_ERR(bh[i]);
@@ -691,7 +696,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 		mb_debug(sb, "read bitmap for group %u\n", group);
 	}
 
-	/* wait for I/O completion */
+	// 等上面位图读完，上面用的是nowait，非阻塞的
 	for (i = 0, group = first_group; i < groups_per_page; i++, group++) {
 		int err2;
 
@@ -702,56 +707,54 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 			err = err2;
 	}
 
+	// 页里面第一个块号
 	first_block = page->index * blocks_per_page;
 	for (i = 0; i < blocks_per_page; i++) {
+		// 块号对应的组
 		group = (first_block + i) >> 1;
+		// 超过最大组
 		if (group >= ngroups)
 			break;
 
+		// 当前组不需要初始化
 		if (!bh[group - first_group])
-			/* skip initialized uptodate buddy */
 			continue;
 
+		// bh有问题，则跳过
 		if (!buffer_verified(bh[group - first_group]))
-			/* Skip faulty bitmaps */
 			continue;
 		err = 0;
 
-		/*
-		 * data carry information regarding this
-		 * particular group in the format specified
-		 * above
-		 *
-		 */
+		// 对应块地址
 		data = page_address(page) + (i * blocksize);
+		// 第1个块是位图
 		bitmap = bh[group - first_group]->b_data;
 
-		/*
-		 * We place the buddy block and bitmap block
-		 * close together
-		 */
+		// (first_block + i) & 1 是buddy块，因为buddy是在位图后面，所以奇数的块号是buddy
 		if ((first_block + i) & 1) {
-			/* this is block of buddy */
+			// 初始化buddy时必须有incore
 			BUG_ON(incore == NULL);
 			mb_debug(sb, "put buddy for group %u in page %lu/%x\n",
 				group, page->index, i * blocksize);
 			trace_ext4_mb_buddy_bitmap_load(sb, group);
+			// 组信息
 			grinfo = ext4_get_group_info(sb, group);
 			grinfo->bb_fragments = 0;
+
+			// todo: what is bb_counter?
 			memset(grinfo->bb_counters, 0,
 			       sizeof(*grinfo->bb_counters) *
 				(sb->s_blocksize_bits+2));
-			/*
-			 * incore got set to the group block bitmap below
-			 */
+			
 			ext4_lock_group(sb, group);
-			/* init the buddy */
+			// 把块全部设成1
 			memset(data, 0xff, blocksize);
+			// 生成buddy信息
 			ext4_mb_generate_buddy(sb, data, incore, group);
 			ext4_unlock_group(sb, group);
 			incore = NULL;
 		} else {
-			/* this is block of bitmap */
+			// 位图块
 			BUG_ON(incore != NULL);
 			mb_debug(sb, "put bitmap for group %u in page %lu/%x\n",
 				group, page->index, i * blocksize);
@@ -759,16 +762,15 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 
 			/* see comments in ext4_mb_put_pa() */
 			ext4_lock_group(sb, group);
+			// 把位图复制到bh里
 			memcpy(data, bitmap, blocksize);
 
-			/* mark all preallocated blks used in in-core bitmap */
+			// 把预分配的标记为使用
 			ext4_mb_generate_from_pa(sb, data, group);
 			ext4_mb_generate_from_freelist(sb, data, group);
 			ext4_unlock_group(sb, group);
 
-			/* set incore so that the buddy information can be
-			 * generated using this
-			 */
+			// 设置incore,buddy会用这个位图来初始化
 			incore = data;
 		}
 	}
@@ -784,6 +786,133 @@ out:
 	return err;
 }
 
+static noinline_for_stack
+void ext4_mb_generate_from_pa(struct super_block *sb, void *bitmap,
+					ext4_group_t group)
+{
+	// 块组信息
+	struct ext4_group_info *grp = ext4_get_group_info(sb, group);
+	struct ext4_prealloc_space *pa;
+	struct list_head *cur;
+	ext4_group_t groupnr;
+	ext4_grpblk_t start;
+	int preallocated = 0;
+	int len;
+
+	/* all form of preallocation discards first load group,
+	 * so the only competing code is preallocation use.
+	 * we don't need any locking here
+	 * notice we do NOT ignore preallocations with pa_deleted
+	 * otherwise we could leave used blocks available for
+	 * allocation in buddy when concurrent ext4_mb_put_pa()
+	 * is dropping preallocation
+	 */
+	// 遍历预分配列表
+	list_for_each(cur, &grp->bb_prealloc_list) {
+		// 预分配空间
+		pa = list_entry(cur, struct ext4_prealloc_space, pa_group_list);
+		spin_lock(&pa->pa_lock);
+		// 获取pa对应的组号和偏移
+		ext4_get_group_no_and_offset(sb, pa->pa_pstart,
+					     &groupnr, &start);
+		len = pa->pa_len;
+		spin_unlock(&pa->pa_lock);
+		// 长度为0就不用标记了
+		if (unlikely(len == 0))
+			continue;
+		// 怎么会组号不相等？？
+		BUG_ON(groupnr != group);
+		//标记这些预分配的正在使用
+		ext4_set_bits(bitmap, start, len);
+		preallocated += len;
+	}
+	mb_debug(sb, "preallocated %d for group %u\n", preallocated, group);
+}
+
+static void ext4_mb_generate_from_freelist(struct super_block *sb, void *bitmap,
+						ext4_group_t group)
+{
+	struct rb_node *n;
+	struct ext4_group_info *grp;
+	struct ext4_free_data *entry;
+
+	// 组信息
+	grp = ext4_get_group_info(sb, group);
+	// 空闲块
+	n = rb_first(&(grp->bb_free_root));
+
+	// 在位图上设置所有空闲块
+	while (n) {
+		entry = rb_entry(n, struct ext4_free_data, efd_node);
+		ext4_set_bits(bitmap, entry->efd_start_cluster, entry->efd_count);
+		n = rb_next(n);
+	}
+	return;
+}
+
+static noinline_for_stack
+void ext4_mb_generate_buddy(struct super_block *sb,
+				void *buddy, void *bitmap, ext4_group_t group)
+{
+	struct ext4_group_info *grp = ext4_get_group_info(sb, group);
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	// 组里最大的cluster数
+	ext4_grpblk_t max = EXT4_CLUSTERS_PER_GROUP(sb);
+	ext4_grpblk_t i = 0;
+	ext4_grpblk_t first;
+	ext4_grpblk_t len;
+	unsigned free = 0;
+	unsigned fragments = 0;
+	// 当前时间？
+	unsigned long long period = get_cycles();
+
+	// 找第1个未使用的块
+	i = mb_find_next_zero_bit(bitmap, max, 0);
+	
+	// 设置之
+	grp->bb_first_free = i;
+	while (i < max) {
+		fragments++;
+		first = i;
+		// 找下在已设置的位
+		i = mb_find_next_bit(bitmap, max, i);
+		// 空闲长度
+		len = i - first;
+		// 编译空闲总量
+		free += len;
+		if (len > 1)
+			ext4_mb_mark_free_simple(sb, buddy, first, len, grp);
+		else
+			// 只有1个页，统计之
+			grp->bb_counters[0]++;
+		if (i < max)
+			i = mb_find_next_zero_bit(bitmap, max, i);
+	}
+	grp->bb_fragments = fragments;
+
+	if (free != grp->bb_free) {
+		ext4_grp_locked_error(sb, group, 0, 0,
+				      "block bitmap and bg descriptor "
+				      "inconsistent: %u vs %u free clusters",
+				      free, grp->bb_free);
+		/*
+		 * If we intend to continue, we consider group descriptor
+		 * corrupt and update bb_free using bitmap value
+		 */
+		grp->bb_free = free;
+		ext4_mark_group_bitmap_corrupted(sb, group,
+					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
+	}
+	mb_set_largest_free_order(sb, grp);
+
+	clear_bit(EXT4_GROUP_INFO_NEED_INIT_BIT, &(grp->bb_state));
+
+	period = get_cycles() - period;
+	spin_lock(&sbi->s_bal_lock);
+	sbi->s_mb_buddies_generated++;
+	sbi->s_mb_generation_time += period;
+	spin_unlock(&sbi->s_bal_lock);
+}
 
 static noinline_for_stack
 void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
@@ -1511,17 +1640,13 @@ int ext4_mb_init_group(struct super_block *sb, ext4_group_t group, gfp_t gfp)
 		goto err;
 	}
 
-	// buddy 页有可能和位图页的块，在一个page里，如果是这样就不用再初始化位图页
+	// buddy 页有可能和位图页的块，在一个page里，如果是这样就不用再初始化位图页，因为在上面的ext4_mb_init_cache已经初始化了
 	if (e4b.bd_buddy_page == NULL) {
-		/*
-		 * If both the bitmap and buddy are in
-		 * the same page we don't need to force
-		 * init the buddy
-		 */
 		ret = 0;
 		goto err;
 	}
 	
+	// 走到这儿说明位图和buddy在两个页里，这里需要再初始化buddy页，这里incore传的是位图所有的块数据 
 	page = e4b.bd_buddy_page;
 	// 初始化buddy所在的页
 	ret = ext4_mb_init_cache(page, e4b.bd_bitmap, gfp);
