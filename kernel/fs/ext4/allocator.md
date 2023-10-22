@@ -874,44 +874,128 @@ void ext4_mb_generate_buddy(struct super_block *sb,
 	while (i < max) {
 		fragments++;
 		first = i;
-		// 找下在已设置的位
+		// 找下一个在已设置的位
 		i = mb_find_next_bit(bitmap, max, i);
 		// 空闲长度
 		len = i - first;
 		// 编译空闲总量
 		free += len;
 		if (len > 1)
+			// 在buddy里标志空闲块
 			ext4_mb_mark_free_simple(sb, buddy, first, len, grp);
 		else
 			// 只有1个页，统计之
 			grp->bb_counters[0]++;
+		
+		// 在位图里找下一个未使用的块
 		if (i < max)
 			i = mb_find_next_zero_bit(bitmap, max, i);
 	}
+
+	// todo: what?
 	grp->bb_fragments = fragments;
 
+	// 经过上面循环统计的空闲块数量与组描述符里记录的空闲数量不一致,这肯定是哪出问题了
 	if (free != grp->bb_free) {
 		ext4_grp_locked_error(sb, group, 0, 0,
 				      "block bitmap and bg descriptor "
 				      "inconsistent: %u vs %u free clusters",
 				      free, grp->bb_free);
 		/*
-		 * If we intend to continue, we consider group descriptor
-		 * corrupt and update bb_free using bitmap value
+		 * 如果我们假装继续,我们要考虑组描述符已经损坏,并且使用位图里的值更新bb_free
 		 */
 		grp->bb_free = free;
+		// 标记文件系统位图损坏
 		ext4_mark_group_bitmap_corrupted(sb, group,
 					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
 	}
+
+	// 记录最大的空闲块数量
 	mb_set_largest_free_order(sb, grp);
 
+	// 清除组需要初始化位图的标志
 	clear_bit(EXT4_GROUP_INFO_NEED_INIT_BIT, &(grp->bb_state));
 
+	// 下面这些统计数据,只在调试时打印
+
+	// 上面生成的时间
 	period = get_cycles() - period;
 	spin_lock(&sbi->s_bal_lock);
+	// 已生成的buddy数量
 	sbi->s_mb_buddies_generated++;
+
+	// 记录生成时间
 	sbi->s_mb_generation_time += period;
 	spin_unlock(&sbi->s_bal_lock);
+}
+
+static void
+mb_set_largest_free_order(struct super_block *sb, struct ext4_group_info *grp)
+{
+	int i;
+	int bits;
+
+	// 先标记为-1, -1表示未初始化
+	grp->bb_largest_free_order = -1;
+
+	// 最大的块大小
+	bits = sb->s_blocksize_bits + 1;
+	// 从后往前遍历找到最大的buddy块, 并记录之
+	for (i = bits; i >= 0; i--) {
+		if (grp->bb_counters[i] > 0) {
+			grp->bb_largest_free_order = i;
+			break;
+		}
+	}
+}
+
+static void ext4_mb_mark_free_simple(struct super_block *sb,
+				void *buddy, ext4_grpblk_t first, ext4_grpblk_t len,
+					struct ext4_group_info *grp)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	ext4_grpblk_t min;
+	ext4_grpblk_t max;
+	ext4_grpblk_t chunk;
+	unsigned int border;
+
+	// 长度怎么会大于组的cluster数量?
+	BUG_ON(len > EXT4_CLUSTERS_PER_GROUP(sb));
+
+	// 边界是2倍块大小?
+	border = 2 << sb->s_blocksize_bits;
+
+	while (len > 0) {
+		// 开始的块的位, 返回值从1开始,所以要减去1才是块号,下同
+		max = ffs(first | border) - 1;
+
+		// 块数量的位
+		min = fls(len) - 1;
+
+		if (max < min)
+			min = max;
+		
+		// buddy块的大小
+		chunk = 1 << min;
+
+		// 记录对应buddy块的数量
+		grp->bb_counters[min]++;
+
+		// min=0,是只有一个块.
+		if (min > 0)
+			// 清除buddy上对应的位, buddy位图在初始化的时候设置成了全1
+			// first >> min = first/min, 也就是first在min里的index
+			// s_mb_offsets[min]: min这个长度的块在buddy里位图的开始处
+			mb_clear_bit(first >> min,
+				     buddy + sbi->s_mb_offsets[min]);
+
+		// 长度减块的数量
+		len -= chunk;
+		// 递增起点
+		first += chunk;
+
+		// todo: 为什么不是直接存一个大块, 而是要分成这么多的小块来记录
+	}
 }
 
 static noinline_for_stack
