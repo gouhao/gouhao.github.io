@@ -1,6 +1,171 @@
 # 块分配器
 源码基于5.10
 
+## 1. ext4_mb_init
+```c
+int ext4_mb_init(struct super_block *sb)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	unsigned i, j;
+	unsigned offset, offset_incr;
+	unsigned max;
+	int ret;
+
+	// s_mb_offsets是unsigned short *
+	// s_mb_offsets是4倍块大小？
+	i = (sb->s_blocksize_bits + 2) * sizeof(*sbi->s_mb_offsets);
+
+	// 分配空间
+	sbi->s_mb_offsets = kmalloc(i, GFP_KERNEL);
+	if (sbi->s_mb_offsets == NULL) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	// s_mb_maxs是unsigned int *
+	// max的数量
+	i = (sb->s_blocksize_bits + 2) * sizeof(*sbi->s_mb_maxs);
+	sbi->s_mb_maxs = kmalloc(i, GFP_KERNEL);
+	if (sbi->s_mb_maxs == NULL) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	// ?
+	ret = ext4_groupinfo_create_slab(sb->s_blocksize);
+	if (ret < 0)
+		goto out;
+
+	// order-0是常规的bitmap，最大值是块大小的8倍
+	// 用一个块来存储order-0的块，因为一字节是8位
+	sbi->s_mb_maxs[0] = sb->s_blocksize << 3;
+	sbi->s_mb_offsets[0] = 0;
+
+	i = 1;
+	offset = 0;
+	// 步长为块大小的一半
+	offset_incr = 1 << (sb->s_blocksize_bits - 1);
+	// 最大值为块大小的4倍
+	max = sb->s_blocksize << 2;
+	do {
+		sbi->s_mb_offsets[i] = offset;
+		sbi->s_mb_maxs[i] = max;
+		offset += offset_incr;
+		offset_incr = offset_incr >> 1;
+		max = max >> 1;
+		i++;
+	} while (i <= sb->s_blocksize_bits + 1);
+
+	spin_lock_init(&sbi->s_md_lock);
+	spin_lock_init(&sbi->s_bal_lock);
+	sbi->s_mb_free_pending = 0;
+	INIT_LIST_HEAD(&sbi->s_freed_data_list);
+
+	sbi->s_mb_max_to_scan = MB_DEFAULT_MAX_TO_SCAN;
+	sbi->s_mb_min_to_scan = MB_DEFAULT_MIN_TO_SCAN;
+	sbi->s_mb_stats = MB_DEFAULT_STATS;
+	sbi->s_mb_stream_request = MB_DEFAULT_STREAM_THRESHOLD;
+	sbi->s_mb_order2_reqs = MB_DEFAULT_ORDER2_REQS;
+	sbi->s_mb_max_inode_prealloc = MB_DEFAULT_MAX_INODE_PREALLOC;
+	/*
+	 * The default group preallocation is 512, which for 4k block
+	 * sizes translates to 2 megabytes.  However for bigalloc file
+	 * systems, this is probably too big (i.e, if the cluster size
+	 * is 1 megabyte, then group preallocation size becomes half a
+	 * gigabyte!).  As a default, we will keep a two megabyte
+	 * group pralloc size for cluster sizes up to 64k, and after
+	 * that, we will force a minimum group preallocation size of
+	 * 32 clusters.  This translates to 8 megs when the cluster
+	 * size is 256k, and 32 megs when the cluster size is 1 meg,
+	 * which seems reasonable as a default.
+	 */
+	sbi->s_mb_group_prealloc = max(MB_DEFAULT_GROUP_PREALLOC >>
+				       sbi->s_cluster_bits, 32);
+	/*
+	 * If there is a s_stripe > 1, then we set the s_mb_group_prealloc
+	 * to the lowest multiple of s_stripe which is bigger than
+	 * the s_mb_group_prealloc as determined above. We want
+	 * the preallocation size to be an exact multiple of the
+	 * RAID stripe size so that preallocations don't fragment
+	 * the stripes.
+	 */
+	if (sbi->s_stripe > 1) {
+		sbi->s_mb_group_prealloc = roundup(
+			sbi->s_mb_group_prealloc, sbi->s_stripe);
+	}
+
+	sbi->s_locality_groups = alloc_percpu(struct ext4_locality_group);
+	if (sbi->s_locality_groups == NULL) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for_each_possible_cpu(i) {
+		struct ext4_locality_group *lg;
+		lg = per_cpu_ptr(sbi->s_locality_groups, i);
+		mutex_init(&lg->lg_mutex);
+		for (j = 0; j < PREALLOC_TB_SIZE; j++)
+			INIT_LIST_HEAD(&lg->lg_prealloc_list[j]);
+		spin_lock_init(&lg->lg_prealloc_lock);
+	}
+
+	/* init file for buddy data */
+	ret = ext4_mb_init_backend(sb);
+	if (ret != 0)
+		goto out_free_locality_groups;
+
+	return 0;
+
+out_free_locality_groups:
+	free_percpu(sbi->s_locality_groups);
+	sbi->s_locality_groups = NULL;
+out:
+	kfree(sbi->s_mb_offsets);
+	sbi->s_mb_offsets = NULL;
+	kfree(sbi->s_mb_maxs);
+	sbi->s_mb_maxs = NULL;
+	return ret;
+}
+
+static int ext4_groupinfo_create_slab(size_t size)
+{
+	static DEFINE_MUTEX(ext4_grpinfo_slab_create_mutex);
+	int slab_size;
+	int blocksize_bits = order_base_2(size);
+	int cache_index = blocksize_bits - EXT4_MIN_BLOCK_LOG_SIZE;
+	struct kmem_cache *cachep;
+
+	if (cache_index >= NR_GRPINFO_CACHES)
+		return -EINVAL;
+
+	if (unlikely(cache_index < 0))
+		cache_index = 0;
+
+	mutex_lock(&ext4_grpinfo_slab_create_mutex);
+	if (ext4_groupinfo_caches[cache_index]) {
+		mutex_unlock(&ext4_grpinfo_slab_create_mutex);
+		return 0;	/* Already created */
+	}
+
+	slab_size = offsetof(struct ext4_group_info,
+				bb_counters[blocksize_bits + 2]);
+
+	cachep = kmem_cache_create(ext4_groupinfo_slab_names[cache_index],
+					slab_size, 0, SLAB_RECLAIM_ACCOUNT,
+					NULL);
+
+	ext4_groupinfo_caches[cache_index] = cachep;
+
+	mutex_unlock(&ext4_grpinfo_slab_create_mutex);
+	if (!cachep) {
+		printk(KERN_EMERG
+		       "EXT4-fs: no memory for groupinfo slab cache\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+```
+
+
 ## 1. ext4_mb_new_blocks
 ```c
 ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
