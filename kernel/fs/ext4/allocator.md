@@ -124,7 +124,7 @@ int ext4_mb_init(struct super_block *sb)
 		spin_lock_init(&lg->lg_prealloc_lock);
 	}
 
-	// 
+	// 初始化group-info, 及buddy inode
 	ret = ext4_mb_init_backend(sb);
 	if (ret != 0)
 		goto out_free_locality_groups;
@@ -225,15 +225,18 @@ static int ext4_mb_init_backend(struct super_block *sb)
 			ext4_msg(sb, KERN_ERR, "can't read descriptor %u", i);
 			goto err_freebuddy;
 		}
+		// 添加并初始化组相关信息
 		if (ext4_mb_add_groupinfo(sb, i, desc) != 0)
 			goto err_freebuddy;
 	}
 
+	// 初始化块预取?
 	if (ext4_has_feature_flex_bg(sb)) {
 		/* a single flex group is supposed to be read by a single IO.
 		 * 2 ^ s_log_groups_per_flex != UINT_MAX as s_mb_prefetch is
 		 * unsigned integer, so the maximum shift is 32.
 		 */
+		// 灵活组不能大于32
 		if (sbi->s_es->s_log_groups_per_flex >= 32) {
 			ext4_msg(sb, KERN_ERR, "too many log groups per flexible block group");
 			goto err_freebuddy;
@@ -244,6 +247,8 @@ static int ext4_mb_init_backend(struct super_block *sb)
 	} else {
 		sbi->s_mb_prefetch = 32;
 	}
+
+	// 预取最大只能大于组数量
 	if (sbi->s_mb_prefetch > ext4_get_groups_count(sb))
 		sbi->s_mb_prefetch = ext4_get_groups_count(sb);
 	/* now many real IOs to prefetch within a single allocation at cr=0
@@ -253,6 +258,7 @@ static int ext4_mb_init_backend(struct super_block *sb)
 	 * with an average random access time 5ms, it'd take a second to get
 	 * 200 groups (* N with flex_bg), so let's make this limit 4
 	 */
+	// 设置预取限制,最大为组数量
 	sbi->s_mb_prefetch_limit = sbi->s_mb_prefetch * 4;
 	if (sbi->s_mb_prefetch_limit > ext4_get_groups_count(sb))
 		sbi->s_mb_prefetch_limit = ext4_get_groups_count(sb);
@@ -323,9 +329,11 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 {
 	int i;
 	int metalen = 0;
+	// 组所在的块
 	int idx = group >> EXT4_DESC_PER_BLOCK_BITS(sb);
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct ext4_group_info **meta_group_info;
+	// 获取块大小对应的slab?
 	struct kmem_cache *cachep = get_groupinfo_cache(sb->s_blocksize_bits);
 
 	/*
@@ -333,9 +341,12 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 	 * If it's true, we have to allocate a new table of pointers
 	 * to ext4_group_info structures
 	 */
+	// 如果是第0个组,则分配组元数据
 	if (group % EXT4_DESC_PER_BLOCK(sb) == 0) {
+		// 元数据大小,为块上所有组的大小
 		metalen = sizeof(*meta_group_info) <<
 			EXT4_DESC_PER_BLOCK_BITS(sb);
+		// 分配空间
 		meta_group_info = kmalloc(metalen, GFP_NOFS);
 		if (meta_group_info == NULL) {
 			ext4_msg(sb, KERN_ERR, "can't allocate mem "
@@ -343,18 +354,24 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 			goto exit_meta_group_info;
 		}
 		rcu_read_lock();
+		// 设置组元数据?
 		rcu_dereference(sbi->s_group_info)[idx] = meta_group_info;
 		rcu_read_unlock();
 	}
 
+	// 获取idx对应的元数据
 	meta_group_info = sbi_array_rcu_deref(sbi, s_group_info, idx);
+
+	// 块内偏移
 	i = group & (EXT4_DESC_PER_BLOCK(sb) - 1);
 
+	// 分配元数据信息
 	meta_group_info[i] = kmem_cache_zalloc(cachep, GFP_NOFS);
 	if (meta_group_info[i] == NULL) {
 		ext4_msg(sb, KERN_ERR, "can't allocate buddy mem");
 		goto exit_group_info;
 	}
+	// 设置需要初始化标志
 	set_bit(EXT4_GROUP_INFO_NEED_INIT_BIT,
 		&(meta_group_info[i]->bb_state));
 
@@ -362,8 +379,10 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 	 * initialize bb_free to be able to skip
 	 * empty groups without initialization
 	 */
+	// 初始化bb_free
 	if (ext4_has_group_desc_csum(sb) &&
 	    (desc->bg_flags & cpu_to_le16(EXT4_BG_BLOCK_UNINIT))) {
+		
 		meta_group_info[i]->bb_free =
 			ext4_free_clusters_after_init(sb, group, desc);
 	} else {
@@ -371,11 +390,15 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 			ext4_free_group_clusters(sb, desc);
 	}
 
+	// 预分配表
 	INIT_LIST_HEAD(&meta_group_info[i]->bb_prealloc_list);
 	init_rwsem(&meta_group_info[i]->alloc_sem);
+
+	// #define RB_ROOT	(struct rb_root) { NULL, }
 	meta_group_info[i]->bb_free_root = RB_ROOT;
 	meta_group_info[i]->bb_largest_free_order = -1;  /* uninit */
 
+	// 调试用
 	mb_group_bb_bitmap_alloc(sb, meta_group_info[i], group);
 	return 0;
 
@@ -393,10 +416,20 @@ exit_group_info:
 exit_meta_group_info:
 	return -ENOMEM;
 }
+
+static struct kmem_cache *get_groupinfo_cache(int blocksize_bits)
+{
+	// EXT4_MIN_BLOCK_LOG_SIZE=10. todo: why?
+	int cache_index = blocksize_bits - EXT4_MIN_BLOCK_LOG_SIZE;
+	// 获取对应的slab
+	struct kmem_cache *cachep = ext4_groupinfo_caches[cache_index];
+
+	BUG_ON(!cachep);
+	return cachep;
+}
 ```
 
 
-## 1. ext4_mb_new_blocks
 ## 1. ext4_mb_init_group
 ```c
 struct ext4_buddy {
@@ -933,7 +966,7 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 	if (ext4_is_quota_file(ar->inode))
 		ar->flags |= EXT4_MB_USE_ROOT_BLOCKS;
 
-	// 不使用保留的. todo: 没太看懂
+	// 不使用保留的. todo: quota相关没太看懂
 	if ((ar->flags & EXT4_MB_DELALLOC_RESERVED) == 0) {
 		// 检查是否有len的空闲块,
 		while (ar->len &&
@@ -992,7 +1025,7 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 		goto out;
 	}
 
-	// 使用预分配的?
+	// 使用历史预分配的?
 	ac->ac_op = EXT4_MB_HISTORY_PREALLOC;
 	seq = this_cpu_read(discard_pa_seq);
 
@@ -1567,7 +1600,7 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	// 想要的块长度
 	len = ar->len;
 
-	// 一次最大只能分配cluster的数量
+	// 一次最大只能分配本组的cluster的数量
 	if (len >= EXT4_CLUSTERS_PER_GROUP(sb))
 		len = EXT4_CLUSTERS_PER_GROUP(sb);
 
@@ -1577,10 +1610,10 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	if (goal < le32_to_cpu(es->s_first_data_block) ||
 			goal >= ext4_blocks_count(es))
 		goal = le32_to_cpu(es->s_first_data_block);
-	// 找到目标所在的组和偏移
+	// 找到goal所在的组及组内块偏移
 	ext4_get_group_no_and_offset(sb, goal, &group, &block);
 
-	// 最好的逻辑块
+	// 最好的逻辑块就是要求的逻辑块
 	ac->ac_b_ex.fe_logical = EXT4_LBLK_CMASK(sbi, ar->logical);
 
 	// 意思是还没分配, 继续查找?
@@ -1594,7 +1627,7 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	ac->ac_o_ex.fe_start = block;
 	ac->ac_o_ex.fe_len = len;
 
-	// 把原始ex复制到目标ex里
+	// 把原始o复制到目标g里
 	ac->ac_g_ex = ac->ac_o_ex;
 
 	ac->ac_flags = ar->flags;
@@ -1649,7 +1682,7 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
 	size = max(size, isize);
 
 	// s_mb_stream_request是区分大文件与小文件的界线,单位是块
-	// 如果大于这个值,说明是大小文件
+	// 如果大于这个值,说明是大文件
 	if (size > sbi->s_mb_stream_request) {
 		ac->ac_flags |= EXT4_MB_STREAM_ALLOC;
 		return;
@@ -1670,27 +1703,6 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
 }
 ```
 
-## prealloc
-```c
-struct ext4_prealloc_space {
-	struct list_head	pa_inode_list; // inode预分配表
-	struct list_head	pa_group_list; // 组预分配表
-	union {
-		struct list_head pa_tmp_list;
-		struct rcu_head	pa_rcu;
-	} u;
-	spinlock_t		pa_lock;
-	atomic_t		pa_count;
-	unsigned		pa_deleted; // 是否已删除
-	ext4_fsblk_t		pa_pstart;	/* 物理块起点 */
-	ext4_lblk_t		pa_lstart;	/* 逻辑块起点 */
-	ext4_grpblk_t		pa_len;		/* 预分配长度 */
-	ext4_grpblk_t		pa_free;	/* 空闲块数量 */
-	unsigned short		pa_type;	/* 预分配类型 inode or group */
-	spinlock_t		*pa_obj_lock;
-	struct inode		*pa_inode;	/* hack, for history only */
-};
-```
 ### 10.1 ext4_mb_new_blocks_simple
 ```c
 static ext4_fsblk_t ext4_mb_new_blocks_simple(handle_t *handle,
@@ -1777,8 +1789,8 @@ void ext4_get_group_no_and_offset(struct super_block *sb, ext4_fsblk_t blocknr,
 	// 距离第1个数据块的偏移
 	blocknr = blocknr - le32_to_cpu(es->s_first_data_block);
 	// do_div的效果: blocknr/=blocks_per_group, offset=blocknr % blocks_per_group
+	// 并将找到的块号对齐到cluster
 	offset = do_div(blocknr, EXT4_BLOCKS_PER_GROUP(sb)) >>
-		// todo: cluster暂还没看明白
 		EXT4_SB(sb)->s_cluster_bits;
 	if (offsetp)
 		*offsetp = offset;
@@ -1892,6 +1904,44 @@ out_err:
 
 ### 10.2 ext4_mb_use_preallocated
 ```c
+
+struct ext4_prealloc_space {
+	struct list_head	pa_inode_list; // inode预分配表
+	struct list_head	pa_group_list; // 组预分配表
+	union {
+		struct list_head pa_tmp_list;
+		struct rcu_head	pa_rcu;
+	} u;
+	spinlock_t		pa_lock;
+	atomic_t		pa_count;
+	unsigned		pa_deleted; // 是否已删除
+	ext4_fsblk_t		pa_pstart;	/* 物理块起点 */
+	ext4_lblk_t		pa_lstart;	/* 逻辑块起点 */
+	ext4_grpblk_t		pa_len;		/* 预分配长度 */
+	ext4_grpblk_t		pa_free;	/* 空闲块数量 */
+	unsigned short		pa_type;	/* 预分配类型 inode or group */
+	spinlock_t		*pa_obj_lock;
+	struct inode		*pa_inode;	/* hack, for history only */
+};
+
+/*
+ * Locality group:
+ *   we try to group all related changes together
+ *   so that writeback can flush/allocate them together as well
+ *   Size of lg_prealloc_list hash is determined by MB_DEFAULT_GROUP_PREALLOC
+ *   (512). We store prealloc space into the hash based on the pa_free blocks
+ *   order value.ie, fls(pa_free)-1;
+ */
+#define PREALLOC_TB_SIZE 10
+struct ext4_locality_group {
+	/* for allocator */
+	/* to serialize allocates */
+	struct mutex		lg_mutex;
+	/* list of preallocations */
+	struct list_head	lg_prealloc_list[PREALLOC_TB_SIZE];
+	spinlock_t		lg_prealloc_lock;
+};
+
 static noinline_for_stack bool
 ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 {
@@ -1902,12 +1952,14 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 	struct ext4_prealloc_space *pa, *cpa = NULL;
 	ext4_fsblk_t goal_block;
 
-	// 只有数据才能预分配
+	// 只有文件数据才能预分配
 	if (!(ac->ac_flags & EXT4_MB_HINT_DATA))
 		return false;
 
 	
 	rcu_read_lock();
+
+	// 遍历inode的per-inode表
 	list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
 
 		// 不在pa范围
@@ -1922,12 +1974,16 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 		     EXT4_MAX_BLOCK_FILE_PHYS))
 			continue;
 
+		// 走到这儿表求这个pa可以用
 		spin_lock(&pa->pa_lock);
+
 		// 没有被删, 有空闲的, 则使用它们
 		if (pa->pa_deleted == 0 && pa->pa_free) {
 			atomic_inc(&pa->pa_count);
+			// 使用这个pa里的块
 			ext4_mb_use_inode_pa(ac, pa);
 			spin_unlock(&pa->pa_lock);
+			// todo: what is this?
 			ac->ac_criteria = 10;
 			rcu_read_unlock();
 			return true;
@@ -1936,16 +1992,17 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 	}
 	rcu_read_unlock();
 
-	// 走到这儿表示没找到
+	// 走到这儿表示在pa-inode里没找到
 
 	// 不能使用组预分配, 直接返回
 	if (!(ac->ac_flags & EXT4_MB_HINT_GROUP_ALLOC))
 		return false;
 
-	// inode可能没有locate组. todo: what?
+	// inode可能没有locate组, 没有组的也返回
 	lg = ac->ac_lg;
 	if (lg == NULL)
 		return false;
+
 	// fls是找最后一个被设置的位的下标, 也就是把长度转成2的幂
 	order  = fls(ac->ac_o_ex.fe_len) - 1;
 
@@ -1955,7 +2012,7 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 		/* The max size of hash table is PREALLOC_TB_SIZE */
 		order = PREALLOC_TB_SIZE - 1;
 
-	// todo: what ?
+	// 找到对应的块
 	goal_block = ext4_grp_offs_to_block(ac->ac_sb, &ac->ac_g_ex);
 	// 找一个离目标块最近的pa
 	for (i = order; i < PREALLOC_TB_SIZE; i++) {
@@ -1967,6 +2024,7 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 			if (pa->pa_deleted == 0 &&
 					pa->pa_free >= ac->ac_o_ex.fe_len) {
 
+				// 选一个离目标最近的pa
 				cpa = ext4_mb_check_group_pa(goal_block,
 								pa, cpa);
 			}
@@ -1982,6 +2040,102 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 	}
 	return false;
 }
+
+static inline ext4_fsblk_t ext4_grp_offs_to_block(struct super_block *sb,
+					struct ext4_free_extent *fex)
+{
+	// 最终要转成cluster
+	return ext4_group_first_block_no(sb, fex->fe_group) +
+		(fex->fe_start << EXT4_SB(sb)->s_cluster_bits);
+}
+
+static struct ext4_prealloc_space *
+ext4_mb_check_group_pa(ext4_fsblk_t goal_block,
+			struct ext4_prealloc_space *pa,
+			struct ext4_prealloc_space *cpa)
+{
+	ext4_fsblk_t cur_distance, new_distance;
+
+	// cpa没有值,就直接用这个pa
+	if (cpa == NULL) {
+		atomic_inc(&pa->pa_count);
+		return pa;
+	}
+	// 到cpa的距离
+	cur_distance = abs(goal_block - cpa->pa_pstart);
+	// 到新pa的距离
+	new_distance = abs(goal_block - pa->pa_pstart);
+
+	// 如果当前距离小, 则使用cpa
+	if (cur_distance <= new_distance)
+		return cpa;
+
+	// 否则使用pa
+	atomic_dec(&cpa->pa_count);
+	atomic_inc(&pa->pa_count);
+	return pa;
+}
+
+static void ext4_mb_use_inode_pa(struct ext4_allocation_context *ac,
+				struct ext4_prealloc_space *pa)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	ext4_fsblk_t start;
+	ext4_fsblk_t end;
+	int len;
+
+	// 目标起点
+	start = pa->pa_pstart + (ac->ac_o_ex.fe_logical - pa->pa_lstart);
+	// 如果超过pa的长度,则以pa为终点, 否则以fe_len为终点
+	end = min(pa->pa_pstart + EXT4_C2B(sbi, pa->pa_len),
+		  start + EXT4_C2B(sbi, ac->ac_o_ex.fe_len));
+	// 块数量(以cluster为单位)
+	len = EXT4_NUM_B2C(sbi, end - start);
+
+	// 再获取start所在的组和在组内的偏移
+	ext4_get_group_no_and_offset(ac->ac_sb, start, &ac->ac_b_ex.fe_group,
+					&ac->ac_b_ex.fe_start);
+	// 已经找到,设置相关变量
+	ac->ac_b_ex.fe_len = len;
+	ac->ac_status = AC_STATUS_FOUND;
+	ac->ac_pa = pa;
+
+	// 健康检查
+	BUG_ON(start < pa->pa_pstart);
+	BUG_ON(end > pa->pa_pstart + EXT4_C2B(sbi, pa->pa_len));
+	BUG_ON(pa->pa_free < len);
+
+	// 从pa里减去已分配的长度
+	pa->pa_free -= len;
+
+	mb_debug(ac->ac_sb, "use %llu/%d from inode pa %p\n", start, len, pa);
+}
+
+static void ext4_mb_use_group_pa(struct ext4_allocation_context *ac,
+				struct ext4_prealloc_space *pa)
+{
+	unsigned int len = ac->ac_o_ex.fe_len;
+
+	// 获取pa_start所在的组和偏移
+	ext4_get_group_no_and_offset(ac->ac_sb, pa->pa_pstart,
+					&ac->ac_b_ex.fe_group,
+					&ac->ac_b_ex.fe_start);
+	// 已找到,设置相关变量
+	ac->ac_b_ex.fe_len = len;
+	ac->ac_status = AC_STATUS_FOUND;
+	ac->ac_pa = pa;
+
+	// 这里并没有减小pa的长度. todo: 什么时候减小?
+	/* we don't correct pa_pstart or pa_plen here to avoid
+	 * possible race when the group is being loaded concurrently
+	 * instead we correct pa later, after blocks are marked
+	 * in on-disk bitmap -- see ext4_mb_release_context()
+	 * Other CPUs are prevented from allocating from this pa by lg_mutex
+	 */
+	mb_debug(ac->ac_sb, "use %u/%u from group pa %p\n",
+		 pa->pa_lstart-len, len, pa);
+}
+
 ```
 
 ## 1.3 ext4_mb_normalize_request
