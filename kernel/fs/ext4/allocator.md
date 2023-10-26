@@ -30,7 +30,7 @@ int ext4_mb_init(struct super_block *sb)
 		ret = -ENOMEM;
 		goto out;
 	}
-	// ?
+	// 创建块大小的slab
 	ret = ext4_groupinfo_create_slab(sb->s_blocksize);
 	if (ret < 0)
 		goto out;
@@ -40,19 +40,30 @@ int ext4_mb_init(struct super_block *sb)
 	sbi->s_mb_maxs[0] = sb->s_blocksize << 3;
 	sbi->s_mb_offsets[0] = 0;
 
+	// 从order1开始
 	i = 1;
 	offset = 0;
-	// 步长为块大小的一半
+	// order1的空间为块大小一半
 	offset_incr = 1 << (sb->s_blocksize_bits - 1);
-	// 最大值为块大小的4倍
+	// order1的空间只占块的一半，一字节有8位，所以最大值为块大小的4倍
 	max = sb->s_blocksize << 2;
+
+	
 	do {
+		//  每个order的偏移
 		sbi->s_mb_offsets[i] = offset;
+		// 每个order最朋值
 		sbi->s_mb_maxs[i] = max;
+		// 增加偏移
 		offset += offset_incr;
+		// 偏移值再减半
 		offset_incr = offset_incr >> 1;
+		// 最大值也减半
 		max = max >> 1;
+		// order递增
 		i++;
+		
+		// order的不能大于块大小的幂
 	} while (i <= sb->s_blocksize_bits + 1);
 
 	spin_lock_init(&sbi->s_md_lock);
@@ -78,6 +89,8 @@ int ext4_mb_init(struct super_block *sb)
 	 * size is 256k, and 32 megs when the cluster size is 1 meg,
 	 * which seems reasonable as a default.
 	 */
+	// MB_DEFAULT_GROUP_PREALLOC=512
+	// 预分配
 	sbi->s_mb_group_prealloc = max(MB_DEFAULT_GROUP_PREALLOC >>
 				       sbi->s_cluster_bits, 32);
 	/*
@@ -88,16 +101,20 @@ int ext4_mb_init(struct super_block *sb)
 	 * RAID stripe size so that preallocations don't fragment
 	 * the stripes.
 	 */
+	// 条带，对raid的优化
 	if (sbi->s_stripe > 1) {
 		sbi->s_mb_group_prealloc = roundup(
 			sbi->s_mb_group_prealloc, sbi->s_stripe);
 	}
 
+	// s_locality_groups是作预分配的
 	sbi->s_locality_groups = alloc_percpu(struct ext4_locality_group);
 	if (sbi->s_locality_groups == NULL) {
 		ret = -ENOMEM;
 		goto out;
 	}
+
+	// 初始化每个cpu的s_locality_groups
 	for_each_possible_cpu(i) {
 		struct ext4_locality_group *lg;
 		lg = per_cpu_ptr(sbi->s_locality_groups, i);
@@ -107,7 +124,7 @@ int ext4_mb_init(struct super_block *sb)
 		spin_lock_init(&lg->lg_prealloc_lock);
 	}
 
-	/* init file for buddy data */
+	// 
 	ret = ext4_mb_init_backend(sb);
 	if (ret != 0)
 		goto out_free_locality_groups;
@@ -129,10 +146,15 @@ static int ext4_groupinfo_create_slab(size_t size)
 {
 	static DEFINE_MUTEX(ext4_grpinfo_slab_create_mutex);
 	int slab_size;
+	// 把块大小转成bit
 	int blocksize_bits = order_base_2(size);
+
+	// EXT4_MIN_BLOCK_LOG_SIZE=10
+	// todo: what is cache_index?
 	int cache_index = blocksize_bits - EXT4_MIN_BLOCK_LOG_SIZE;
 	struct kmem_cache *cachep;
 
+	// NR_GRPINFO_CACHES = 8
 	if (cache_index >= NR_GRPINFO_CACHES)
 		return -EINVAL;
 
@@ -140,11 +162,14 @@ static int ext4_groupinfo_create_slab(size_t size)
 		cache_index = 0;
 
 	mutex_lock(&ext4_grpinfo_slab_create_mutex);
+	// 已经创建了组缓存
 	if (ext4_groupinfo_caches[cache_index]) {
 		mutex_unlock(&ext4_grpinfo_slab_create_mutex);
 		return 0;	/* Already created */
 	}
 
+	// bb_counters是以order为下标的空闲块数量
+	// 数量就是slab的大小
 	slab_size = offsetof(struct ext4_group_info,
 				bb_counters[blocksize_bits + 2]);
 
@@ -162,6 +187,211 @@ static int ext4_groupinfo_create_slab(size_t size)
 	}
 
 	return 0;
+}
+
+static int ext4_mb_init_backend(struct super_block *sb)
+{
+	// 组数
+	ext4_group_t ngroups = ext4_get_groups_count(sb);
+	ext4_group_t i;
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	int err;
+	struct ext4_group_desc *desc;
+	struct ext4_group_info ***group_info;
+	struct kmem_cache *cachep;
+
+	// 分配组信息
+	err = ext4_mb_alloc_groupinfo(sb, ngroups);
+	if (err)
+		return err;
+
+	// 分配一个inode用作buddy-cache，用于块分配
+	sbi->s_buddy_cache = new_inode(sb);
+	if (sbi->s_buddy_cache == NULL) {
+		ext4_msg(sb, KERN_ERR, "can't get new inode");
+		goto err_freesgi;
+	}
+	// 设置inode号
+	sbi->s_buddy_cache->i_ino = EXT4_BAD_INO;
+	// buddy inode不占用磁盘空间
+	EXT4_I(sbi->s_buddy_cache)->i_disksize = 0;
+
+	// 遍历所有组，添加组信息
+	for (i = 0; i < ngroups; i++) {
+		cond_resched();
+		// 组描述符
+		desc = ext4_get_group_desc(sb, i, NULL);
+		if (desc == NULL) {
+			ext4_msg(sb, KERN_ERR, "can't read descriptor %u", i);
+			goto err_freebuddy;
+		}
+		if (ext4_mb_add_groupinfo(sb, i, desc) != 0)
+			goto err_freebuddy;
+	}
+
+	if (ext4_has_feature_flex_bg(sb)) {
+		/* a single flex group is supposed to be read by a single IO.
+		 * 2 ^ s_log_groups_per_flex != UINT_MAX as s_mb_prefetch is
+		 * unsigned integer, so the maximum shift is 32.
+		 */
+		if (sbi->s_es->s_log_groups_per_flex >= 32) {
+			ext4_msg(sb, KERN_ERR, "too many log groups per flexible block group");
+			goto err_freebuddy;
+		}
+		sbi->s_mb_prefetch = min_t(uint, 1 << sbi->s_es->s_log_groups_per_flex,
+			BLK_MAX_SEGMENT_SIZE >> (sb->s_blocksize_bits - 9));
+		sbi->s_mb_prefetch *= 8; /* 8 prefetch IOs in flight at most */
+	} else {
+		sbi->s_mb_prefetch = 32;
+	}
+	if (sbi->s_mb_prefetch > ext4_get_groups_count(sb))
+		sbi->s_mb_prefetch = ext4_get_groups_count(sb);
+	/* now many real IOs to prefetch within a single allocation at cr=0
+	 * given cr=0 is an CPU-related optimization we shouldn't try to
+	 * load too many groups, at some point we should start to use what
+	 * we've got in memory.
+	 * with an average random access time 5ms, it'd take a second to get
+	 * 200 groups (* N with flex_bg), so let's make this limit 4
+	 */
+	sbi->s_mb_prefetch_limit = sbi->s_mb_prefetch * 4;
+	if (sbi->s_mb_prefetch_limit > ext4_get_groups_count(sb))
+		sbi->s_mb_prefetch_limit = ext4_get_groups_count(sb);
+
+	return 0;
+
+err_freebuddy:
+	cachep = get_groupinfo_cache(sb->s_blocksize_bits);
+	while (i-- > 0)
+		kmem_cache_free(cachep, ext4_get_group_info(sb, i));
+	i = sbi->s_group_info_size;
+	rcu_read_lock();
+	group_info = rcu_dereference(sbi->s_group_info);
+	while (i-- > 0)
+		kfree(group_info[i]);
+	rcu_read_unlock();
+	iput(sbi->s_buddy_cache);
+err_freesgi:
+	rcu_read_lock();
+	kvfree(rcu_dereference(sbi->s_group_info));
+	rcu_read_unlock();
+	return -ENOMEM;
+}
+
+int ext4_mb_alloc_groupinfo(struct super_block *sb, ext4_group_t ngroups)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	unsigned size;
+	struct ext4_group_info ***old_groupinfo, ***new_groupinfo;
+
+	// 组的数量
+	size = (ngroups + EXT4_DESC_PER_BLOCK(sb) - 1) >>
+		EXT4_DESC_PER_BLOCK_BITS(sb);
+	// 如果大小给以前的组小，那就不用分配了，直接返回
+	if (size <= sbi->s_group_info_size)
+		return 0;
+
+	// 需要的字节数，2次幂
+	size = roundup_pow_of_two(sizeof(*sbi->s_group_info) * size);
+	// 分配一个组
+	new_groupinfo = kvzalloc(size, GFP_KERNEL);
+	if (!new_groupinfo) {
+		ext4_msg(sb, KERN_ERR, "can't allocate buddy meta group");
+		return -ENOMEM;
+	}
+	rcu_read_lock();
+	// 旧组
+	old_groupinfo = rcu_dereference(sbi->s_group_info);
+	// 把旧组信息复制到新组
+	if (old_groupinfo)
+		memcpy(new_groupinfo, old_groupinfo,
+		       sbi->s_group_info_size * sizeof(*sbi->s_group_info));
+	rcu_read_unlock();
+	// 设置到sbi里
+	rcu_assign_pointer(sbi->s_group_info, new_groupinfo);
+	// 更新组大小
+	sbi->s_group_info_size = size / sizeof(*sbi->s_group_info);
+	// 释放老的组信息
+	if (old_groupinfo)
+		ext4_kvfree_array_rcu(old_groupinfo);
+	ext4_debug("allocated s_groupinfo array for %d meta_bg's\n", 
+		   sbi->s_group_info_size);
+	return 0;
+}
+
+int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
+			  struct ext4_group_desc *desc)
+{
+	int i;
+	int metalen = 0;
+	int idx = group >> EXT4_DESC_PER_BLOCK_BITS(sb);
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct ext4_group_info **meta_group_info;
+	struct kmem_cache *cachep = get_groupinfo_cache(sb->s_blocksize_bits);
+
+	/*
+	 * First check if this group is the first of a reserved block.
+	 * If it's true, we have to allocate a new table of pointers
+	 * to ext4_group_info structures
+	 */
+	if (group % EXT4_DESC_PER_BLOCK(sb) == 0) {
+		metalen = sizeof(*meta_group_info) <<
+			EXT4_DESC_PER_BLOCK_BITS(sb);
+		meta_group_info = kmalloc(metalen, GFP_NOFS);
+		if (meta_group_info == NULL) {
+			ext4_msg(sb, KERN_ERR, "can't allocate mem "
+				 "for a buddy group");
+			goto exit_meta_group_info;
+		}
+		rcu_read_lock();
+		rcu_dereference(sbi->s_group_info)[idx] = meta_group_info;
+		rcu_read_unlock();
+	}
+
+	meta_group_info = sbi_array_rcu_deref(sbi, s_group_info, idx);
+	i = group & (EXT4_DESC_PER_BLOCK(sb) - 1);
+
+	meta_group_info[i] = kmem_cache_zalloc(cachep, GFP_NOFS);
+	if (meta_group_info[i] == NULL) {
+		ext4_msg(sb, KERN_ERR, "can't allocate buddy mem");
+		goto exit_group_info;
+	}
+	set_bit(EXT4_GROUP_INFO_NEED_INIT_BIT,
+		&(meta_group_info[i]->bb_state));
+
+	/*
+	 * initialize bb_free to be able to skip
+	 * empty groups without initialization
+	 */
+	if (ext4_has_group_desc_csum(sb) &&
+	    (desc->bg_flags & cpu_to_le16(EXT4_BG_BLOCK_UNINIT))) {
+		meta_group_info[i]->bb_free =
+			ext4_free_clusters_after_init(sb, group, desc);
+	} else {
+		meta_group_info[i]->bb_free =
+			ext4_free_group_clusters(sb, desc);
+	}
+
+	INIT_LIST_HEAD(&meta_group_info[i]->bb_prealloc_list);
+	init_rwsem(&meta_group_info[i]->alloc_sem);
+	meta_group_info[i]->bb_free_root = RB_ROOT;
+	meta_group_info[i]->bb_largest_free_order = -1;  /* uninit */
+
+	mb_group_bb_bitmap_alloc(sb, meta_group_info[i], group);
+	return 0;
+
+exit_group_info:
+	/* If a meta_group_info table has been allocated, release it now */
+	if (group % EXT4_DESC_PER_BLOCK(sb) == 0) {
+		struct ext4_group_info ***group_info;
+
+		rcu_read_lock();
+		group_info = rcu_dereference(sbi->s_group_info);
+		kfree(group_info[idx]);
+		group_info[idx] = NULL;
+		rcu_read_unlock();
+	}
+exit_meta_group_info:
+	return -ENOMEM;
 }
 ```
 
