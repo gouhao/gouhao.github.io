@@ -395,8 +395,6 @@ exit_meta_group_info:
 }
 ```
 
-
-## 1. ext4_mb_new_blocks
 ## 1. ext4_mb_init_group
 ```c
 struct ext4_buddy {
@@ -1000,10 +998,10 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 	if (!ext4_mb_use_preallocated(ac)) {
 		// 普通分配
 		ac->ac_op = EXT4_MB_HISTORY_ALLOC;
-		// 把请求标准化
+		// 把请求大小标准化，并且还有可能合并
 		ext4_mb_normalize_request(ac, ar);
 
-		// 给ac分配一个ext4_prealloc_space对象
+		// 给ac分配一个预分配对象
 		*errp = ext4_mb_pa_alloc(ac);
 		if (*errp)
 			goto errout;
@@ -1116,13 +1114,15 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 	// 已经找到了不应该走这个函数
 	BUG_ON(ac->ac_status == AC_STATUS_FOUND);
 
-	// 先试一下目标块
+	// 先试一下目标块的地方能否分配
 	err = ext4_mb_find_by_goal(ac, &e4b);
 	// 出错或者找到了
 	if (err || ac->ac_status == AC_STATUS_FOUND)
 		goto out;
 
-	// 只找目标块, 则退出. 这个标志应该很少用吧
+	// 走到这儿说明没找到
+
+	// 只找目标块, 则退出. 
 	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
 		goto out;
 
@@ -1293,28 +1293,33 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 	struct ext4_group_info *grp = ext4_get_group_info(ac->ac_sb, group);
 	struct ext4_free_extent ex;
 
-	// 没有找目标块退出
+	// 不需要找目标块，退出
 	if (!(ac->ac_flags & EXT4_MB_HINT_TRY_GOAL))
 		return 0;
 	// 该组的空闲块为0
 	if (grp->bb_free == 0)
 		return 0;
 
+	// 加载buddy
 	err = ext4_mb_load_buddy(ac->ac_sb, group, e4b);
 	if (err)
 		return err;
 
+	// 加载位图错误，直接返回
 	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(e4b->bd_info))) {
 		ext4_mb_unload_buddy(e4b);
 		return 0;
 	}
 
 	ext4_lock_group(ac->ac_sb, group);
+	// 根据start找合适的extent
 	max = mb_find_extent(e4b, ac->ac_g_ex.fe_start,
 			     ac->ac_g_ex.fe_len, &ex);
+	// what?
 	ex.fe_logical = 0xDEADFA11; /* debug value */
 
 	if (max >= ac->ac_g_ex.fe_len && ac->ac_g_ex.fe_len == sbi->s_stripe) {
+		// 对raid的优化
 		ext4_fsblk_t start;
 
 		start = ext4_group_first_block_no(ac->ac_sb, e4b->bd_group) +
@@ -1326,6 +1331,7 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 			ext4_mb_use_best_found(ac, e4b);
 		}
 	} else if (max >= ac->ac_g_ex.fe_len) {
+		// 可分配块数量大于需要的长度
 		BUG_ON(ex.fe_len <= 0);
 		BUG_ON(ex.fe_group != ac->ac_g_ex.fe_group);
 		BUG_ON(ex.fe_start != ac->ac_g_ex.fe_start);
@@ -1333,6 +1339,8 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 		ac->ac_b_ex = ex;
 		ext4_mb_use_best_found(ac, e4b);
 	} else if (max > 0 && (ac->ac_flags & EXT4_MB_HINT_MERGE)) {
+		// 可分配块小于需要的长度
+
 		/* Sometimes, caller may want to merge even small
 		 * number of blocks to an existing extent */
 		BUG_ON(ex.fe_len <= 0);
@@ -1547,6 +1555,132 @@ void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
 
 		break;
 	}
+}
+
+static void ext4_mb_use_best_found(struct ext4_allocation_context *ac,
+					struct ext4_buddy *e4b)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	int ret;
+
+	// 与所需的组不一样
+	BUG_ON(ac->ac_b_ex.fe_group != e4b->bd_group);
+	// 已经找到怎么会走到这儿
+	BUG_ON(ac->ac_status == AC_STATUS_FOUND);
+
+	// 长度取最小值
+	ac->ac_b_ex.fe_len = min(ac->ac_b_ex.fe_len, ac->ac_g_ex.fe_len);
+	// 起始逻辑块
+	ac->ac_b_ex.fe_logical = ac->ac_g_ex.fe_logical;
+	// 标记ex里的块已在使用
+	ret = mb_mark_used(e4b, &ac->ac_b_ex);
+
+	/* 预分配会改变ac_b_ex, 因此我们把已经分配的块存储起来，作为历史 */
+	ac->ac_f_ex = ac->ac_b_ex;
+
+	// 已找到
+	ac->ac_status = AC_STATUS_FOUND;
+	// ？
+	ac->ac_tail = ret & 0xffff;
+	ac->ac_buddy = ret >> 16;
+
+	// 获取bitmap/buddy_page的引用
+	ac->ac_bitmap_page = e4b->bd_bitmap_page;
+	get_page(ac->ac_bitmap_page);
+	ac->ac_buddy_page = e4b->bd_buddy_page;
+	get_page(ac->ac_buddy_page);
+
+	// 如果是流分配，则存储本次分配的组和起点，下次从这儿开始分配
+	if (ac->ac_flags & EXT4_MB_STREAM_ALLOC) {
+		spin_lock(&sbi->s_md_lock);
+		sbi->s_mb_last_group = ac->ac_f_ex.fe_group;
+		sbi->s_mb_last_start = ac->ac_f_ex.fe_start;
+		spin_unlock(&sbi->s_md_lock);
+	}
+	/*
+	 * As we've just preallocated more space than
+	 * user requested originally, we store allocated
+	 * space in a special descriptor.
+	 */
+	if (ac->ac_o_ex.fe_len < ac->ac_b_ex.fe_len)
+		ext4_mb_new_preallocation(ac);
+
+}
+
+static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
+{
+	int ord;
+	int mlen = 0;
+	int max = 0;
+	int cur;
+	int start = ex->fe_start;
+	int len = ex->fe_len;
+	unsigned ret = 0;
+	int len0 = len;
+	void *buddy;
+
+	BUG_ON(start + len > (e4b->bd_sb->s_blocksize << 3));
+	BUG_ON(e4b->bd_group != ex->fe_group);
+	assert_spin_locked(ext4_group_lock_ptr(e4b->bd_sb, e4b->bd_group));
+	mb_check_buddy(e4b);
+	mb_mark_used_double(e4b, start, len);
+
+	this_cpu_inc(discard_pa_seq);
+	e4b->bd_info->bb_free -= len;
+	if (e4b->bd_info->bb_first_free == start)
+		e4b->bd_info->bb_first_free += len;
+
+	/* let's maintain fragments counter */
+	if (start != 0)
+		mlen = !mb_test_bit(start - 1, e4b->bd_bitmap);
+	if (start + len < EXT4_SB(e4b->bd_sb)->s_mb_maxs[0])
+		max = !mb_test_bit(start + len, e4b->bd_bitmap);
+	if (mlen && max)
+		e4b->bd_info->bb_fragments++;
+	else if (!mlen && !max)
+		e4b->bd_info->bb_fragments--;
+
+	/* let's maintain buddy itself */
+	while (len) {
+		ord = mb_find_order_for_block(e4b, start);
+
+		if (((start >> ord) << ord) == start && len >= (1 << ord)) {
+			/* the whole chunk may be allocated at once! */
+			mlen = 1 << ord;
+			buddy = mb_find_buddy(e4b, ord, &max);
+			BUG_ON((start >> ord) >= max);
+			mb_set_bit(start >> ord, buddy);
+			e4b->bd_info->bb_counters[ord]--;
+			start += mlen;
+			len -= mlen;
+			BUG_ON(len < 0);
+			continue;
+		}
+
+		/* store for history */
+		if (ret == 0)
+			ret = len | (ord << 16);
+
+		/* we have to split large buddy */
+		BUG_ON(ord <= 0);
+		buddy = mb_find_buddy(e4b, ord, &max);
+		mb_set_bit(start >> ord, buddy);
+		e4b->bd_info->bb_counters[ord]--;
+
+		ord--;
+		cur = (start >> ord) & ~1U;
+		buddy = mb_find_buddy(e4b, ord, &max);
+		mb_clear_bit(cur, buddy);
+		mb_clear_bit(cur + 1, buddy);
+		e4b->bd_info->bb_counters[ord]++;
+		e4b->bd_info->bb_counters[ord]++;
+	}
+	mb_set_largest_free_order(e4b->bd_sb, e4b->bd_info);
+
+	ext4_set_bits(e4b->bd_bitmap, ex->fe_start, len0);
+	mb_check_buddy(e4b);
+
+	return ret;
 }
 ```
 
@@ -2011,34 +2145,35 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 	if (ac->ac_flags & EXT4_MB_HINT_NOPREALLOC)
 		return;
 
-	// 标准化组分配. todo: 后面看
+	// 使用组分配
 	if (ac->ac_flags & EXT4_MB_HINT_GROUP_ALLOC) {
 		ext4_mb_normalize_group_request(ac);
 		return ;
 	}
 
+	// 走到这儿就是一般情况
+
 	// 块大小
 	bsbits = ac->ac_sb->s_blocksize_bits;
 
-	/* 首先, 我们来当前请求需要分配的大小 */
+	// 请求块的大小（以块为单位）
 	size = ac->ac_o_ex.fe_logical + EXT4_C2B(sbi, ac->ac_o_ex.fe_len);
+	// 转成byte
 	size = size << bsbits;
-	// todo: what
+	// 如果比当前文件小，则以当前文件大小为准
 	if (size < i_size_read(ac->ac_inode))
 		size = i_size_read(ac->ac_inode);
 	orig_size = size;
 
-	/* max size of free chunks */
+	// 一次分配的最大为块大小4倍
 	max = 2 << bsbits;
 
 #define NRL_CHECK_SIZE(req, size, max, chunk_size)	\
 		(req <= (size) || max <= (chunk_size))
 
-	/* 首先, 预言文件大小
-	/* XXX: 这个表应该可调节吗? */
 	start_off = 0;
 
-	// 规范文件大小??
+	// 这是干什么？
 	if (size <= 16 * 1024) {
 		size = 16 * 1024;
 	} else if (size <= 32 * 1024) {
@@ -2071,6 +2206,8 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 		size	  = (loff_t) EXT4_C2B(EXT4_SB(ac->ac_sb),
 					      ac->ac_o_ex.fe_len) << bsbits;
 	}
+
+	// 把规范后的size转成块
 	size = size >> bsbits;
 	start = start_off >> bsbits;
 
@@ -2094,8 +2231,10 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 	// 最终的节点
 	end = start + size;
 
-	/* 先检查已分配的块 */
+	
 	rcu_read_lock();
+
+	/* 先检查预分配的块 */
 	list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
 		ext4_lblk_t pa_end;
 
@@ -2123,7 +2262,7 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 			spin_unlock(&pa->pa_lock);
 			continue;
 		}
-		// 怎么会发生这种情况
+		// todo： 为什么不能在pa的范围内
 		BUG_ON(pa->pa_lstart <= start && pa_end >= end);
 
 		/* 把start或end限制到这个pa的位置 */
