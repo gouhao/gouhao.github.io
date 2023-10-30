@@ -1150,7 +1150,7 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 
 	// 先试一下目标块的地方能否分配
 	err = ext4_mb_find_by_goal(ac, &e4b);
-	// 出错或者找到了
+	// 出错或者找到了, 大多数情况都能成功分配，从这返回
 	if (err || ac->ac_status == AC_STATUS_FOUND)
 		goto out;
 
@@ -1196,6 +1196,7 @@ repeat:
 		group = ac->ac_g_ex.fe_group;
 		prefetch_grp = group;
 
+		// 遍历所有组
 		for (i = 0; i < ngroups; group++, i++) {
 			int ret = 0;
 			cond_resched();
@@ -1216,7 +1217,7 @@ repeat:
 				if (ext4_has_feature_flex_bg(sb)) {
 					// 每个灵活组几个组
 					nr = 1 << sbi->s_log_groups_per_flex;
-					// what ?
+					// 对齐到灵活组
 					nr -= group & (nr - 1);
 					// 预取组的最小值
 					nr = min(nr, sbi->s_mb_prefetch);
@@ -1314,6 +1315,67 @@ out:
 		ext4_mb_prefetch_fini(sb, prefetch_grp, nr);
 
 	return err;
+}
+
+static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
+				     ext4_group_t group, int cr)
+{
+	// 组信息
+	struct ext4_group_info *grp = ext4_get_group_info(ac->ac_sb, group);
+	struct super_block *sb = ac->ac_sb;
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	// 是不是应该加锁
+	bool should_lock = ac->ac_flags & EXT4_MB_STRICT_CHECK;
+	ext4_grpblk_t free;
+	int ret = 0;
+
+	if (should_lock)
+		ext4_lock_group(sb, group);
+	
+	// 组的空闲块数
+	free = grp->bb_free;
+	// 这个组没有空闲的了
+	if (free == 0)
+		goto out;
+	if (cr <= 2 && free < ac->ac_g_ex.fe_len)
+		goto out;
+	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(grp)))
+		goto out;
+	if (should_lock)
+		ext4_unlock_group(sb, group);
+
+	/* We only do this if the grp has never been initialized */
+	if (unlikely(EXT4_MB_GRP_NEED_INIT(grp))) {
+		struct ext4_group_desc *gdp =
+			ext4_get_group_desc(sb, group, NULL);
+		int ret;
+
+		/* cr=0/1 is a very optimistic search to find large
+		 * good chunks almost for free.  If buddy data is not
+		 * ready, then this optimization makes no sense.  But
+		 * we never skip the first block group in a flex_bg,
+		 * since this gets used for metadata block allocation,
+		 * and we want to make sure we locate metadata blocks
+		 * in the first block group in the flex_bg if possible.
+		 */
+		if (cr < 2 &&
+		    (!sbi->s_log_groups_per_flex ||
+		     ((group & ((1 << sbi->s_log_groups_per_flex) - 1)) != 0)) &&
+		    !(ext4_has_group_desc_csum(sb) &&
+		      (gdp->bg_flags & cpu_to_le16(EXT4_BG_BLOCK_UNINIT))))
+			return 0;
+		ret = ext4_mb_init_group(sb, group, GFP_NOFS);
+		if (ret)
+			return ret;
+	}
+
+	if (should_lock)
+		ext4_lock_group(sb, group);
+	ret = ext4_mb_good_group(ac, group, cr);
+out:
+	if (should_lock)
+		ext4_unlock_group(sb, group);
+	return ret;
 }
 
 static noinline_for_stack
