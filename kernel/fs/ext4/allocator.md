@@ -1346,14 +1346,15 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 	}
 
 	ext4_lock_group(ac->ac_sb, group);
-	// 根据start找合适的extent
+	// 根据start找合适的extent, 返回值是最大可分配的块数
 	max = mb_find_extent(e4b, ac->ac_g_ex.fe_start,
 			     ac->ac_g_ex.fe_len, &ex);
 	// what?
 	ex.fe_logical = 0xDEADFA11; /* debug value */
 
+	
 	if (max >= ac->ac_g_ex.fe_len && ac->ac_g_ex.fe_len == sbi->s_stripe) {
-		// 对raid的优化
+		// 对raid的优化. todo: raid后面看	
 		ext4_fsblk_t start;
 
 		start = ext4_group_first_block_no(ac->ac_sb, e4b->bd_group) +
@@ -1365,15 +1366,18 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 			ext4_mb_use_best_found(ac, e4b);
 		}
 	} else if (max >= ac->ac_g_ex.fe_len) {
-		// 可分配块数量大于需要的长度
+		// 可分配块数量大于需要的长度, 大多都会走这
 		BUG_ON(ex.fe_len <= 0);
 		BUG_ON(ex.fe_group != ac->ac_g_ex.fe_group);
 		BUG_ON(ex.fe_start != ac->ac_g_ex.fe_start);
+		// 找到了
 		ac->ac_found++;
+		// 把ex的值复制到b_ex里
 		ac->ac_b_ex = ex;
+		// 标记best已使用
 		ext4_mb_use_best_found(ac, e4b);
 	} else if (max > 0 && (ac->ac_flags & EXT4_MB_HINT_MERGE)) {
-		// 可分配块小于需要的长度
+		// 可分配块小于需要的长度, 有merge标志
 
 		/* Sometimes, caller may want to merge even small
 		 * number of blocks to an existing extent */
@@ -1384,7 +1388,10 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 		ac->ac_b_ex = ex;
 		ext4_mb_use_best_found(ac, e4b);
 	}
+
+	// 解锁group
 	ext4_unlock_group(ac->ac_sb, group);
+	// 释放page引用
 	ext4_mb_unload_buddy(e4b);
 
 	return 0;
@@ -1442,13 +1449,12 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 	}
 
 	/*
-	 * buddy缓存节点存储块位图和块信息在连续的块里，所以每个组
-	 * 我们需要2个块
+	 * 位图块
 	 */
 	block = group * 2;
 	// 页号
 	pnum = block / blocks_per_page;
-	// 页内偏移
+	// 块在页内偏移
 	poff = block % blocks_per_page;
 
 	// 获取对应的页
@@ -1474,6 +1480,7 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 					unlock_page(page);
 					goto err;
 				}
+				// 调试相关
 				mb_cmp_bitmaps(e4b, page_address(page) +
 					       (poff * sb->s_blocksize));
 			}
@@ -1490,11 +1497,12 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 		goto err;
 	}
 
-	// 记录页和位图的起点
+	// 位图页的page
 	e4b->bd_bitmap_page = page;
+	// 位图页的地址起点
 	e4b->bd_bitmap = page_address(page) + (poff * sb->s_blocksize);
 
-	// 兄弟块的页及偏移
+	// buddy信息页
 	block++;
 	pnum = block / blocks_per_page;
 	poff = block % blocks_per_page;
@@ -1508,6 +1516,7 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 		if (page) {
 			BUG_ON(page->mapping != inode->i_mapping);
 			if (!PageUptodate(page)) {
+				// 注意：这里初始化第二个参数传的是位图
 				ret = ext4_mb_init_cache(page, e4b->bd_bitmap,
 							 gfp);
 				if (ret) {
@@ -1543,6 +1552,139 @@ err:
 	e4b->bd_buddy = NULL;
 	e4b->bd_bitmap = NULL;
 	return ret;
+}
+
+
+static int mb_find_extent(struct ext4_buddy *e4b, int block,
+				int needed, struct ext4_free_extent *ex)
+{
+	int next = block;
+	int max, order;
+	void *buddy;
+
+	assert_spin_locked(ext4_group_lock_ptr(e4b->bd_sb, e4b->bd_group));
+	BUG_ON(ex == NULL);
+
+	// 获取最大可分配的值
+	// 因为这里传的是0, 所以返回的是位图
+	buddy = mb_find_buddy(e4b, 0, &max);
+	BUG_ON(buddy == NULL);
+	BUG_ON(block >= max);
+	// 如果当前块已经设置,则直接返回
+	if (mb_test_bit(block, buddy)) {
+		ex->fe_len = 0;
+		ex->fe_start = 0;
+		ex->fe_group = 0;
+		return 0;
+	}
+
+	// 找一个有足够空间分开块的order
+	order = mb_find_order_for_block(e4b, block);
+	block = block >> order;
+
+	// 设置order及起始块
+	ex->fe_len = 1 << order;
+	ex->fe_start = block << order;
+	ex->fe_group = e4b->bd_group;
+
+	// todo: what?
+	next = next - ex->fe_start;
+	ex->fe_len -= next;
+	ex->fe_start += next;
+
+	// 如果不够需要的长度,则递规查找
+	while (needed > ex->fe_len &&
+		// 找order的的最大值
+	       mb_find_buddy(e4b, order, &max)) {
+
+		// 超过最大值,退出
+		if (block + 1 >= max)
+			break;
+
+		// 下一个块如果设置则退出
+		next = (block + 1) * (1 << order);
+		if (mb_test_bit(next, e4b->bd_bitmap))
+			break;
+		// 如果没设置,则找next的order
+		order = mb_find_order_for_block(e4b, next);
+
+		// todo:??
+		block = next >> order;
+		ex->fe_len += 1 << order;
+	}
+
+	// 要分配的长度,超过了每组最大的cluster数量
+	if (ex->fe_start + ex->fe_len > EXT4_CLUSTERS_PER_GROUP(e4b->bd_sb)) {
+		// 这种情况不应该发生, 但是有时确实发生了. 就返回分配失败
+		WARN_ON(1);
+		ext4_grp_locked_error(e4b->bd_sb, e4b->bd_group, 0, 0,
+			"corruption or bug in mb_find_extent "
+			"block=%d, order=%d needed=%d ex=%u/%d/%d@%u",
+			block, order, needed, ex->fe_group, ex->fe_start,
+			ex->fe_len, ex->fe_logical);
+		ex->fe_len = 0;
+		ex->fe_start = 0;
+		ex->fe_group = 0;
+	}
+	return ex->fe_len;
+}
+
+static void *mb_find_buddy(struct ext4_buddy *e4b, int order, int *max)
+{
+	char *bb;
+
+	// 位图地址怎么会和buddy地址一样？
+	BUG_ON(e4b->bd_bitmap == e4b->bd_buddy);
+	BUG_ON(max == NULL);
+
+	// order最大只能是块大小+1次幂，why?
+	if (order > e4b->bd_blkbits + 1) {
+		*max = 0;
+		return NULL;
+	}
+
+	// 0阶时可以分配所有的块
+	if (order == 0) {
+		*max = 1 << (e4b->bd_blkbits + 3);
+		// 返回的是位图地址
+		return e4b->bd_bitmap;
+	}
+
+	// bb为对应阶数的buddy地址
+	bb = e4b->bd_buddy + EXT4_SB(e4b->bd_sb)->s_mb_offsets[order];
+	// 最大可分配数量
+	*max = EXT4_SB(e4b->bd_sb)->s_mb_maxs[order];
+
+	return bb;
+}
+
+static int mb_find_order_for_block(struct ext4_buddy *e4b, int block)
+{
+	int order = 1;
+	int bb_incr = 1 << (e4b->bd_blkbits - 1);
+	void *bb;
+
+	BUG_ON(e4b->bd_bitmap == e4b->bd_buddy);
+	BUG_ON(block >= (1 << (e4b->bd_blkbits + 3)));
+
+	// buddy起点
+	bb = e4b->bd_buddy;
+	while (order <= e4b->bd_blkbits + 1) {
+		// block减半
+		block = block >> 1;
+		// 当前block没设置, 则直接返回order
+		if (!mb_test_bit(block, bb)) {
+			/* this block is part of buddy of order 'order' */
+			return order;
+		}
+		// 位图增加到下一阶
+		bb += bb_incr;
+		// 高阶位图长度是低阶的一半
+		bb_incr >>= 1;
+		// 阶数递增
+		order++;
+	}
+	return 0;
 }
 
 static noinline_for_stack
@@ -1606,7 +1748,7 @@ static void ext4_mb_use_best_found(struct ext4_allocation_context *ac,
 	ac->ac_b_ex.fe_len = min(ac->ac_b_ex.fe_len, ac->ac_g_ex.fe_len);
 	// 起始逻辑块
 	ac->ac_b_ex.fe_logical = ac->ac_g_ex.fe_logical;
-	// 标记ex里的块已在使用
+	// 标记ex里的块已在使用, 并且处理buddy位图相关
 	ret = mb_mark_used(e4b, &ac->ac_b_ex);
 
 	/* 预分配会改变ac_b_ex, 因此我们把已经分配的块存储起来，作为历史 */
@@ -1631,11 +1773,7 @@ static void ext4_mb_use_best_found(struct ext4_allocation_context *ac,
 		sbi->s_mb_last_start = ac->ac_f_ex.fe_start;
 		spin_unlock(&sbi->s_md_lock);
 	}
-	/*
-	 * As we've just preallocated more space than
-	 * user requested originally, we store allocated
-	 * space in a special descriptor.
-	 */
+	// 需要的空间小于已分配的空间,则把多余空间放到预分配里
 	if (ac->ac_o_ex.fe_len < ac->ac_b_ex.fe_len)
 		ext4_mb_new_preallocation(ac);
 
@@ -1647,35 +1785,51 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 	int mlen = 0;
 	int max = 0;
 	int cur;
+	// 起点
 	int start = ex->fe_start;
+	// 长度
 	int len = ex->fe_len;
 	unsigned ret = 0;
 	int len0 = len;
 	void *buddy;
 
+	// 超过最大可分配大小
 	BUG_ON(start + len > (e4b->bd_sb->s_blocksize << 3));
 	BUG_ON(e4b->bd_group != ex->fe_group);
 	assert_spin_locked(ext4_group_lock_ptr(e4b->bd_sb, e4b->bd_group));
+	// buddy一致性检查,调试用的
 	mb_check_buddy(e4b);
+	// 在位图里设置这些位已经使用
 	mb_mark_used_double(e4b, start, len);
 
+	// what?
 	this_cpu_inc(discard_pa_seq);
+
+	// 空闲块数减少
 	e4b->bd_info->bb_free -= len;
+	// 如果是第一个空闲的块,则重新设置它
 	if (e4b->bd_info->bb_first_free == start)
 		e4b->bd_info->bb_first_free += len;
 
-	/* let's maintain fragments counter */
+	// 计算碎片数量
+	
+	// 已分配区间左边的块是否设置
 	if (start != 0)
 		mlen = !mb_test_bit(start - 1, e4b->bd_bitmap);
+
+	// 已分配区间右边是否设置
 	if (start + len < EXT4_SB(e4b->bd_sb)->s_mb_maxs[0])
 		max = !mb_test_bit(start + len, e4b->bd_bitmap);
+	// 如果两边都没设置,则递增碎片数量
 	if (mlen && max)
 		e4b->bd_info->bb_fragments++;
+	// 反之,减少碎片数量
 	else if (!mlen && !max)
 		e4b->bd_info->bb_fragments--;
 
 	/* let's maintain buddy itself */
 	while (len) {
+		// 找到start对应的阶
 		ord = mb_find_order_for_block(e4b, start);
 
 		if (((start >> ord) << ord) == start && len >= (1 << ord)) {
@@ -1695,26 +1849,54 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 		if (ret == 0)
 			ret = len | (ord << 16);
 
-		/* we have to split large buddy */
+		// 把大的buddy分割, 放到小一些的块里
+
 		BUG_ON(ord <= 0);
+		// 找到order的buddy地址
 		buddy = mb_find_buddy(e4b, ord, &max);
+		// 设置该buddy为使用
 		mb_set_bit(start >> ord, buddy);
+		// 减少相关buddy的块数量
 		e4b->bd_info->bb_counters[ord]--;
 
+		// 阶减1
 		ord--;
+		// 起始地址减半
 		cur = (start >> ord) & ~1U;
+		// 找到对应的buddy
 		buddy = mb_find_buddy(e4b, ord, &max);
+
+		// 清除buddy上相关的位
 		mb_clear_bit(cur, buddy);
 		mb_clear_bit(cur + 1, buddy);
+		// 对应的order+1
 		e4b->bd_info->bb_counters[ord]++;
 		e4b->bd_info->bb_counters[ord]++;
 	}
+	// 设置最大的空闲order
 	mb_set_largest_free_order(e4b->bd_sb, e4b->bd_info);
 
+	// 在位图上设置区间已使用. todo: 上面不是已经标记过了吗?
 	ext4_set_bits(e4b->bd_bitmap, ex->fe_start, len0);
 	mb_check_buddy(e4b);
 
 	return ret;
+}
+
+static void mb_mark_used_double(struct ext4_buddy *e4b, int first, int count)
+{
+	int i;
+
+	// 没有位图
+	if (unlikely(e4b->bd_info->bb_bitmap == NULL))
+		return;
+	assert_spin_locked(ext4_group_lock_ptr(e4b->bd_sb, e4b->bd_group));
+	for (i = 0; i < count; i++) {
+		// 该位置已被标记
+		BUG_ON(mb_test_bit(first + i, e4b->bd_info->bb_bitmap));
+		// 在位图里设置这些位已使用
+		mb_set_bit(first + i, e4b->bd_info->bb_bitmap);
+	}
 }
 ```
 
