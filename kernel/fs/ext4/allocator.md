@@ -1337,14 +1337,16 @@ static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
 	// 这个组没有空闲的了
 	if (free == 0)
 		goto out;
+	// cr=3可以随意分配，小于3都需要精确分配，所以不符合长度的就退出
 	if (cr <= 2 && free < ac->ac_g_ex.fe_len)
 		goto out;
+	// 当前组的位图坏了，这个是不是应该放到前面判断？？
 	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(grp)))
 		goto out;
 	if (should_lock)
 		ext4_unlock_group(sb, group);
 
-	/* We only do this if the grp has never been initialized */
+	// 当前组还没初始化
 	if (unlikely(EXT4_MB_GRP_NEED_INIT(grp))) {
 		struct ext4_group_desc *gdp =
 			ext4_get_group_desc(sb, group, NULL);
@@ -1364,6 +1366,7 @@ static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
 		    !(ext4_has_group_desc_csum(sb) &&
 		      (gdp->bg_flags & cpu_to_le16(EXT4_BG_BLOCK_UNINIT))))
 			return 0;
+		// 初始化组
 		ret = ext4_mb_init_group(sb, group, GFP_NOFS);
 		if (ret)
 			return ret;
@@ -1371,11 +1374,79 @@ static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
 
 	if (should_lock)
 		ext4_lock_group(sb, group);
+	// 判断当前组是否适合分配
 	ret = ext4_mb_good_group(ac, group, cr);
 out:
 	if (should_lock)
 		ext4_unlock_group(sb, group);
 	return ret;
+}
+
+static bool ext4_mb_good_group(struct ext4_allocation_context *ac,
+				ext4_group_t group, int cr)
+{
+	ext4_grpblk_t free, fragments;
+	int flex_size = ext4_flex_bg_size(EXT4_SB(ac->ac_sb));
+	struct ext4_group_info *grp = ext4_get_group_info(ac->ac_sb, group);
+
+	// cr什么时候会有这些值？
+	BUG_ON(cr < 0 || cr >= 4);
+
+	// 位图错误直接返回
+	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(grp)))
+		return false;
+
+	// 没有空间了
+	free = grp->bb_free;
+	if (free == 0)
+		return false;
+
+	// 连碎片也没有了
+	fragments = grp->bb_fragments;
+	if (fragments == 0)
+		return false;
+
+	switch (cr) {
+	case 0:
+		BUG_ON(ac->ac_2order == 0);
+
+		// 如果是文件的话，避免在灵活组的第一个组里分配
+		if ((ac->ac_flags & EXT4_MB_HINT_DATA) &&
+		    (flex_size >= EXT4_FLEX_SIZE_DIR_ALLOC_SCHEME) &&
+		    ((group % flex_size) == 0))
+			return false;
+
+		// 长度不够
+		if (free < ac->ac_g_ex.fe_len)
+			return false;
+
+		// 超过了一次可分配的最在值
+		if (ac->ac_2order > ac->ac_sb->s_blocksize_bits+1)
+			return true;
+
+		// 当前组最大空闲块，小于要求的块长度
+		if (grp->bb_largest_free_order < ac->ac_2order)
+			return false;
+
+		return true;
+	case 1:
+		// todo: 空间除以碎片是啥？
+		if ((free / fragments) >= ac->ac_g_ex.fe_len)
+			return true;
+		break;
+	case 2:
+		// 长度必须大于要求的
+		if (free >= ac->ac_g_ex.fe_len)
+			return true;
+		break;
+	case 3:
+		// 任意分配
+		return true;
+	default:
+		BUG();
+	}
+
+	return false;
 }
 
 static noinline_for_stack
