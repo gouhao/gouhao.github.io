@@ -1236,9 +1236,10 @@ repeat:
 				// 不适合
 				if (!first_err)
 					first_err = ret;
+				// 继续尝试下一个组
 				continue;
 			}
-			// 加载兄弟的block位图。todo: what is buddy bitmap
+			// 加载buddy位图
 			err = ext4_mb_load_buddy(sb, group, &e4b);
 			if (err)
 				goto out;
@@ -1258,11 +1259,14 @@ repeat:
 
 			// 根据cr走不同的扫描
 			if (cr == 0)
+				// 扫描位图
 				ext4_mb_simple_scan_group(ac, &e4b);
 			else if (cr == 1 && sbi->s_stripe &&
 					!(ac->ac_g_ex.fe_len % sbi->s_stripe))
+				// raid. 后面看
 				ext4_mb_scan_aligned(ac, &e4b);
 			else
+				// 扫描所有组
 				ext4_mb_complex_scan_group(ac, &e4b);
 
 			ext4_unlock_group(sb, group);
@@ -1274,31 +1278,27 @@ repeat:
 		}
 	}
 
-	// todo: what?
+	// 如果还没找到, 且已经找到了best
 	if (ac->ac_b_ex.fe_len > 0 && ac->ac_status != AC_STATUS_FOUND &&
 	    !(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
-		/*
-		 * We've been searching too long. Let's try to allocate
-		 * the best chunk we've found so far
-		 */
+		// 从best里尝试分配
 		ext4_mb_try_best_found(ac, &e4b);
 		if (ac->ac_status != AC_STATUS_FOUND) {
-			/*
-			 * Someone more lucky has already allocated it.
-			 * The only thing we can do is just take first
-			 * found block(s)
-			 */
+			// 还是没找到,增加错误次数
 			lost = atomic_inc_return(&sbi->s_mb_lost_chunks);
 			mb_debug(sb, "lost chunk, group: %u, start: %d, len: %d, lost: %d\n",
 				 ac->ac_b_ex.fe_group, ac->ac_b_ex.fe_start,
 				 ac->ac_b_ex.fe_len, lost);
 
+			// 重置数据
 			ac->ac_b_ex.fe_group = 0;
 			ac->ac_b_ex.fe_start = 0;
 			ac->ac_b_ex.fe_len = 0;
 			ac->ac_status = AC_STATUS_CONTINUE;
 			ac->ac_flags |= EXT4_MB_HINT_FIRST;
+			// 设置cr=3, 搜索所有的组
 			cr = 3;
+			// 重新搜索
 			goto repeat;
 		}
 	}
@@ -1315,6 +1315,165 @@ out:
 		ext4_mb_prefetch_fini(sb, prefetch_grp, nr);
 
 	return err;
+}
+
+static noinline_for_stack
+int ext4_mb_try_best_found(struct ext4_allocation_context *ac,
+					struct ext4_buddy *e4b)
+{
+	struct ext4_free_extent ex = ac->ac_b_ex;
+	ext4_group_t group = ex.fe_group;
+	int max;
+	int err;
+
+	BUG_ON(ex.fe_len <= 0);
+	// 加载buddy
+	err = ext4_mb_load_buddy(ac->ac_sb, group, e4b);
+	if (err)
+		return err;
+
+	ext4_lock_group(ac->ac_sb, group);
+	// 找适当的extent
+	max = mb_find_extent(e4b, ex.fe_start, ex.fe_len, &ex);
+
+	// 如果找到就用它
+	if (max > 0) {
+		ac->ac_b_ex = ex;
+		ext4_mb_use_best_found(ac, e4b);
+	}
+
+	ext4_unlock_group(ac->ac_sb, group);
+	ext4_mb_unload_buddy(e4b);
+
+	return 0;
+}
+
+static noinline_for_stack
+void ext4_mb_complex_scan_group(struct ext4_allocation_context *ac,
+					struct ext4_buddy *e4b)
+{
+	struct super_block *sb = ac->ac_sb;
+	// buddy对应的位图
+	void *bitmap = e4b->bd_bitmap;
+	struct ext4_free_extent ex;
+	int i;
+	int free;
+
+	// 空闲数量
+	free = e4b->bd_info->bb_free;
+	// 没有空闲了
+	if (WARN_ON(free <= 0))
+		return;
+
+	// 第一个空闲的
+	i = e4b->bd_info->bb_first_free;
+
+
+	// 有空闲而且需要继续查找
+	while (free && ac->ac_status == AC_STATUS_CONTINUE) {
+		// 找位图上一个空闲的位置
+		i = mb_find_next_zero_bit(bitmap,
+						EXT4_CLUSTERS_PER_GROUP(sb), i);
+		// 上面的free说明有空闲块,可是这里却找不到,说明位图出现了错误
+		if (i >= EXT4_CLUSTERS_PER_GROUP(sb)) {
+			ext4_grp_locked_error(sb, e4b->bd_group, 0, 0,
+					"%d free clusters as per "
+					"group info. But bitmap says 0",
+					free);
+			ext4_mark_group_bitmap_corrupted(sb, e4b->bd_group,
+					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
+			break;
+		}
+
+		// 找能容的下fe_len的块
+		mb_find_extent(e4b, i, ac->ac_g_ex.fe_len, &ex);
+		// 没找到
+		if (WARN_ON(ex.fe_len <= 0))
+			break;
+		// 位图又坏了
+		if (free < ex.fe_len) {
+			ext4_grp_locked_error(sb, e4b->bd_group, 0, 0,
+					"%d free clusters as per "
+					"group info. But got %d blocks",
+					free, ex.fe_len);
+			ext4_mark_group_bitmap_corrupted(sb, e4b->bd_group,
+					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
+			/*
+			 * The number of free blocks differs. This mostly
+			 * indicate that the bitmap is corrupt. So exit
+			 * without claiming the space.
+			 */
+			break;
+		}
+		ex.fe_logical = 0xDEADC0DE; /* debug value */
+		// 检查是不是最好的exntent. todo: 后面看
+		ext4_mb_measure_extent(ac, &ex, e4b);
+
+		// 继续找空闲块
+		i += ex.fe_len;
+		free -= ex.fe_len;
+	}
+
+	ext4_mb_check_limits(ac, e4b, 1);
+}
+
+tatic void ext4_mb_measure_extent(struct ext4_allocation_context *ac,
+					struct ext4_free_extent *ex,
+					struct ext4_buddy *e4b)
+{
+	struct ext4_free_extent *bex = &ac->ac_b_ex;
+	struct ext4_free_extent *gex = &ac->ac_g_ex;
+
+	BUG_ON(ex->fe_len <= 0);
+	BUG_ON(ex->fe_len > EXT4_CLUSTERS_PER_GROUP(ac->ac_sb));
+	BUG_ON(ex->fe_start >= EXT4_CLUSTERS_PER_GROUP(ac->ac_sb));
+	BUG_ON(ac->ac_status != AC_STATUS_CONTINUE);
+
+	ac->ac_found++;
+
+	/*
+	 * The special case - take what you catch first
+	 */
+	if (unlikely(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
+		*bex = *ex;
+		ext4_mb_use_best_found(ac, e4b);
+		return;
+	}
+
+	/*
+	 * Let's check whether the chuck is good enough
+	 */
+	if (ex->fe_len == gex->fe_len) {
+		*bex = *ex;
+		ext4_mb_use_best_found(ac, e4b);
+		return;
+	}
+
+	/*
+	 * If this is first found extent, just store it in the context
+	 */
+	if (bex->fe_len == 0) {
+		*bex = *ex;
+		return;
+	}
+
+	/*
+	 * If new found extent is better, store it in the context
+	 */
+	if (bex->fe_len < gex->fe_len) {
+		/* if the request isn't satisfied, any found extent
+		 * larger than previous best one is better */
+		if (ex->fe_len > bex->fe_len)
+			*bex = *ex;
+	} else if (ex->fe_len > gex->fe_len) {
+		/* if the request is satisfied, then we try to find
+		 * an extent that still satisfy the request, but is
+		 * smaller than previous one */
+		if (ex->fe_len < bex->fe_len)
+			*bex = *ex;
+	}
+
+	ext4_mb_check_limits(ac, e4b, 0);
 }
 
 static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
@@ -1711,21 +1870,27 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 		return 0;
 	}
 
-	// 找一个有足够空间分开块的order
+	// 找一个有足够空间分配块的order
 	order = mb_find_order_for_block(e4b, block);
+	// 把起始块对齐到order
 	block = block >> order;
 
-	// 设置order及起始块
+	// 已经分配的长度
 	ex->fe_len = 1 << order;
+	// 起点
 	ex->fe_start = block << order;
+	// 所分配的组
 	ex->fe_group = e4b->bd_group;
 
-	// todo: what?
+	// 原来的分配起点与现在分配起点的距离. 因为上面把block对齐到了order, 所以
+	// 这里fe_start肯定小于next
 	next = next - ex->fe_start;
+	// 真正需要的长度
 	ex->fe_len -= next;
+	// 真正长度的起点
 	ex->fe_start += next;
 
-	// 如果不够需要的长度,则递规查找
+	// 如果已分配的不够需要的长度,则递规查找
 	while (needed > ex->fe_len &&
 		// 找order的的最大值
 	       mb_find_buddy(e4b, order, &max)) {
@@ -1778,8 +1943,10 @@ static void *mb_find_buddy(struct ext4_buddy *e4b, int order, int *max)
 
 	// 0阶时可以分配所有的块
 	if (order == 0) {
+		// blkbits是块大小, +3是一字节有8位, 这样算出来就是一个块能存多少位
+		// 如果块大小是4k, 则max是32768
 		*max = 1 << (e4b->bd_blkbits + 3);
-		// 返回的是位图地址
+		// 返回的是位图地址. 因为只需要一个块,所以从位图里直接分配就好了
 		return e4b->bd_bitmap;
 	}
 
@@ -1833,13 +2000,19 @@ void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
 
 	BUG_ON(ac->ac_2order <= 0);
 	for (i = ac->ac_2order; i <= sb->s_blocksize_bits + 1; i++) {
+
+		// 当前阶的空闲块为0
 		if (grp->bb_counters[i] == 0)
 			continue;
 
+		// 找到order对应的buddy
 		buddy = mb_find_buddy(e4b, i, &max);
 		BUG_ON(buddy == NULL);
 
+		// 在buddy里找一个没有用的位
 		k = mb_find_next_zero_bit(buddy, max, 0);
+
+		// 走到这里不可能找不到, 如果找不到就是位图错了
 		if (k >= max) {
 			ext4_grp_locked_error(ac->ac_sb, e4b->bd_group, 0, 0,
 				"%d free clusters of order %d. But found 0",
@@ -1851,14 +2024,19 @@ void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
 		}
 		ac->ac_found++;
 
+		// 找到的长度
 		ac->ac_b_ex.fe_len = 1 << i;
+		// 起点
 		ac->ac_b_ex.fe_start = k << i;
+		// 在哪个组找的
 		ac->ac_b_ex.fe_group = e4b->bd_group;
 
+		// 标记使用
 		ext4_mb_use_best_found(ac, e4b);
 
 		BUG_ON(ac->ac_f_ex.fe_len != ac->ac_g_ex.fe_len);
 
+		// 统计
 		if (EXT4_SB(sb)->s_mb_stats)
 			atomic_inc(&EXT4_SB(sb)->s_bal_2orders);
 
