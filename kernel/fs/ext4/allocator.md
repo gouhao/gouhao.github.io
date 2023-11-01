@@ -1862,7 +1862,7 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 	buddy = mb_find_buddy(e4b, 0, &max);
 	BUG_ON(buddy == NULL);
 	BUG_ON(block >= max);
-	// 如果当前块已经设置,则直接返回
+	// 如果当前块已经初始分配,则直接返回
 	if (mb_test_bit(block, buddy)) {
 		ex->fe_len = 0;
 		ex->fe_start = 0;
@@ -1870,10 +1870,13 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 		return 0;
 	}
 
-	// 找一个有足够空间分配块的order
+	// 找从block开始的位置有空闲块的order，这里的block表示要分配的块号
 	order = mb_find_order_for_block(e4b, block);
 	// 把起始块对齐到order
 	block = block >> order;
+
+
+	// 从这里开始把block 当做在buddy位图里的下标看
 
 	// 已经分配的长度
 	ex->fe_len = 1 << order;
@@ -1899,15 +1902,18 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 		if (block + 1 >= max)
 			break;
 
-		// 下一个块如果设置则退出
+		// next设置为以上次order为步进的下一个块
 		next = (block + 1) * (1 << order);
+		// 如果next已经被分配，则退出. todo: 为什么退出，空间不连续？
 		if (mb_test_bit(next, e4b->bd_bitmap))
 			break;
-		// 如果没设置,则找next的order
+		// 如果空闲,则next再开始找连续空间
 		order = mb_find_order_for_block(e4b, next);
 
-		// todo:??
+		// block对齐到新的order
 		block = next >> order;
+
+		// 加上新的长度
 		ex->fe_len += 1 << order;
 	}
 
@@ -1958,26 +1964,32 @@ static void *mb_find_buddy(struct ext4_buddy *e4b, int order, int *max)
 	return bb;
 }
 
+// block为要分配的位的起点
 static int mb_find_order_for_block(struct ext4_buddy *e4b, int block)
 {
+	// 从order-1开始找
 	int order = 1;
+	// 步长为块长度一半，因为开始是从1开始找
 	int bb_incr = 1 << (e4b->bd_blkbits - 1);
 	void *bb;
 
 	BUG_ON(e4b->bd_bitmap == e4b->bd_buddy);
+	// 块号超过了本组最大的块数
 	BUG_ON(block >= (1 << (e4b->bd_blkbits + 3)));
 
 	// buddy起点
 	bb = e4b->bd_buddy;
+
+	// order的阶必须小于块大小的一半，因为order是从1开始的
 	while (order <= e4b->bd_blkbits + 1) {
-		// block减半
+		// 这里的block当做buddy位图里的下标看，
+		// 每上升一个阶，位图里的1位所表示的块长度就增加1倍，所对应的在位图里的下标就减半
 		block = block >> 1;
-		// 当前block没设置, 则直接返回order
+		// 当前位没设置，则返回这个order
 		if (!mb_test_bit(block, bb)) {
-			/* this block is part of buddy of order 'order' */
 			return order;
 		}
-		// 位图增加到下一阶
+		// 位图起点增加到下一阶
 		bb += bb_incr;
 		// 高阶位图长度是低阶的一半
 		bb_incr >>= 1;
