@@ -1638,7 +1638,8 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 	}
 
 	ext4_lock_group(ac->ac_sb, group);
-	// 根据start找合适的extent, 返回值是最大可分配的块数
+	// 计算从fe_start开始，可以分配多少个连续块，分配的起点在ex里
+	// max返回的是可分配连续块
 	max = mb_find_extent(e4b, ac->ac_g_ex.fe_start,
 			     ac->ac_g_ex.fe_len, &ex);
 	// what?
@@ -1872,7 +1873,7 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 
 	// 找从block开始的位置有空闲块的order，这里的block表示要分配的块号
 	order = mb_find_order_for_block(e4b, block);
-	// 把起始块对齐到order
+	// 把起始块转换成order对应的buddy里的位图下标
 	block = block >> order;
 
 
@@ -1895,25 +1896,31 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 
 	// 如果已分配的不够需要的长度,则递规查找
 	while (needed > ex->fe_len &&
-		// 找order的的最大值
+		// 找order的可以分配的最大值
 	       mb_find_buddy(e4b, order, &max)) {
 
 		// 超过最大值,退出
 		if (block + 1 >= max)
 			break;
 
-		// next设置为以上次order为步进的下一个块
+		/* next设置为以上次order为步进的下一个块的块号
+
+		1<<order: 上次order有多少块
+		上面把block已经转成了order对应的位图下标，
+		这里 (block+1)就是下一个位，再乘以 1<<order，就又把块
+		下标还原成以1<<order为单位的下一个块的块号
+		*/
 		next = (block + 1) * (1 << order);
-		// 如果next已经被分配，则退出. todo: 为什么退出，空间不连续？
+		// 直接在位图里测试这个块是否已分配，若已分配则退出. todo: 为什么退出，空间不连续？
 		if (mb_test_bit(next, e4b->bd_bitmap))
 			break;
-		// 如果空闲,则next再开始找连续空间
+		// 如果空闲,则以next块号再开始找连续空间
 		order = mb_find_order_for_block(e4b, next);
 
-		// block对齐到新的order
+		// next对齐到order，即转成order所在位图的下标
 		block = next >> order;
 
-		// 加上新的长度
+		// 加上分配了的长度
 		ex->fe_len += 1 << order;
 	}
 
