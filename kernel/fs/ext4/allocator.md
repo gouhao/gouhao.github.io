@@ -1659,7 +1659,9 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 			ext4_mb_use_best_found(ac, e4b);
 		}
 	} else if (max >= ac->ac_g_ex.fe_len) {
-		// 可分配块数量大于需要的长度, 大多都会走这
+		// 可分配块数量满足需要的长度, 大多都会走这
+
+		// 这些BUG_ON在什么条件下产生的？？
 		BUG_ON(ex.fe_len <= 0);
 		BUG_ON(ex.fe_group != ac->ac_g_ex.fe_group);
 		BUG_ON(ex.fe_start != ac->ac_g_ex.fe_start);
@@ -1672,11 +1674,11 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 	} else if (max > 0 && (ac->ac_flags & EXT4_MB_HINT_MERGE)) {
 		// 可分配块小于需要的长度, 有merge标志
 
-		/* Sometimes, caller may want to merge even small
-		 * number of blocks to an existing extent */
+		/* 有时候，调用者想合并一些小的块到已有的extent*/
 		BUG_ON(ex.fe_len <= 0);
 		BUG_ON(ex.fe_group != ac->ac_g_ex.fe_group);
 		BUG_ON(ex.fe_start != ac->ac_g_ex.fe_start);
+
 		ac->ac_found++;
 		ac->ac_b_ex = ex;
 		ext4_mb_use_best_found(ac, e4b);
