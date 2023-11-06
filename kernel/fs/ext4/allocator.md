@@ -1320,7 +1320,7 @@ static noinline_for_stack
 int ext4_mb_try_best_found(struct ext4_allocation_context *ac,
 					struct ext4_buddy *e4b)
 {
-	// 把bex里的值复制到ex里
+	// 把ex里的值复制到ex里
 	struct ext4_free_extent ex = ac->ac_b_ex;
 	ext4_group_t group = ex.fe_group;
 	int max;
