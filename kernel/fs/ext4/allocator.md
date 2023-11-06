@@ -1163,11 +1163,9 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 	// 把长度转换成2的幂
 	i = fls(ac->ac_g_ex.fe_len);
 	ac->ac_2order = 0;
-	// todo: ?
+	// s_mb_order2_reqs默认是2
 	if (i >= sbi->s_mb_order2_reqs && i <= sb->s_blocksize_bits + 2) {
-		/*
-		 * This should tell if fe_len is exactly power of 2
-		 */
+		// 长度与2对齐，ac_2order设置为较小的一阶
 		if ((ac->ac_g_ex.fe_len & (~(1 << (i - 1)))) == 0)
 			ac->ac_2order = array_index_nospec(i - 1,
 							   sb->s_blocksize_bits + 2);
@@ -1222,10 +1220,11 @@ repeat:
 					// 预取组的最小值
 					nr = min(nr, sbi->s_mb_prefetch);
 				}
-				// 预读组, 返回值是下次预取的位置, prefetch_ios返回的是
+				// 预读组的块的位图, 返回值是下次预取的位置, prefetch_ios返回的是
 				// 提交io的数量
 				prefetch_grp = ext4_mb_prefetch(sb, group,
 							nr, &prefetch_ios);
+				// 如果等于当前说明没有预取的了
 				if (prefetch_ios == curr_ios)
 					nr = 0;
 			}
@@ -1278,7 +1277,7 @@ repeat:
 		}
 	}
 
-	// 如果还没找到, 且已经找到了best
+	// fe_len>0说明已经分配了一些，如果还没分配够
 	if (ac->ac_b_ex.fe_len > 0 && ac->ac_status != AC_STATUS_FOUND &&
 	    !(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
 		// 从best里尝试分配
@@ -1321,6 +1320,7 @@ static noinline_for_stack
 int ext4_mb_try_best_found(struct ext4_allocation_context *ac,
 					struct ext4_buddy *e4b)
 {
+	// 把bex里的值复制到ex里
 	struct ext4_free_extent ex = ac->ac_b_ex;
 	ext4_group_t group = ex.fe_group;
 	int max;
@@ -2088,8 +2088,9 @@ static void ext4_mb_use_best_found(struct ext4_allocation_context *ac,
 
 	// 已找到
 	ac->ac_status = AC_STATUS_FOUND;
-	// ？
+	// 低16位存的是第一次非连续的长度
 	ac->ac_tail = ret & 0xffff;
+	// 高16位存的是order的值
 	ac->ac_buddy = ret >> 16;
 
 	// 获取bitmap/buddy_page的引用
