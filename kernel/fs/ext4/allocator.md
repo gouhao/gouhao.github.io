@@ -1017,22 +1017,23 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 		goto out;
 	}
 
-	// 初始化分配上下文
+	// 初始化分配上下文，主要初始化了origin, goal, 将best的起点设置为目标块
+	// 并决定了使用预分配的方式
 	*errp = ext4_mb_initialize_context(ac, ar);
 	if (*errp) {
 		ar->len = 0;
 		goto out;
 	}
 
-	// 使用历史预分配的?
+	// 使用预分配
 	ac->ac_op = EXT4_MB_HISTORY_PREALLOC;
 	seq = this_cpu_read(discard_pa_seq);
 
-	// 如果不使用预分配
+	// 如果不使用预分配。todo: 预分配后面看
 	if (!ext4_mb_use_preallocated(ac)) {
-		// 普通分配
+		// 正常分配操作
 		ac->ac_op = EXT4_MB_HISTORY_ALLOC;
-		// 把请求大小标准化，并且还有可能合并
+		// 把请求大小标准化，并且还有可能合并，只对预分配进行处理
 		ext4_mb_normalize_request(ac, ar);
 
 		// 给ac分配一个预分配对象
@@ -1049,7 +1050,7 @@ repeat:
 			ext4_discard_allocated_blocks(ac);
 			goto errout;
 		}
-		// todo: what?
+		// 分配到了块，但是分配到的块不够，释放pa对象
 		if (ac->ac_status == AC_STATUS_FOUND &&
 			ac->ac_o_ex.fe_len >= ac->ac_f_ex.fe_len)
 			ext4_mb_pa_free(ac);
@@ -1138,7 +1139,7 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 	// 超级块信息
 	sb = ac->ac_sb;
 	sbi = EXT4_SB(sb);
-	// 有多少个组
+	// fs共有多少个组
 	ngroups = ext4_get_groups_count(sb);
 	
 	// 非extent限制到blockfile_groups
@@ -1148,7 +1149,7 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 	// 已经找到了不应该走这个函数
 	BUG_ON(ac->ac_status == AC_STATUS_FOUND);
 
-	// 先试一下目标块的地方能否分配
+	// 先试一下goal能否分配
 	err = ext4_mb_find_by_goal(ac, &e4b);
 	// 出错或者找到了, 大多数情况都能成功分配，从这返回
 	if (err || ac->ac_status == AC_STATUS_FOUND)
@@ -1156,14 +1157,17 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 
 	// 走到这儿说明没找到
 
-	// 只找目标块, 则退出. 
+	// 只找goal, 则退出. 
 	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
 		goto out;
 
 	// 把长度转换成2的幂
 	i = fls(ac->ac_g_ex.fe_len);
 	ac->ac_2order = 0;
+
 	// s_mb_order2_reqs默认是2
+	// s_mb_order2_reqs对应的是sysfs的mb_order2_req接口
+	// i 大于s_mb_order2_reqs且没有超过最大可分配块数时
 	if (i >= sbi->s_mb_order2_reqs && i <= sb->s_blocksize_bits + 2) {
 		// 长度与2对齐，ac_2order设置为较小的一阶
 		if ((ac->ac_g_ex.fe_len & (~(1 << (i - 1)))) == 0)
@@ -1238,6 +1242,9 @@ repeat:
 				// 继续尝试下一个组
 				continue;
 			}
+
+			// 走到这儿表示当前组可以分配
+
 			// 加载buddy位图
 			err = ext4_mb_load_buddy(sb, group, &e4b);
 			if (err)
@@ -1258,7 +1265,8 @@ repeat:
 
 			// 根据cr走不同的扫描
 			if (cr == 0)
-				// 扫描位图
+				// 当ac_2order有值时才会走这里
+				// 扫描ac_2order对应的buddy位图
 				ext4_mb_simple_scan_group(ac, &e4b);
 			else if (cr == 1 && sbi->s_stripe &&
 					!(ac->ac_g_ex.fe_len % sbi->s_stripe))
@@ -1314,6 +1322,55 @@ out:
 		ext4_mb_prefetch_fini(sb, prefetch_grp, nr);
 
 	return err;
+}
+
+static noinline_for_stack
+void ext4_mb_scan_aligned(struct ext4_allocation_context *ac,
+				 struct ext4_buddy *e4b)
+{
+	struct super_block *sb = ac->ac_sb;
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	// 块位图
+	void *bitmap = e4b->bd_bitmap;
+	struct ext4_free_extent ex;
+	ext4_fsblk_t first_group_block;
+	ext4_fsblk_t a;
+	ext4_grpblk_t i;
+	int max;
+
+	// 没有打开stripe特性
+	BUG_ON(sbi->s_stripe == 0);
+
+	// 组内第一块
+	first_group_block = ext4_group_first_block_no(sb, e4b->bd_group);
+
+	// 第一个块对齐到stipe大小
+	a = first_group_block + sbi->s_stripe - 1;
+	do_div(a, sbi->s_stripe);
+	// i是对齐之后的值
+	i = (a * sbi->s_stripe) - first_group_block;
+
+	// 在组内所有cluster里寻找
+	while (i < EXT4_CLUSTERS_PER_GROUP(sb)) {
+		// 这个cluster空闲
+		if (!mb_test_bit(i, bitmap)) {
+			// 从i开始找s_stripe个块
+			max = mb_find_extent(e4b, i, sbi->s_stripe, &ex);
+
+			// max大于stripe，说明找到的order足够分配
+			if (max >= sbi->s_stripe) {
+				ac->ac_found++;
+				ex.fe_logical = 0xDEADF00D; /* debug value */
+				// 复制ex到best
+				ac->ac_b_ex = ex;
+				// 标记best使用
+				ext4_mb_use_best_found(ac, e4b);
+				break;
+			}
+		}
+		// 递增stipe个长度
+		i += sbi->s_stripe;
+	}
 }
 
 static noinline_for_stack
@@ -1499,13 +1556,16 @@ static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
 	// cr=3可以随意分配，小于3都需要精确分配，所以不符合长度的就退出
 	if (cr <= 2 && free < ac->ac_g_ex.fe_len)
 		goto out;
+	
+	// 走到这儿 cr > 2 || free >= fe_len
+
 	// 当前组的位图坏了，这个是不是应该放到前面判断？？
 	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(grp)))
 		goto out;
 	if (should_lock)
 		ext4_unlock_group(sb, group);
 
-	// 当前组还没初始化
+	// 当前组还没初始化，则初始之
 	if (unlikely(EXT4_MB_GRP_NEED_INIT(grp))) {
 		struct ext4_group_desc *gdp =
 			ext4_get_group_desc(sb, group, NULL);
@@ -1560,7 +1620,7 @@ static bool ext4_mb_good_group(struct ext4_allocation_context *ac,
 	if (free == 0)
 		return false;
 
-	// 连碎片也没有了
+	// 没有空闲段了
 	fragments = grp->bb_fragments;
 	if (fragments == 0)
 		return false;
@@ -1579,7 +1639,7 @@ static bool ext4_mb_good_group(struct ext4_allocation_context *ac,
 		if (free < ac->ac_g_ex.fe_len)
 			return false;
 
-		// 超过了一次可分配的最在值
+		// 超过了一次可分配的最大值
 		if (ac->ac_2order > ac->ac_sb->s_blocksize_bits+1)
 			return true;
 
@@ -1589,12 +1649,12 @@ static bool ext4_mb_good_group(struct ext4_allocation_context *ac,
 
 		return true;
 	case 1:
-		// todo: 空间除以碎片是啥？
+		// todo: 空闲/段数=每段平均块数？
 		if ((free / fragments) >= ac->ac_g_ex.fe_len)
 			return true;
 		break;
 	case 2:
-		// 长度必须大于要求的
+		// 组内空闲空间够就可以分配
 		if (free >= ac->ac_g_ex.fe_len)
 			return true;
 		break;
@@ -2019,6 +2079,7 @@ void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
 	int k;
 	int max;
 
+	// 小于0怎么会走这里
 	BUG_ON(ac->ac_2order <= 0);
 	for (i = ac->ac_2order; i <= sb->s_blocksize_bits + 1; i++) {
 
@@ -2047,7 +2108,7 @@ void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
 
 		// 找到的长度
 		ac->ac_b_ex.fe_len = 1 << i;
-		// 起点
+		// 块起点
 		ac->ac_b_ex.fe_start = k << i;
 		// 在哪个组找的
 		ac->ac_b_ex.fe_group = e4b->bd_group;
@@ -2312,7 +2373,7 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	ac->ac_o_ex.fe_start = block;
 	ac->ac_o_ex.fe_len = len;
 
-	// 把原始o复制到目标g里
+	// 把origin复制到goal里
 	ac->ac_g_ex = ac->ac_o_ex;
 
 	ac->ac_flags = ar->flags;
@@ -2345,13 +2406,14 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
 	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
 		return;
 
-	// 要分配的文件块数
+	// 新的结尾，单位是块数
 	size = ac->ac_o_ex.fe_logical + EXT4_C2B(sbi, ac->ac_o_ex.fe_len);
 	// 当前文件块数 
 	isize = (i_size_read(ac->ac_inode) + ac->ac_sb->s_blocksize - 1)
 		>> bsbits;
 
-	// 不使用预分配?
+	// 分配之后的文件块数 == 原文件的块数 && 文件系统不忙 && 不是为了写打开
+	// 则不使用预分配。 todo: why?
 	if ((size == isize) && !ext4_fs_is_busy(sbi) &&
 	    !inode_is_open_for_write(ac->ac_inode)) {
 		ac->ac_flags |= EXT4_MB_HINT_NOPREALLOC;
@@ -2367,7 +2429,7 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
 	size = max(size, isize);
 
 	// s_mb_stream_request是区分大文件与小文件的界线,单位是块
-	// 如果大于这个值,说明是大文件
+	// 如果大于这个值,说明是大文件，大文件使用stream
 	if (size > sbi->s_mb_stream_request) {
 		ac->ac_flags |= EXT4_MB_STREAM_ALLOC;
 		return;
@@ -2380,10 +2442,10 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
 	// 取出s_locality_groups
 	ac->ac_lg = raw_cpu_ptr(sbi->s_locality_groups);
 
-	// 使用组分配标志
+	// 使用组预分配标志
 	ac->ac_flags |= EXT4_MB_HINT_GROUP_ALLOC;
 
-	/* serialize all allocations in the group */
+	// 使用组分配的话，会给组上锁
 	mutex_lock(&ac->ac_lg->lg_mutex);
 }
 ```
@@ -2850,18 +2912,18 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 	if (ac->ac_flags & EXT4_MB_HINT_NOPREALLOC)
 		return;
 
-	// 使用组分配
+	// 使用组分配，则进行组标准化
 	if (ac->ac_flags & EXT4_MB_HINT_GROUP_ALLOC) {
 		ext4_mb_normalize_group_request(ac);
 		return ;
 	}
 
-	// 走到这儿就是一般情况
+	// 走到这儿就是使用stream预分配
 
 	// 块大小
 	bsbits = ac->ac_sb->s_blocksize_bits;
 
-	// 请求块的大小（以块为单位）
+	// 分配后文件大小（以块为单位）
 	size = ac->ac_o_ex.fe_logical + EXT4_C2B(sbi, ac->ac_o_ex.fe_len);
 	// 转成byte
 	size = size << bsbits;
@@ -2933,7 +2995,7 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 	if (size > EXT4_BLOCKS_PER_GROUP(ac->ac_sb))
 		size = EXT4_BLOCKS_PER_GROUP(ac->ac_sb);
 
-	// 最终的节点
+	// start是标准化后的起点
 	end = start + size;
 
 	
@@ -3018,6 +3080,7 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 
 	/* XXX: 尽量对齐块或范围大分配的请求 */
 	ac->ac_g_ex.fe_logical = start;
+	// cluster数量
 	ac->ac_g_ex.fe_len = EXT4_NUM_B2C(sbi, size);
 
 	// 把目标对齐到右边界上方便合并
