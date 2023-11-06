@@ -2088,9 +2088,9 @@ static void ext4_mb_use_best_found(struct ext4_allocation_context *ac,
 
 	// 已找到
 	ac->ac_status = AC_STATUS_FOUND;
-	// 低16位存的是第一次非连续的长度
+	// ret的低16位存的是,未全分配的块长度
 	ac->ac_tail = ret & 0xffff;
-	// 高16位存的是order的值
+	// ret的高16位存的是,未全分配的块order
 	ac->ac_buddy = ret >> 16;
 
 	// 获取bitmap/buddy_page的引用
@@ -2140,7 +2140,7 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 
 	// 空闲块数减少
 	e4b->bd_info->bb_free -= len;
-	// 如果是第一个空闲的块,则重新设置它
+	// 如果start是第一个空闲的块,则重新设置它
 	if (e4b->bd_info->bb_first_free == start)
 		e4b->bd_info->bb_first_free += len;
 
@@ -2156,7 +2156,7 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 	// 如果两边都没设置,则递增碎片数量
 	if (mlen && max)
 		e4b->bd_info->bb_fragments++;
-	// 反之,减少碎片数量
+	// 反之,若2边都设置了，则减少碎片数量
 	else if (!mlen && !max)
 		e4b->bd_info->bb_fragments--;
 
@@ -2165,26 +2165,37 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 		// 找到start对应的阶
 		ord = mb_find_order_for_block(e4b, start);
 
+		// start刚好就是order阶对应的起点，且已分配的长度比order大
+		// 这个表示，把整个order对应的块都已经分配了，直接标记对应的位就行了
 		if (((start >> ord) << ord) == start && len >= (1 << ord)) {
-			/* the whole chunk may be allocated at once! */
+			// order的长度
 			mlen = 1 << ord;
+			// 找到order对应的buddy起点
 			buddy = mb_find_buddy(e4b, ord, &max);
 			BUG_ON((start >> ord) >= max);
+			// 标记start对应的位
 			mb_set_bit(start >> ord, buddy);
+			// 减少order对应的统计
 			e4b->bd_info->bb_counters[ord]--;
+			// 增加start
 			start += mlen;
+			// 长度减少
 			len -= mlen;
 			BUG_ON(len < 0);
 			continue;
 		}
 
-		/* store for history */
+		// 走到这儿表示, start和order没有对齐, 或者分配的长度小于order的块
+
+		// 保存原始的长度和order
 		if (ret == 0)
 			ret = len | (ord << 16);
 
 		// 把大的buddy分割, 放到小一些的块里
 
+		// order-0表示一个块,连一个块都没分配下,怎么会走到这儿来...
 		BUG_ON(ord <= 0);
+
 		// 找到order的buddy地址
 		buddy = mb_find_buddy(e4b, ord, &max);
 		// 设置该buddy为使用
@@ -2192,16 +2203,20 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 		// 减少相关buddy的块数量
 		e4b->bd_info->bb_counters[ord]--;
 
+		// 因为起始长度和order没对齐,所以要把多余的空间转到更低一阶的空间里
 		// 阶减1
 		ord--;
-		// 起始地址减半
+
+		// 当前地址对齐到阶. todo: 为啥与非1?
 		cur = (start >> ord) & ~1U;
-		// 找到对应的buddy
+
+		// 找到order的buddy
 		buddy = mb_find_buddy(e4b, ord, &max);
 
-		// 清除buddy上相关的位
+		// 清除低阶的2个位, 因为高阶的一块对应低阶的2块
 		mb_clear_bit(cur, buddy);
 		mb_clear_bit(cur + 1, buddy);
+
 		// 对应的order+1
 		e4b->bd_info->bb_counters[ord]++;
 		e4b->bd_info->bb_counters[ord]++;
@@ -2209,11 +2224,31 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 	// 设置最大的空闲order
 	mb_set_largest_free_order(e4b->bd_sb, e4b->bd_info);
 
-	// 在位图上设置区间已使用. todo: 上面不是已经标记过了吗?
+	// 在块位图上设置区间已使用.
 	ext4_set_bits(e4b->bd_bitmap, ex->fe_start, len0);
 	mb_check_buddy(e4b);
 
 	return ret;
+}
+
+void ext4_set_bits(void *bm, int cur, int len)
+{
+	__u32 *addr;
+
+	// 终点
+	len = cur + len;
+	while (cur < len) {
+		// 快速路径.cur与32对齐
+		if ((cur & 31) == 0 && (len - cur) >= 32) {
+			addr = bm + (cur >> 3);
+			// 直接设置一个32的值
+			*addr = 0xffffffff;
+			cur += 32;
+			continue;
+		}
+		mb_set_bit(cur, bm);
+		cur++;
+	}
 }
 
 static void mb_mark_used_double(struct ext4_buddy *e4b, int first, int count)
@@ -3008,3 +3043,153 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 }
 ```
 
+## 预分配
+```c
+static void ext4_mb_new_preallocation(struct ext4_allocation_context *ac)
+{
+	if (ac->ac_flags & EXT4_MB_HINT_GROUP_ALLOC)
+		// 组预分配
+		ext4_mb_new_group_pa(ac);
+	else
+		// inode预分配
+		ext4_mb_new_inode_pa(ac);
+}
+
+static noinline_for_stack void
+ext4_mb_new_group_pa(struct ext4_allocation_context *ac)
+{
+	struct super_block *sb = ac->ac_sb;
+	struct ext4_locality_group *lg;
+	struct ext4_prealloc_space *pa;
+	struct ext4_group_info *grp;
+
+	/* preallocate only when found space is larger then requested */
+	BUG_ON(ac->ac_o_ex.fe_len >= ac->ac_b_ex.fe_len);
+	BUG_ON(ac->ac_status != AC_STATUS_FOUND);
+	BUG_ON(!S_ISREG(ac->ac_inode->i_mode));
+	BUG_ON(ac->ac_pa == NULL);
+
+	pa = ac->ac_pa;
+
+	/* preallocation can change ac_b_ex, thus we store actually
+	 * allocated blocks for history */
+	ac->ac_f_ex = ac->ac_b_ex;
+
+	pa->pa_pstart = ext4_grp_offs_to_block(sb, &ac->ac_b_ex);
+	pa->pa_lstart = pa->pa_pstart;
+	pa->pa_len = ac->ac_b_ex.fe_len;
+	pa->pa_free = pa->pa_len;
+	spin_lock_init(&pa->pa_lock);
+	INIT_LIST_HEAD(&pa->pa_inode_list);
+	INIT_LIST_HEAD(&pa->pa_group_list);
+	pa->pa_deleted = 0;
+	pa->pa_type = MB_GROUP_PA;
+
+	mb_debug(sb, "new group pa %p: %llu/%d for %u\n", pa, pa->pa_pstart,
+		 pa->pa_len, pa->pa_lstart);
+	trace_ext4_mb_new_group_pa(ac, pa);
+
+	ext4_mb_use_group_pa(ac, pa);
+	atomic_add(pa->pa_free, &EXT4_SB(sb)->s_mb_preallocated);
+
+	grp = ext4_get_group_info(sb, ac->ac_b_ex.fe_group);
+	lg = ac->ac_lg;
+	BUG_ON(lg == NULL);
+
+	pa->pa_obj_lock = &lg->lg_prealloc_lock;
+	pa->pa_inode = NULL;
+
+	list_add(&pa->pa_group_list, &grp->bb_prealloc_list);
+
+	/*
+	 * We will later add the new pa to the right bucket
+	 * after updating the pa_free in ext4_mb_release_context
+	 */
+}
+
+static noinline_for_stack void
+ext4_mb_new_inode_pa(struct ext4_allocation_context *ac)
+{
+	struct super_block *sb = ac->ac_sb;
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct ext4_prealloc_space *pa;
+	struct ext4_group_info *grp;
+	struct ext4_inode_info *ei;
+
+	/* preallocate only when found space is larger then requested */
+	BUG_ON(ac->ac_o_ex.fe_len >= ac->ac_b_ex.fe_len);
+	BUG_ON(ac->ac_status != AC_STATUS_FOUND);
+	BUG_ON(!S_ISREG(ac->ac_inode->i_mode));
+	BUG_ON(ac->ac_pa == NULL);
+
+	pa = ac->ac_pa;
+
+	if (ac->ac_b_ex.fe_len < ac->ac_g_ex.fe_len) {
+		int winl;
+		int wins;
+		int win;
+		int offs;
+
+		/* we can't allocate as much as normalizer wants.
+		 * so, found space must get proper lstart
+		 * to cover original request */
+		BUG_ON(ac->ac_g_ex.fe_logical > ac->ac_o_ex.fe_logical);
+		BUG_ON(ac->ac_g_ex.fe_len < ac->ac_o_ex.fe_len);
+
+		/* we're limited by original request in that
+		 * logical block must be covered any way
+		 * winl is window we can move our chunk within */
+		winl = ac->ac_o_ex.fe_logical - ac->ac_g_ex.fe_logical;
+
+		/* also, we should cover whole original request */
+		wins = EXT4_C2B(sbi, ac->ac_b_ex.fe_len - ac->ac_o_ex.fe_len);
+
+		/* the smallest one defines real window */
+		win = min(winl, wins);
+
+		offs = ac->ac_o_ex.fe_logical %
+			EXT4_C2B(sbi, ac->ac_b_ex.fe_len);
+		if (offs && offs < win)
+			win = offs;
+
+		ac->ac_b_ex.fe_logical = ac->ac_o_ex.fe_logical -
+			EXT4_NUM_B2C(sbi, win);
+		BUG_ON(ac->ac_o_ex.fe_logical < ac->ac_b_ex.fe_logical);
+		BUG_ON(ac->ac_o_ex.fe_len > ac->ac_b_ex.fe_len);
+	}
+
+	/* preallocation can change ac_b_ex, thus we store actually
+	 * allocated blocks for history */
+	ac->ac_f_ex = ac->ac_b_ex;
+
+	pa->pa_lstart = ac->ac_b_ex.fe_logical;
+	pa->pa_pstart = ext4_grp_offs_to_block(sb, &ac->ac_b_ex);
+	pa->pa_len = ac->ac_b_ex.fe_len;
+	pa->pa_free = pa->pa_len;
+	spin_lock_init(&pa->pa_lock);
+	INIT_LIST_HEAD(&pa->pa_inode_list);
+	INIT_LIST_HEAD(&pa->pa_group_list);
+	pa->pa_deleted = 0;
+	pa->pa_type = MB_INODE_PA;
+
+	mb_debug(sb, "new inode pa %p: %llu/%d for %u\n", pa, pa->pa_pstart,
+		 pa->pa_len, pa->pa_lstart);
+	trace_ext4_mb_new_inode_pa(ac, pa);
+
+	ext4_mb_use_inode_pa(ac, pa);
+	atomic_add(pa->pa_free, &sbi->s_mb_preallocated);
+
+	ei = EXT4_I(ac->ac_inode);
+	grp = ext4_get_group_info(sb, ac->ac_b_ex.fe_group);
+
+	pa->pa_obj_lock = &ei->i_prealloc_lock;
+	pa->pa_inode = ac->ac_inode;
+
+	list_add(&pa->pa_group_list, &grp->bb_prealloc_list);
+
+	spin_lock(pa->pa_obj_lock);
+	list_add_rcu(&pa->pa_inode_list, &ei->i_prealloc_list);
+	spin_unlock(pa->pa_obj_lock);
+	atomic_inc(&ei->i_prealloc_active);
+}
+```
