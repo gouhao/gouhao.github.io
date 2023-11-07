@@ -1273,7 +1273,7 @@ repeat:
 				// raid. 后面看
 				ext4_mb_scan_aligned(ac, &e4b);
 			else
-				// 扫描所有组
+				// 从位图上扫描
 				ext4_mb_complex_scan_group(ac, &e4b);
 
 			ext4_unlock_group(sb, group);
@@ -1410,7 +1410,7 @@ void ext4_mb_complex_scan_group(struct ext4_allocation_context *ac,
 					struct ext4_buddy *e4b)
 {
 	struct super_block *sb = ac->ac_sb;
-	// buddy对应的位图
+	// 位图
 	void *bitmap = e4b->bd_bitmap;
 	struct ext4_free_extent ex;
 	int i;
@@ -1442,12 +1442,12 @@ void ext4_mb_complex_scan_group(struct ext4_allocation_context *ac,
 			break;
 		}
 
-		// 找能容的下fe_len的块
+		// 从i开始找能容的下fe_len的buddy块
 		mb_find_extent(e4b, i, ac->ac_g_ex.fe_len, &ex);
 		// 没找到
 		if (WARN_ON(ex.fe_len <= 0))
 			break;
-		// 位图又坏了
+		// 位图又坏了，分配的长度竟然大于free!
 		if (free < ex.fe_len) {
 			ext4_grp_locked_error(sb, e4b->bd_group, 0, 0,
 					"%d free clusters as per "
@@ -1463,7 +1463,7 @@ void ext4_mb_complex_scan_group(struct ext4_allocation_context *ac,
 			break;
 		}
 		ex.fe_logical = 0xDEADC0DE; /* debug value */
-		// 检查是不是最好的exntent. todo: 后面看
+		// 检查新分配的ex是不是比之前的好，如果好则使用ex
 		ext4_mb_measure_extent(ac, &ex, e4b);
 
 		// 继续找空闲块
@@ -1471,6 +1471,7 @@ void ext4_mb_complex_scan_group(struct ext4_allocation_context *ac,
 		free -= ex.fe_len;
 	}
 
+	// 检查扫描次数的限制
 	ext4_mb_check_limits(ac, e4b, 1);
 }
 
@@ -1481,56 +1482,90 @@ tatic void ext4_mb_measure_extent(struct ext4_allocation_context *ac,
 	struct ext4_free_extent *bex = &ac->ac_b_ex;
 	struct ext4_free_extent *gex = &ac->ac_g_ex;
 
+	// 检查已分配extent的合法性
 	BUG_ON(ex->fe_len <= 0);
 	BUG_ON(ex->fe_len > EXT4_CLUSTERS_PER_GROUP(ac->ac_sb));
 	BUG_ON(ex->fe_start >= EXT4_CLUSTERS_PER_GROUP(ac->ac_sb));
 	BUG_ON(ac->ac_status != AC_STATUS_CONTINUE);
 
+	// 已找到的+1
 	ac->ac_found++;
 
-	/*
-	 * The special case - take what you catch first
-	 */
+	// 如果是文件里的第一个块，则直接复制到best里，然后标记使用
 	if (unlikely(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
 		*bex = *ex;
 		ext4_mb_use_best_found(ac, e4b);
 		return;
 	}
 
-	/*
-	 * Let's check whether the chuck is good enough
-	 */
+	// 分配的长度符合goal的长度
 	if (ex->fe_len == gex->fe_len) {
 		*bex = *ex;
 		ext4_mb_use_best_found(ac, e4b);
 		return;
 	}
 
-	/*
-	 * If this is first found extent, just store it in the context
-	 */
+	// 如果是第一个找到的extent，直接保存到best里
 	if (bex->fe_len == 0) {
 		*bex = *ex;
 		return;
 	}
 
-	/*
-	 * If new found extent is better, store it in the context
-	 */
+	// 走到这儿，表示之前有找到的了
+
 	if (bex->fe_len < gex->fe_len) {
-		/* if the request isn't satisfied, any found extent
-		 * larger than previous best one is better */
+		// 之前找的best长度不符合goal的长度
+
+		// 如果新的ex大于best的长度，则使用ex
 		if (ex->fe_len > bex->fe_len)
 			*bex = *ex;
 	} else if (ex->fe_len > gex->fe_len) {
-		/* if the request is satisfied, then we try to find
-		 * an extent that still satisfy the request, but is
-		 * smaller than previous one */
+		// 新找的ex的长度大于goal
+
+		// 新找到的比之前best的小，则使用新找到的
 		if (ex->fe_len < bex->fe_len)
 			*bex = *ex;
 	}
 
+	// 检查扫描次数的限制
 	ext4_mb_check_limits(ac, e4b, 0);
+}
+
+static void ext4_mb_check_limits(struct ext4_allocation_context *ac,
+					struct ext4_buddy *e4b,
+					int finish_group)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	struct ext4_free_extent *bex = &ac->ac_b_ex;
+	struct ext4_free_extent *gex = &ac->ac_g_ex;
+	struct ext4_free_extent ex;
+	int max;
+
+	// 已经找到
+	if (ac->ac_status == AC_STATUS_FOUND)
+		return;
+	// 已找到的次数大于最大的扫描值 && 不是文件的第1个块
+	if (ac->ac_found > sbi->s_mb_max_to_scan &&
+			!(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
+		// 置状态为扫描中断
+		ac->ac_status = AC_STATUS_BREAK;
+		return;
+	}
+
+	// best还不够goal的长度，返回继续找
+	if (bex->fe_len < gex->fe_len)
+		return;
+
+	// (0 || 已找到的大于最小扫描次数) && best的组 == 需要的组
+	if ((finish_group || ac->ac_found > sbi->s_mb_min_to_scan)
+			&& bex->fe_group == e4b->bd_group) {
+		// 再从best的起点找一次，如果找到则标记之
+		max = mb_find_extent(e4b, bex->fe_start, gex->fe_len, &ex);
+		if (max >= gex->fe_len) {
+			ext4_mb_use_best_found(ac, e4b);
+			return;
+		}
+	}
 }
 
 static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
