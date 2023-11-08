@@ -585,7 +585,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 
 	mb_debug(sb, "init page %lu\n", page->index);
 
-	// 每页能放几个组的buddy信息，如上注释是 blocks_per_page/2
+	// 每页能放几个组的buddy信息，因为一个组是2个块 blocks_per_page/2
 	groups_per_page = blocks_per_page >> 1;
 	// 如果块大小和页大小相同时, 经过上面计算groups_per_page是0, 所以最小为1
 	if (groups_per_page == 0)
@@ -605,7 +605,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 	// page里的第一个组号
 	first_group = page->index * blocks_per_page / 2;
 
-	// 遍历页里面的每个组
+	// 遍历页里面的每个组, 初始化各组的位图
 	for (i = 0, group = first_group; i < groups_per_page; i++, group++) {
 		// 超过最后一个组
 		if (group >= ngroups)
@@ -634,7 +634,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 		mb_debug(sb, "read bitmap for group %u\n", group);
 	}
 
-	// 等上面位图读完，上面用的是nowait，非阻塞的
+	// 等待上面位图读完，上面用的是nowait，非阻塞的
 	for (i = 0, group = first_group; i < groups_per_page; i++, group++) {
 		int err2;
 
@@ -654,7 +654,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 		if (group >= ngroups)
 			break;
 
-		// 当前组不需要初始化
+		// 当前组不需要初始化,上面的EXT4_MB_GRP_NEED_INIT
 		if (!bh[group - first_group])
 			continue;
 
@@ -663,7 +663,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 			continue;
 		err = 0;
 
-		// 对应块地址
+		// 对应的块起始地址
 		data = page_address(page) + (i * blocksize);
 		// 第1个块是位图
 		bitmap = bh[group - first_group]->b_data;
@@ -679,7 +679,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 			grinfo = ext4_get_group_info(sb, group);
 			grinfo->bb_fragments = 0;
 
-			// todo: what is bb_counter?
+			// 把所有的counter清0
 			memset(grinfo->bb_counters, 0,
 			       sizeof(*grinfo->bb_counters) *
 				(sb->s_blocksize_bits+2));
@@ -700,7 +700,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 
 			/* see comments in ext4_mb_put_pa() */
 			ext4_lock_group(sb, group);
-			// 把位图复制到bh里
+			// 把位图复制到页里
 			memcpy(data, bitmap, blocksize);
 
 			// 把预分配的标记为使用
@@ -1285,7 +1285,7 @@ repeat:
 		}
 	}
 
-	// fe_len>0说明已经分配了一些，如果还没分配够
+	// fe_len>0说明已经分配了一些，如果还没分配够 && 又不是文件的第一块
 	if (ac->ac_b_ex.fe_len > 0 && ac->ac_status != AC_STATUS_FOUND &&
 	    !(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
 		// 从best里尝试分配
@@ -1721,7 +1721,7 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 	if (grp->bb_free == 0)
 		return 0;
 
-	// 加载buddy
+	// 加载组的buddy
 	err = ext4_mb_load_buddy(ac->ac_sb, group, e4b);
 	if (err)
 		return err;
@@ -1839,12 +1839,13 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 	}
 
 	/*
-	 * 位图块
+	 * 每个组有2个位图块, 第一块是位图信息,第二块是buddy信息,
+	 * 所以组号*2就是该组的起始块号
 	 */
 	block = group * 2;
 	// 页号
 	pnum = block / blocks_per_page;
-	// 块在页内偏移
+	// 块在页内偏移, 因为有可能一页里放多个块
 	poff = block % blocks_per_page;
 
 	// 获取对应的页
@@ -1863,7 +1864,9 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 			put_page(page);
 		page = find_or_create_page(inode->i_mapping, pnum, gfp);
 		if (page) {
+			// 什么情况下会有这种?
 			BUG_ON(page->mapping != inode->i_mapping);
+			// 页面不是最新的,则初始化该组的buddy, 对于位图传的是NULL
 			if (!PageUptodate(page)) {
 				ret = ext4_mb_init_cache(page, NULL, gfp);
 				if (ret) {
@@ -1926,7 +1929,7 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 		goto err;
 	}
 
-	// 设置 buddy 页的地址和偏移
+	// 设置 buddy 页的page引用和真实地址偏移
 	e4b->bd_buddy_page = page;
 	e4b->bd_buddy = page_address(page) + (poff * sb->s_blocksize);
 
@@ -2394,10 +2397,10 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	// 找到goal所在的组及组内块偏移
 	ext4_get_group_no_and_offset(sb, goal, &group, &block);
 
-	// 最好的逻辑块就是要求的逻辑块
+	// 设置best的起始逻辑块
 	ac->ac_b_ex.fe_logical = EXT4_LBLK_CMASK(sbi, ar->logical);
 
-	// 意思是还没分配, 继续查找?
+	// 初始状态置为还没分配到
 	ac->ac_status = AC_STATUS_CONTINUE;
 	ac->ac_sb = sb;
 	ac->ac_inode = ar->inode;
