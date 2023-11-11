@@ -634,7 +634,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 		mb_debug(sb, "read bitmap for group %u\n", group);
 	}
 
-	// 等待上面位图读完，上面用的是nowait，非阻塞的
+	// 等待上面位图读完，上面用的是nowait非阻塞的
 	for (i = 0, group = first_group; i < groups_per_page; i++, group++) {
 		int err2;
 
@@ -801,22 +801,24 @@ void ext4_mb_generate_buddy(struct super_block *sb,
 	ext4_grpblk_t len;
 	unsigned free = 0;
 	unsigned fragments = 0;
-	// 当前时间？
+	// 当前时间
 	unsigned long long period = get_cycles();
 
-	// 找第1个未使用的块
+	// 从位图里找第1个未使用的块
 	i = mb_find_next_zero_bit(bitmap, max, 0);
 	
-	// 设置之
+	// 设置第1个空闲块号
 	grp->bb_first_free = i;
 	while (i < max) {
+		// 空闲块片段数，就类似于空闲extent的数量
 		fragments++;
 		first = i;
-		// 找下一个在已设置的位
+		// 找下一个在已设置的位，上面找了第1个未使用的块，这里找下一个已使用的块，
+		// first~i之间就是空闲的块数
 		i = mb_find_next_bit(bitmap, max, i);
 		// 空闲长度
 		len = i - first;
-		// 编译空闲总量
+		// free是统计空闲块数，注意和上面fragments的区别
 		free += len;
 		if (len > 1)
 			// 在buddy里标志空闲块
@@ -830,7 +832,7 @@ void ext4_mb_generate_buddy(struct super_block *sb,
 			i = mb_find_next_zero_bit(bitmap, max, i);
 	}
 
-	// todo: what?
+	// 记录空闲片段的数量
 	grp->bb_fragments = fragments;
 
 	// 经过上面循环统计的空闲块数量与组描述符里记录的空闲数量不一致,这肯定是哪出问题了
@@ -848,7 +850,7 @@ void ext4_mb_generate_buddy(struct super_block *sb,
 					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
 	}
 
-	// 记录最大的空闲块数量
+	// 记录最大的空闲块数量, 这个会遍历bb_counters, 找最大块的那个阶
 	mb_set_largest_free_order(sb, grp);
 
 	// 清除组需要初始化位图的标志
@@ -900,14 +902,17 @@ static void ext4_mb_mark_free_simple(struct super_block *sb,
 	// 长度怎么会大于组的cluster数量?
 	BUG_ON(len > EXT4_CLUSTERS_PER_GROUP(sb));
 
-	// 边界是2倍块大小?
+	// 边界是4倍块大小?
 	border = 2 << sb->s_blocksize_bits;
 
 	while (len > 0) {
 		// 开始的块的位, 返回值从1开始,所以要减去1才是块号,下同
+		// 这里first最大到order
 		max = ffs(first | border) - 1;
 
-		// 块数量的位
+		// 找到剩余长度最大对应的阶, fls是从右向左找到最高置位的位数，
+		// 即空闲块的阶数,是以2对齐的,会舍弃掉不对齐的块数
+		// 假如len是3, 则fls返回2, min的值为1, 即阶为1
 		min = fls(len) - 1;
 
 		if (max < min)
@@ -916,7 +921,7 @@ static void ext4_mb_mark_free_simple(struct super_block *sb,
 		// buddy块的大小
 		chunk = 1 << min;
 
-		// 记录对应buddy块的数量
+		// 记录对应buddy块的空闲数量
 		grp->bb_counters[min]++;
 
 		// min=0,是只有一个块.
@@ -931,8 +936,6 @@ static void ext4_mb_mark_free_simple(struct super_block *sb,
 		len -= chunk;
 		// 递增起点
 		first += chunk;
-
-		// todo: 为什么不是直接存一个大块, 而是要分成这么多的小块来记录
 	}
 }
 ```
@@ -1728,13 +1731,14 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 
 	// 加载位图错误，直接返回
 	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(e4b->bd_info))) {
+		// 释放page页的引用
 		ext4_mb_unload_buddy(e4b);
 		return 0;
 	}
 
 	ext4_lock_group(ac->ac_sb, group);
 	// 计算从fe_start开始，可以分配多少个连续块，分配的起点在ex里
-	// max返回的是可分配连续块
+	// max返回的是可分配连续块数
 	max = mb_find_extent(e4b, ac->ac_g_ex.fe_start,
 			     ac->ac_g_ex.fe_len, &ex);
 	// what?
@@ -1979,9 +1983,9 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 
 	// 从这里开始把block 当做在buddy位图里的下标看
 
-	// 已经分配的长度
+	// 阶的长度
 	ex->fe_len = 1 << order;
-	// 起点
+	// 阶的起点
 	ex->fe_start = block << order;
 	// 所分配的组
 	ex->fe_group = e4b->bd_group;
@@ -1989,14 +1993,14 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 	// 原来的分配起点与现在分配起点的距离. 因为上面把block对齐到了order, 所以
 	// 这里fe_start肯定小于next
 	next = next - ex->fe_start;
-	// 真正需要的长度
+	// 从起点开始真正分配的长度
 	ex->fe_len -= next;
-	// 真正长度的起点
+	// 真正起点
 	ex->fe_start += next;
 
 	// 如果已分配的不够需要的长度,则递规查找
 	while (needed > ex->fe_len &&
-		// 找order的可以分配的最大值
+		// 找order的对应最大位的数量
 	       mb_find_buddy(e4b, order, &max)) {
 
 		// 超过最大值,退出
@@ -2005,7 +2009,7 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 
 		/* next设置为以上次order为步进的下一个块的块号
 
-		1<<order: 上次order有多少块
+		1<<order: 上次order的长度
 		上面把block已经转成了order对应的位图下标，
 		这里 (block+1)就是下一个位，再乘以 1<<order，就又把块
 		下标还原成以1<<order为单位的下一个块的块号
@@ -2048,7 +2052,7 @@ static void *mb_find_buddy(struct ext4_buddy *e4b, int order, int *max)
 	BUG_ON(e4b->bd_bitmap == e4b->bd_buddy);
 	BUG_ON(max == NULL);
 
-	// order最大只能是块大小+1次幂，why?
+	// order最大只能是块大小+1次幂
 	if (order > e4b->bd_blkbits + 1) {
 		*max = 0;
 		return NULL;
@@ -2065,7 +2069,7 @@ static void *mb_find_buddy(struct ext4_buddy *e4b, int order, int *max)
 
 	// bb为对应阶数的buddy地址
 	bb = e4b->bd_buddy + EXT4_SB(e4b->bd_sb)->s_mb_offsets[order];
-	// 最大可分配数量
+	// order对应的最大比特位的数量
 	*max = EXT4_SB(e4b->bd_sb)->s_mb_maxs[order];
 
 	return bb;
@@ -2087,10 +2091,11 @@ static int mb_find_order_for_block(struct ext4_buddy *e4b, int block)
 	// buddy起点
 	bb = e4b->bd_buddy;
 
-	// order的阶必须小于块大小的一半，因为order是从1开始的
+	// 阶数最大是bd_blkbits+1, 因为一组最大的块数是bd_blkbits+3
 	while (order <= e4b->bd_blkbits + 1) {
 		// 这里的block当做buddy位图里的下标看，
 		// 每上升一个阶，位图里的1位所表示的块长度就增加1倍，所对应的在位图里的下标就减半
+		// 刚进来的块号相应于是0阶的, 所以这里先除以2
 		block = block >> 1;
 		// 当前位没设置，则返回这个order
 		if (!mb_test_bit(block, bb)) {
