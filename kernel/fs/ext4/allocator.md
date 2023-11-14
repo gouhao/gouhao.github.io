@@ -2257,7 +2257,7 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 	// 已分配区间右边是否设置
 	if (start + len < EXT4_SB(e4b->bd_sb)->s_mb_maxs[0])
 		max = !mb_test_bit(start + len, e4b->bd_bitmap);
-	// 如果两边都没设置,则递增碎片数量
+	// 如果两边都没设置,则递增空闲碎片数量
 	if (mlen && max)
 		e4b->bd_info->bb_fragments++;
 	// 反之,若2边都设置了，则减少碎片数量
@@ -2289,9 +2289,10 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 			continue;
 		}
 
-		// 走到这儿表示, start和order没有对齐, 或者分配的长度小于order的块
+		// 走到这儿表示, start和order没有对齐, 或者需要的长度小于order的块
 
-		// 保存原始的长度和order
+
+		// 保存原始的长度和order，只在第一次记录
 		if (ret == 0)
 			ret = len | (ord << 16);
 
@@ -2321,7 +2322,7 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 		mb_clear_bit(cur, buddy);
 		mb_clear_bit(cur + 1, buddy);
 
-		// 对应的order+1
+		// 对应的order+2
 		e4b->bd_info->bb_counters[ord]++;
 		e4b->bd_info->bb_counters[ord]++;
 	}
