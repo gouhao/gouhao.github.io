@@ -1164,7 +1164,7 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
 		goto out;
 
-	// 把长度转换成2的幂
+	// 把长度转换成2的幂, 把长度对齐到2的幂
 	i = fls(ac->ac_g_ex.fe_len);
 	ac->ac_2order = 0;
 
@@ -1172,7 +1172,7 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 	// s_mb_order2_reqs对应的是sysfs的mb_order2_req接口
 	// i 大于s_mb_order2_reqs且没有超过最大可分配块数时
 	if (i >= sbi->s_mb_order2_reqs && i <= sb->s_blocksize_bits + 2) {
-		// 长度与2对齐，ac_2order设置为较小的一阶
+		// 长度与较小一阶对齐，则ac_2order设置为较小的一阶
 		if ((ac->ac_g_ex.fe_len & (~(1 << (i - 1)))) == 0)
 			ac->ac_2order = array_index_nospec(i - 1,
 							   sb->s_blocksize_bits + 2);
@@ -1268,15 +1268,16 @@ repeat:
 
 			// 根据cr走不同的扫描
 			if (cr == 0)
+				// 精确分配
 				// 当ac_2order有值时才会走这里
-				// 扫描ac_2order对应的buddy位图
+				// 从当前组里找不小于ac_2order地块
 				ext4_mb_simple_scan_group(ac, &e4b);
 			else if (cr == 1 && sbi->s_stripe &&
 					!(ac->ac_g_ex.fe_len % sbi->s_stripe))
 				// raid. 后面看
 				ext4_mb_scan_aligned(ac, &e4b);
 			else
-				// 从位图上扫描
+				// 从位图上扫描, 任何组都可以, 会从全局扫描,找一个合适的块
 				ext4_mb_complex_scan_group(ac, &e4b);
 
 			ext4_unlock_group(sb, group);
@@ -1419,7 +1420,7 @@ void ext4_mb_complex_scan_group(struct ext4_allocation_context *ac,
 	int i;
 	int free;
 
-	// 空闲数量
+	// 空闲数量,这个数量是磁盘上总共的空闲块, 并不只是当前组的
 	free = e4b->bd_info->bb_free;
 	// 没有空闲了
 	if (WARN_ON(free <= 0))
@@ -1591,7 +1592,7 @@ static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
 	// 这个组没有空闲的了
 	if (free == 0)
 		goto out;
-	// cr=3可以随意分配，小于3都需要精确分配，所以不符合长度的就退出
+	// cr=3可以随意分配，小于3都只能在本组内分配, 所以本组空闲块不符合长度的就退出
 	if (cr <= 2 && free < ac->ac_g_ex.fe_len)
 		goto out;
 	
@@ -2147,6 +2148,9 @@ void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
 					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
 			break;
 		}
+
+		// 走到这儿表示找到了
+
 		ac->ac_found++;
 
 		// 找到的长度
@@ -2290,7 +2294,7 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 		}
 
 		// 走到这儿表示, start和order没有对齐, 或者需要的长度小于order的块
-
+		// 下面是要把一个大块分成2个小块
 
 		// 保存原始的长度和order，只在第一次记录
 		if (ret == 0)
@@ -2329,7 +2333,7 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 	// 设置最大的空闲order
 	mb_set_largest_free_order(e4b->bd_sb, e4b->bd_info);
 
-	// 在块位图上设置区间已使用.
+	// 在块位图上设置区间已使用. todo: 为什么要一直设置到len0??
 	ext4_set_bits(e4b->bd_bitmap, ex->fe_start, len0);
 	mb_check_buddy(e4b);
 
