@@ -165,11 +165,10 @@ out:
 }
 
 /*
- * Expand the file descriptor table.
- * This function will allocate a new fdtable and both fd array and fdset, of
- * the given size.
- * Return <0 error code on error; 1 on successful completion.
- * The files->file_lock should be held on entry, and will be held on exit.
+ * 扩展文件描述符表
+ * 这个函数将会分配一个新的fdtable, 以及给定大小的fd数组和fdset
+ * 出错返回小于0的错误码, 1表示成功完成
+ * 进这个函数的时候应该锁files->file_lock, 退出时也持有
  */
 static int expand_fdtable(struct files_struct *files, unsigned int nr)
 	__releases(files->file_lock)
@@ -178,43 +177,51 @@ static int expand_fdtable(struct files_struct *files, unsigned int nr)
 	struct fdtable *new_fdt, *cur_fdt;
 
 	spin_unlock(&files->file_lock);
+	// 分配一个fdtable对象, 及里面的数组, 位图
 	new_fdt = alloc_fdtable(nr);
 
-	/* make sure all __fd_install() have seen resize_in_progress
-	 * or have finished their rcu_read_lock_sched() section.
+	/* 确保所有的__fd_install()能看见resize_in_progress
+	 * 或者已经完成了他们的 rcu_read_lock_sched() 代码区间
 	 */
 	if (atomic_read(&files->count) > 1)
 		synchronize_rcu();
 
+	// 加锁
 	spin_lock(&files->file_lock);
+	// todo: 为啥加锁之后才叛空
 	if (!new_fdt)
 		return -ENOMEM;
 	/*
-	 * extremely unlikely race - sysctl_nr_open decreased between the check in
-	 * caller and alloc_fdtable().  Cheaper to catch it here...
+	 * 极端情况下不太可能的竞争 - sysctl_nr_open 在caller调用时和
+	 * alloc_fdtable之间被减小, 简单的处理它...
 	 */
 	if (unlikely(new_fdt->max_fds <= nr)) {
 		__free_fdtable(new_fdt);
 		return -EMFILE;
 	}
+	// 获取老的fdt
 	cur_fdt = files_fdtable(files);
+	// nr不可能小于之前的老的max_fds
 	BUG_ON(nr < cur_fdt->max_fds);
+
+	// 从老的fdt给新的fdt复制数据
 	copy_fdtable(new_fdt, cur_fdt);
+	// 设置新表
 	rcu_assign_pointer(files->fdt, new_fdt);
+
+	// fdtab是静态数据, 如果是新分配的数据,才调用free_fdtable_rcu来释放内存
 	if (cur_fdt != &files->fdtab)
 		call_rcu(&cur_fdt->rcu, free_fdtable_rcu);
-	/* coupled with smp_rmb() in __fd_install() */
+	/* 与__fd_install()里的smp_rmb()对应的 */
 	smp_wmb();
 	return 1;
 }
 
 /*
- * Expand files.
- * This function will expand the file structures, if the requested size exceeds
- * the current capacity and there is room for expansion.
- * Return <0 error code on error; 0 when nothing done; 1 when files were
- * expanded and execution may have blocked.
- * The files->file_lock should be held on entry, and will be held on exit.
+ * 扩展文件
+ * 这个函数将扩展file数据结构, 如果需要的大小超过了当前的容量就扩展空间
+ * 如果出错返回小于0的错误码, 0表示什么都没做, 1表示文件被扩展了而且程序可能会被阻塞
+ * 进这个函数应该锁files->file_lock, 一直到退出也会持有锁
  */
 static int expand_files(struct files_struct *files, unsigned int nr)
 	__releases(files->file_lock)
@@ -224,68 +231,93 @@ static int expand_files(struct files_struct *files, unsigned int nr)
 	int expanded = 0;
 
 repeat:
+	// 获取fdt
 	fdt = files_fdtable(files);
 
-	/* Do we need to expand? */
+	/* 小于max_fds就不用扩展了, 返回0 */
 	if (nr < fdt->max_fds)
 		return expanded;
 
-	/* Can we expand? */
+	/* 超过了最大打开数量, 也不能扩展 */
 	if (nr >= sysctl_nr_open)
 		return -EMFILE;
 
+	// 当前文件正在扩展中
 	if (unlikely(files->resize_in_progress)) {
+		// 先释放锁
 		spin_unlock(&files->file_lock);
 		expanded = 1;
+
+		// 等待扩展结束
 		wait_event(files->resize_wait, !files->resize_in_progress);
+		// 加锁之后再重试.
 		spin_lock(&files->file_lock);
 		goto repeat;
 	}
 
-	/* All good, so we try */
+	// 正在扩展标志
 	files->resize_in_progress = true;
+	// 扩展表
 	expanded = expand_fdtable(files, nr);
+	// 取消标志
 	files->resize_in_progress = false;
 
+	// 唤醒所有等待的人, 与上面的等待对应
 	wake_up_all(&files->resize_wait);
 	return expanded;
 }
 
+// 设置执行时关闭位
 static inline void __set_close_on_exec(unsigned int fd, struct fdtable *fdt)
 {
 	__set_bit(fd, fdt->close_on_exec);
 }
 
+// 清除执行时关闭位
 static inline void __clear_close_on_exec(unsigned int fd, struct fdtable *fdt)
 {
 	if (test_bit(fd, fdt->close_on_exec))
 		__clear_bit(fd, fdt->close_on_exec);
 }
 
+// 设置打开文件位
 static inline void __set_open_fd(unsigned int fd, struct fdtable *fdt)
 {
+	// 先设置打开文件位
 	__set_bit(fd, fdt->open_fds);
+	// 该位对应的long
 	fd /= BITS_PER_LONG;
+
+	// full_fds_bits里的每1位表示 open_fds 里的一整个long是否被设置,
+	// 在查找fd时,可以加速查找
+	// 如果整个long都被设置了,则设置full_fds
 	if (!~fdt->open_fds[fd])
 		__set_bit(fd, fdt->full_fds_bits);
 }
 
+// 清除打开文件位
 static inline void __clear_open_fd(unsigned int fd, struct fdtable *fdt)
 {
+	// 清除已打开位
 	__clear_bit(fd, fdt->open_fds);
+	// 直接清除对应的full_fds, 因为其中1位置空, full_fds肯定不会是全1
 	__clear_bit(fd / BITS_PER_LONG, fdt->full_fds_bits);
 }
 
+// 统计打开文件数量
 static unsigned int count_open_files(struct fdtable *fdt)
 {
+	// 最大的fds
 	unsigned int size = fdt->max_fds;
 	unsigned int i;
 
-	/* Find the last open fd */
+	// 找到最后被设置的fd
 	for (i = size / BITS_PER_LONG; i > 0; ) {
 		if (fdt->open_fds[--i])
 			break;
 	}
+	// 总的已打开文件数
+	// todo: 这个判断好像不准吧，并不是每个long全设置
 	i = (i + 1) * BITS_PER_LONG;
 	return i;
 }
