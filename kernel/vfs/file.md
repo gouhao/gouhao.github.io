@@ -322,20 +322,25 @@ static unsigned int count_open_files(struct fdtable *fdt)
 	return i;
 }
 
+// 检查fdtable的大小
 static unsigned int sane_fdtable_size(struct fdtable *fdt, unsigned int max_fds)
 {
 	unsigned int count;
 
+	// 已打开文件数量
 	count = count_open_files(fdt);
+
+	// NR_OPEN_DEFAULT 是 64
 	if (max_fds < NR_OPEN_DEFAULT)
 		max_fds = NR_OPEN_DEFAULT;
+	// 选一个较小值
 	return min(count, max_fds);
 }
 
 /*
- * Allocate a new files structure and copy contents from the
- * passed in files structure.
- * errorp will be valid only when the returned files_struct is NULL.
+ * 分配一个新的files_struct结构，并从传进来的老的files_struct结构里复制
+ * 内容到新分配的结构里.
+ * 当返回NULL时, errorp里会有值
  */
 struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int *errorp)
 {
@@ -345,12 +350,15 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
 	struct fdtable *old_fdt, *new_fdt;
 
 	*errorp = -ENOMEM;
+	// 分配一个新的files_struct
 	newf = kmem_cache_alloc(files_cachep, GFP_KERNEL);
 	if (!newf)
 		goto out;
 
+	// 设置引用为1
 	atomic_set(&newf->count, 1);
 
+	// 初始化newf里的各种字段
 	spin_lock_init(&newf->file_lock);
 	newf->resize_in_progress = false;
 	init_waitqueue_head(&newf->resize_wait);
@@ -362,26 +370,38 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
 	new_fdt->full_fds_bits = newf->full_fds_bits_init;
 	new_fdt->fd = &newf->fd_array[0];
 
+	// 注意:这里加的是oldf的锁
 	spin_lock(&oldf->file_lock);
+
+
+	// 这个是使用rcu获取old_fdt
 	old_fdt = files_fdtable(oldf);
+	
+	// old_fdt里已打开的文件数量
 	open_files = sane_fdtable_size(old_fdt, max_fds);
 
 	/*
-	 * Check whether we need to allocate a larger fd array and fd set.
+	 * 检查我们是否需要分配一个新的更大的fd数组和fd集合
 	 */
+	// 已打开的文件数量大于新的max_fds才会分配, 因为上面是刚分配的, 所以max_fds是64
+	// 这个循环只有在非常极端的情况下才会走, 在调用这个函数期间, old_fdt发生了改变
 	while (unlikely(open_files > new_fdt->max_fds)) {
+		// 因为new_fdt还没用,所以不用加锁
 		spin_unlock(&oldf->file_lock);
 
+		// 如果new_fdt是动态分配的,则释放它的内存
 		if (new_fdt != &newf->fdtab)
 			__free_fdtable(new_fdt);
 
+		// 新分配一个fdt, todo: 为什么要open_files - 1 ?
 		new_fdt = alloc_fdtable(open_files - 1);
+		// 分配失败
 		if (!new_fdt) {
 			*errorp = -ENOMEM;
 			goto out_release;
 		}
 
-		/* beyond sysctl_nr_open; nothing to do */
+		/* 超过了 sysctl_nr_open 的数量, 直接返回 */
 		if (unlikely(new_fdt->max_fds < open_files)) {
 			__free_fdtable(new_fdt);
 			*errorp = -EMFILE;
@@ -389,40 +409,49 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
 		}
 
 		/*
-		 * Reacquire the oldf lock and a pointer to its fd table
-		 * who knows it may have a new bigger fd table. We need
-		 * the latest pointer.
+		 * 重新获取oldf的锁, 因为我们要用oldf的fdtable, 因为fdt里的文件数
+		 * 可能已经变了, 我们需要最新的指针
 		 */
 		spin_lock(&oldf->file_lock);
 		old_fdt = files_fdtable(oldf);
+		// 再获取已打开文件的数量
 		open_files = sane_fdtable_size(old_fdt, max_fds);
 	}
 
+	// 走到这儿的时候, oldf的锁还在
+
+	// 复制位图数据
 	copy_fd_bitmaps(new_fdt, old_fdt, open_files);
 
+	// 新旧老的fd数组
 	old_fds = old_fdt->fd;
 	new_fds = new_fdt->fd;
 
+	// 复制file指针
 	for (i = open_files; i != 0; i--) {
 		struct file *f = *old_fds++;
+
+		// 如果file有值,就增加它的指针
 		if (f) {
 			get_file(f);
 		} else {
 			/*
-			 * The fd may be claimed in the fd bitmap but not yet
-			 * instantiated in the files array if a sibling thread
-			 * is partway through open().  So make sure that this
-			 * fd is available to the new process.
+			 * 有可能位图上有值, 但数组里却是空的, 有可能并发线程只到达了
+			 * open的一半,if a sibling thread 所以确保在新的进程里fd
+			 * 是可用的.
+			 * todo: 不用并发,这里也有可能是空呀!!
 			 */
 			__clear_open_fd(open_files - i, new_fdt);
 		}
+		// 给新的数组里设置文件的指针, 有可能是NULL
 		rcu_assign_pointer(*new_fds++, f);
 	}
 	spin_unlock(&oldf->file_lock);
 
-	/* clear the remainder */
+	// 清除其余的字节
 	memset(new_fds, 0, (new_fdt->max_fds - open_files) * sizeof(struct file *));
 
+	// 重新设置newf的fdt
 	rcu_assign_pointer(newf->fdt, new_fdt);
 
 	return newf;
