@@ -462,31 +462,43 @@ out:
 	return NULL;
 }
 
+// 关闭fdt里的所有文件
 static struct fdtable *close_files(struct files_struct * files)
 {
 	/*
-	 * It is safe to dereference the fd table without RCU or
-	 * ->file_lock because this is the last reference to the
-	 * files structure.
+	 * 在这里不用rcu lock和file_lock是安全的, 因为这里是最后一次引用
+	 * files这个结构
 	 */
 	struct fdtable *fdt = rcu_dereference_raw(files->fdt);
 	unsigned int i, j = 0;
 
+	// 遍历每一个位, 然后关闭文件
 	for (;;) {
 		unsigned long set;
+
+		// i保存的是fd, j保存的是第几个long
 		i = j * BITS_PER_LONG;
+		// 大于max则退出
 		if (i >= fdt->max_fds)
 			break;
+		// 取出第j个long
 		set = fdt->open_fds[j++];
+
+		// 遍历该long里每一位
 		while (set) {
+			// 如果这一位上有值
 			if (set & 1) {
+				// 给fd[i]设置NULL, 并返回file
 				struct file * file = xchg(&fdt->fd[i], NULL);
+				// 关闭文件
 				if (file) {
 					filp_close(file, files);
 					cond_resched();
 				}
 			}
+			// fd递增
 			i++;
+			// 位图右移
 			set >>= 1;
 		}
 	}
@@ -494,11 +506,15 @@ static struct fdtable *close_files(struct files_struct * files)
 	return fdt;
 }
 
+// 获取进程的files_struct
 struct files_struct *get_files_struct(struct task_struct *task)
 {
 	struct files_struct *files;
 
+	// 锁的是task->alloc_lock
 	task_lock(task);
+
+	// 递增引用计数
 	files = task->files;
 	if (files)
 		atomic_inc(&files->count);
@@ -507,42 +523,57 @@ struct files_struct *get_files_struct(struct task_struct *task)
 	return files;
 }
 
+// 释放进程的files_struct
 void put_files_struct(struct files_struct *files)
 {
+	// 减少文件引用,如果达到0, 则释放
 	if (atomic_dec_and_test(&files->count)) {
+		// 关闭所有文件
 		struct fdtable *fdt = close_files(files);
 
-		/* free the arrays if they are not embedded */
+		// 如果不是数据结构里内置的fdt, 则释放其内存
 		if (fdt != &files->fdtab)
 			__free_fdtable(fdt);
+		// 释放files内存
 		kmem_cache_free(files_cachep, files);
 	}
 }
 
+// 替换进程里的files结构
 void reset_files_struct(struct files_struct *files)
 {
 	struct task_struct *tsk = current;
 	struct files_struct *old;
 
+	// 老的files
 	old = tsk->files;
+	// 锁住进程
 	task_lock(tsk);
+	// 设置新的files
 	tsk->files = files;
 	task_unlock(tsk);
+	// 释放老的files
 	put_files_struct(old);
 }
 
+// 退出进程的files
 void exit_files(struct task_struct *tsk)
 {
+	// 进程的files
 	struct files_struct * files = tsk->files;
 
 	if (files) {
+		// 锁住进程
 		task_lock(tsk);
+		// 进程的file置空
 		tsk->files = NULL;
 		task_unlock(tsk);
+		// 释放files
 		put_files_struct(files);
 	}
 }
 
+// init进程用的, 设置了fdt指向内部的数据, 初始化一些锁
 struct files_struct init_files = {
 	.count		= ATOMIC_INIT(1),
 	.fdt		= &init_files.fdtab,
@@ -557,22 +588,31 @@ struct files_struct init_files = {
 	.resize_wait	= __WAIT_QUEUE_HEAD_INITIALIZER(init_files.resize_wait),
 };
 
+// 找下一个fd, start是起点
 static unsigned int find_next_fd(struct fdtable *fdt, unsigned int start)
 {
+	// 当前fdt最大支持的fd
 	unsigned int maxfd = fdt->max_fds;
+	// 有多少个long
 	unsigned int maxbit = maxfd / BITS_PER_LONG;
+	// 起点所在的long
 	unsigned int bitbit = start / BITS_PER_LONG;
 
+	// 先从full里找一个空的位, full里一个位为0, 说明整个long还没有分配完
+	// full里一位代表一个long, 所以最后乘以 BITS_PER_LONG
 	bitbit = find_next_zero_bit(fdt->full_fds_bits, maxbit, bitbit) * BITS_PER_LONG;
+	// 大于maxfd说明所有位都用了
 	if (bitbit > maxfd)
 		return maxfd;
+	// 如果大于start, 则从bitbit开始. 说明start已经被用了
 	if (bitbit > start)
 		start = bitbit;
+	// 在open里从start开始找一个空闲的位
 	return find_next_zero_bit(fdt->open_fds, maxfd, start);
 }
 
 /*
- * allocate a file descriptor, mark it busy.
+ * 分配一个文件描述符并置位
  */
 int __alloc_fd(struct files_struct *files,
 	       unsigned start, unsigned end, unsigned flags)
@@ -584,41 +624,54 @@ int __alloc_fd(struct files_struct *files,
 	spin_lock(&files->file_lock);
 repeat:
 	fdt = files_fdtable(files);
+	// 从start开始找
 	fd = start;
+	// 如果小于next, 则从next开始找
+	// next里放的是下一个待分配的fd, 加速查找
 	if (fd < files->next_fd)
 		fd = files->next_fd;
 
+	// 找下一个fd
 	if (fd < fdt->max_fds)
 		fd = find_next_fd(fdt, fd);
 
 	/*
-	 * N.B. For clone tasks sharing a files structure, this test
-	 * will limit the total number of files that can be opened.
+	 * 注意: 对于clone的任务共享files结构, 这个测试将会
+	 * 限制总的打开文件的数量
 	 */
 	error = -EMFILE;
 	if (fd >= end)
 		goto out;
 
+	// 扩展files结构
 	error = expand_files(files, fd);
+	// 小于0表示出错了
 	if (error < 0)
 		goto out;
 
 	/*
-	 * If we needed to expand the fs array we
-	 * might have blocked - try again.
+	 * 大于0说明扩展了, 有可能会阻塞, 需要重试
+	 * 因为fdt有可能已经变了
 	 */
 	if (error)
 		goto repeat;
 
+	// next_fd置为start的下一位, 当然下一位有可能已经用了
 	if (start <= files->next_fd)
 		files->next_fd = fd + 1;
 
+	// 在open位图上设置fd为1
 	__set_open_fd(fd, fdt);
+
+	// 根据是否有执行时关闭, 在相应位图上执行操作
 	if (flags & O_CLOEXEC)
 		__set_close_on_exec(fd, fdt);
 	else
 		__clear_close_on_exec(fd, fdt);
+	// 设置结果
 	error = fd;
+
+	// 如果不为空, 则强制置空
 #if 1
 	/* Sanity check */
 	if (rcu_access_pointer(fdt->fd[fd]) != NULL) {
@@ -632,58 +685,62 @@ out:
 	return error;
 }
 
+// 分配fd, 这个可以指定搜索的起点
 static int alloc_fd(unsigned start, unsigned flags)
 {
+	// 限制值为rlimit(RLIMIT_NOFILE): 进程可打开的文件数量
 	return __alloc_fd(current->files, start, rlimit(RLIMIT_NOFILE), flags);
 }
 
+// 获取未使用的fd, 这个从0开始搜索
 int __get_unused_fd_flags(unsigned flags, unsigned long nofile)
 {
 	return __alloc_fd(current->files, 0, nofile, flags);
 }
 
+// 获取未使用的fd, 这个从0开始搜索, 限制是rlimit(RLIMIT_NOFILE), 
 int get_unused_fd_flags(unsigned flags)
 {
 	return __get_unused_fd_flags(flags, rlimit(RLIMIT_NOFILE));
 }
 EXPORT_SYMBOL(get_unused_fd_flags);
 
+// 释放未使用的fd
 static void __put_unused_fd(struct files_struct *files, unsigned int fd)
 {
+	// 获取fdt, 使用files_fdtable必须持有file_lock锁
 	struct fdtable *fdt = files_fdtable(files);
+
+	// 清除open和full上的位图
 	__clear_open_fd(fd, fdt);
+	// 设置next_fd, 如果小于next的话
 	if (fd < files->next_fd)
 		files->next_fd = fd;
 }
 
+// 导出接口
 void put_unused_fd(unsigned int fd)
 {
 	struct files_struct *files = current->files;
+	// 加锁之后直接调用上面的函数
 	spin_lock(&files->file_lock);
 	__put_unused_fd(files, fd);
 	spin_unlock(&files->file_lock);
 }
-
 EXPORT_SYMBOL(put_unused_fd);
 
 /*
- * Install a file pointer in the fd array.
+ * 在fd数组安装一个文件指针
  *
- * The VFS is full of places where we drop the files lock between
- * setting the open_fds bitmap and installing the file in the file
- * array.  At any such point, we are vulnerable to a dup2() race
- * installing a file in the array before us.  We need to detect this and
- * fput() the struct file we are about to overwrite in this case.
+ * vfs里充满了在设置位图和安装文件之间不持有files_lock的地方.
+ * 在任何一点, 我们都很容易受到dup2在我们之间安装一个文件到数组里.
+ * 此时,我们需要检测这种情况, 并且要fput file结构
  *
- * It should never happen - if we allow dup2() do it, _really_ bad things
- * will follow.
+ * 它应该永远不发生. 如果我们允许dup2这样做, 糟糕的事将会发生.
  *
- * NOTE: __fd_install() variant is really, really low-level; don't
- * use it unless you are forced to by truly lousy API shoved down
- * your throat.  'files' *MUST* be either current->files or obtained
- * by get_files_struct(current) done by whoever had given it to you,
- * or really bad things will happen.  Normally you want to use
- * fd_install() instead.
+ * 注意: __fd_install()是非常低级的函数; 不要用它, 除非API不好用.
+ * files必须是current->files或者是别人从get_files_struct(current)获取的
+ * 否则将会发生不好的事. 通常你应该使用fd_install()来代替.
  */
 
 void __fd_install(struct files_struct *files, unsigned int fd,
@@ -691,26 +748,41 @@ void __fd_install(struct files_struct *files, unsigned int fd,
 {
 	struct fdtable *fdt;
 
+	// rcu锁, 禁用了中断
 	rcu_read_lock_sched();
 
+	// 如果files正在扩容
 	if (unlikely(files->resize_in_progress)) {
+		// 释放rcu锁
 		rcu_read_unlock_sched();
+
+		// 锁住file_lock. 因为扩容时会上锁, 所以这里也要上锁
 		spin_lock(&files->file_lock);
+		// 获取新的fdt
 		fdt = files_fdtable(files);
+		// fd应该是空的, 否则就出错了
 		BUG_ON(fdt->fd[fd] != NULL);
+		// 设置file到fd位置
 		rcu_assign_pointer(fdt->fd[fd], file);
 		spin_unlock(&files->file_lock);
 		return;
 	}
-	/* coupled with smp_wmb() in expand_fdtable() */
+	// 一般情况用, rcu就够了
+
+	/* 与 expand_fdtable() 里的smp_wmb() 对应 */
 	smp_rmb();
+
+	// 取出fdt
 	fdt = rcu_dereference_sched(files->fdt);
+	// 必须是NULL
 	BUG_ON(fdt->fd[fd] != NULL);
+	// 设置对应指针
 	rcu_assign_pointer(fdt->fd[fd], file);
 	rcu_read_unlock_sched();
 }
 
 /*
+ * 这个将会消耗文件的引用计数, 所以调用者应该将其视为调用了fput(file)
  * This consumes the "file" refcount, so callers should treat it
  * as if they had called fput(file).
  */
@@ -721,19 +793,28 @@ void fd_install(unsigned int fd, struct file *file)
 
 EXPORT_SYMBOL(fd_install);
 
+// 根据fd获取一个文件, 并将fd的位置置空
 static struct file *pick_file(struct files_struct *files, unsigned fd)
 {
 	struct file *file = NULL;
 	struct fdtable *fdt;
 
+	// 上锁, 修改fd数组的都要上锁
 	spin_lock(&files->file_lock);
+	
+	// 获取fdt
 	fdt = files_fdtable(files);
+	// 大于max出错
 	if (fd >= fdt->max_fds)
 		goto out_unlock;
+	// 获取文件
 	file = fdt->fd[fd];
+	// 文件为空
 	if (!file)
 		goto out_unlock;
+	// 把fd置空
 	rcu_assign_pointer(fdt->fd[fd], NULL);
+	// 释放fd
 	__put_unused_fd(files, fd);
 
 out_unlock:
@@ -742,19 +823,22 @@ out_unlock:
 }
 
 /*
- * The same warnings as for __alloc_fd()/__fd_install() apply here...
+ * 与 __alloc_fd()/__fd_install() 的警告相同
  */
 int __close_fd(struct files_struct *files, unsigned fd)
 {
 	struct file *file;
 
+	// 先pick文件, pick的同时会释放fd和置空数组
 	file = pick_file(files, fd);
+	// 文件为空返回BADF
 	if (!file)
 		return -EBADF;
 
+	// 关闭文件
 	return filp_close(file, files);
 }
-EXPORT_SYMBOL(__close_fd); /* for ksys_close() */
+EXPORT_SYMBOL(__close_fd); /* 给 ksys_close() 用*/
 
 /**
  * __close_range() - Close all file descriptors in a given range.
