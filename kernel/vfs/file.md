@@ -841,13 +841,12 @@ int __close_fd(struct files_struct *files, unsigned fd)
 EXPORT_SYMBOL(__close_fd); /* 给 ksys_close() 用*/
 
 /**
- * __close_range() - Close all file descriptors in a given range.
+ * __close_range() - 关闭指定范围的文件描述符, close_range syscall
  *
- * @fd:     starting file descriptor to close
- * @max_fd: last file descriptor to close
+ * @fd:     要关闭的开始fd
+ * @max_fd: 最后一个fd (包含)
  *
- * This closes a range of file descriptors. All file descriptors
- * from @fd up to and including @max_fd are closed.
+ * 此函数关闭指定范围内的fd. 从start到max_fd(包含)都会被关闭
  */
 int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
 {
@@ -855,19 +854,24 @@ int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
 	struct task_struct *me = current;
 	struct files_struct *cur_fds = me->files, *fds = NULL;
 
+	// flags如果有除CLOSE_RANGE_UNSHARE的标志都会报错,
+	// 这个标志只有测试用例用到
 	if (flags & ~CLOSE_RANGE_UNSHARE)
 		return -EINVAL;
 
+	// 起点不能大于结尾
 	if (fd > max_fd)
 		return -EINVAL;
 
+	// 获取当前fd最大值
 	rcu_read_lock();
 	cur_max = files_fdtable(cur_fds)->max_fds;
 	rcu_read_unlock();
 
-	/* cap to last valid index into fdtable */
+	// 最大的大效fd, 因为fd是从0开始
 	cur_max--;
 
+	// todo: unshare后面看
 	if (flags & CLOSE_RANGE_UNSHARE) {
 		int ret;
 		unsigned int max_unshare_fds = NR_OPEN_MAX;
@@ -892,18 +896,24 @@ int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
 			swap(cur_fds, fds);
 	}
 
+	// 将max_fd规范化
 	max_fd = min(max_fd, cur_max);
+
+	// 从起点到终点关闭文件
 	while (fd <= max_fd) {
 		struct file *file;
 
+		// 取出一个文件,并把数组里置空
 		file = pick_file(cur_fds, fd++);
 		if (!file)
 			continue;
 
+		// 关闭文件
 		filp_close(file, cur_fds);
 		cond_resched();
 	}
 
+	// 恢复fds, 这个只有testing用到
 	if (fds) {
 		/*
 		 * We're done closing the files we were supposed to. Time to install
@@ -919,9 +929,9 @@ int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
 }
 
 /*
- * variant of __close_fd that gets a ref on the file for later fput.
- * The caller must ensure that filp_close() called on the file, and then
- * an fput().
+ * __close_fd的变体, 会获取文件一个引用
+ *
+ * 调用者必须确保filp_close()被调用, 然后fput
  */
 int __close_fd_get_file(unsigned int fd, struct file **res)
 {
@@ -931,14 +941,19 @@ int __close_fd_get_file(unsigned int fd, struct file **res)
 
 	spin_lock(&files->file_lock);
 	fdt = files_fdtable(files);
+	// fd值无效
 	if (fd >= fdt->max_fds)
 		goto out_unlock;
+	// 取出文件
 	file = fdt->fd[fd];
 	if (!file)
 		goto out_unlock;
+	// 数组置空
 	rcu_assign_pointer(fdt->fd[fd], NULL);
+	// 释放fd
 	__put_unused_fd(files, fd);
 	spin_unlock(&files->file_lock);
+	// 获取文件引用
 	get_file(file);
 	*res = file;
 	return 0;
@@ -954,30 +969,44 @@ void do_close_on_exec(struct files_struct *files)
 	unsigned i;
 	struct fdtable *fdt;
 
-	/* exec unshares first */
+	// 加锁
 	spin_lock(&files->file_lock);
 	for (i = 0; ; i++) {
 		unsigned long set;
 		unsigned fd = i * BITS_PER_LONG;
+		
 		fdt = files_fdtable(files);
+		// fd越界
 		if (fd >= fdt->max_fds)
 			break;
+		// 取出一个long
 		set = fdt->close_on_exec[i];
 		if (!set)
 			continue;
+		// 然后把这个long置0
 		fdt->close_on_exec[i] = 0;
+		// 关闭这个long里的文件
 		for ( ; set ; fd++, set >>= 1) {
 			struct file *file;
+
+			// 这一位没有刚退出
 			if (!(set & 1))
 				continue;
+			// 取出文件
 			file = fdt->fd[fd];
 			if (!file)
 				continue;
+			// 该位置空
 			rcu_assign_pointer(fdt->fd[fd], NULL);
+			// 释放fd
 			__put_unused_fd(files, fd);
+
+			// 关闭文件要释放锁
 			spin_unlock(&files->file_lock);
+			// 关闭文件
 			filp_close(file, files);
 			cond_resched();
+			// 调度之后重新加锁
 			spin_lock(&files->file_lock);
 		}
 
@@ -985,46 +1014,50 @@ void do_close_on_exec(struct files_struct *files)
 	spin_unlock(&files->file_lock);
 }
 
+// 获取file并增加引用, 全使用的rcu操作
 static inline struct file *__fget_files_rcu(struct files_struct *files,
 	unsigned int fd, fmode_t mask, unsigned int refs)
 {
 	for (;;) {
 		struct file *file;
+		// 取出fdt
 		struct fdtable *fdt = rcu_dereference_raw(files->fdt);
 		struct file __rcu **fdentry;
 
+		// fd越界
 		if (unlikely(fd >= fdt->max_fds))
 			return NULL;
 
+		// 获取存放file的数组地址, array_index_nospec是把fd规范到max_fds
 		fdentry = fdt->fd + array_index_nospec(fd, fdt->max_fds);
+		// 取出file
 		file = rcu_dereference_raw(*fdentry);
+		// 为空直接返回
 		if (unlikely(!file))
 			return NULL;
 
+		// 有掩码的值, 也返回
 		if (unlikely(file->f_mode & mask))
 			return NULL;
 
 		/*
-		 * Ok, we have a file pointer. However, because we do
-		 * this all locklessly under RCU, we may be racing with
-		 * that file being closed.
+		 * 我们有了一个文件指针. 然而,因为我们用的是rcu无锁, 可能会与
+		 * 已关闭的文件产生竞争.
 		 *
-		 * Such a race can take two forms:
+		 * 有下面2种竞争情况:
 		 *
-		 *  (a) the file ref already went down to zero,
-		 *      and get_file_rcu_many() fails. Just try
-		 *      again:
+		 *  (a) 文件指针已经到0, get_file_rcu_many() 会失败, 
+		 *	则继续重试
 		 */
 		if (unlikely(!get_file_rcu_many(file, refs)))
 			continue;
 
 		/*
-		 *  (b) the file table entry has changed under us.
-		 *       Note that we don't need to re-check the 'fdt->fd'
-		 *       pointer having changed, because it always goes
-		 *       hand-in-hand with 'fdt'.
+		 *  (b) fdtable或者file entry已经变了.
+		 *       注意: 我们不用重新检查fdt->fd指针有没有变, 因为它和
+		 *	fdt相关
 		 *
-		 * If so, we need to put our refs and try again.
+		 * 如果是这样,我们需要释放引用然后重试
 		 */
 		if (unlikely(rcu_dereference_raw(files->fdt) != fdt) ||
 		    unlikely(rcu_dereference_raw(*fdentry) != file)) {
@@ -1032,10 +1065,7 @@ static inline struct file *__fget_files_rcu(struct files_struct *files,
 			continue;
 		}
 
-		/*
-		 * Ok, we have a ref to the file, and checked that it
-		 * still exists.
-		 */
+		// 文件正常, 返回之
 		return file;
 	}
 }
@@ -1045,6 +1075,7 @@ static struct file *__fget_files(struct files_struct *files, unsigned int fd,
 {
 	struct file *file;
 
+	// 加rcu锁之后获取引用
 	rcu_read_lock();
 	file = __fget_files_rcu(files, fd, mask, refs);
 	rcu_read_unlock();
@@ -1052,33 +1083,39 @@ static struct file *__fget_files(struct files_struct *files, unsigned int fd,
 	return file;
 }
 
+// 从当前进程获取fd 文件, 并增加refs指针
 static inline struct file *__fget(unsigned int fd, fmode_t mask,
 				  unsigned int refs)
 {
 	return __fget_files(current->files, fd, mask, refs);
 }
 
+// 掩码值传的是FMODE_PATH
 struct file *fget_many(unsigned int fd, unsigned int refs)
 {
 	return __fget(fd, FMODE_PATH, refs);
 }
 
+// 只获取file引用一次
 struct file *fget(unsigned int fd)
 {
 	return __fget(fd, FMODE_PATH, 1);
 }
 EXPORT_SYMBOL(fget);
 
+// 只获取file引用一次, mode是0
 struct file *fget_raw(unsigned int fd)
 {
 	return __fget(fd, 0, 1);
 }
 EXPORT_SYMBOL(fget_raw);
 
+// 从指定进程获取fd对应的文件
 struct file *fget_task(struct task_struct *task, unsigned int fd)
 {
 	struct file *file = NULL;
 
+	// 锁住task并获取文件, mode是0, 引用是1
 	task_lock(task);
 	if (task->files)
 		file = __fget_files(task->files, fd, 0, 1);
