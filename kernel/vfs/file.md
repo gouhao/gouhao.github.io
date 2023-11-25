@@ -1125,20 +1125,14 @@ struct file *fget_task(struct task_struct *task, unsigned int fd)
 }
 
 /*
- * Lightweight file lookup - no refcnt increment if fd table isn't shared.
+ * 轻量级文件查找 - 如果文件没有共享,则不会增加引用计数
  *
- * You can use this instead of fget if you satisfy all of the following
- * conditions:
- * 1) You must call fput_light before exiting the syscall and returning control
- *    to userspace (i.e. you cannot remember the returned struct file * after
- *    returning to userspace).
- * 2) You must not call filp_close on the returned struct file * in between
- *    calls to fget_light and fput_light.
- * 3) You must not clone the current task in between the calls to fget_light
- *    and fput_light.
+ * 你可以用它代替fget, 如果你满足下面条件:
+ * 1) 你必须在退出系统调用前调用fput_light, 并且把控制权交给用户空间(例如: 你不能在返回用户空间之后还保留file *) 
+ * 2) 你不能在fget_light和fput_light之间调用filp_close(file*)
+ * 3) 你不能在fget_light和fput_light之间clone当前进程
  *
- * The fput_needed flag returned by fget_light should be passed to the
- * corresponding fput_light.
+ * 返回值是文件的值和调用fput_light需要的flag
  */
 static unsigned long __fget_light(unsigned int fd, fmode_t mask)
 {
@@ -1146,23 +1140,33 @@ static unsigned long __fget_light(unsigned int fd, fmode_t mask)
 	struct file *file;
 
 	if (atomic_read(&files->count) == 1) {
+		// 文件数量为1, 表示files只在当前进程使用, 没有与其他人共享
+
+		// 直接调用fcheck就行
 		file = __fcheck_files(files, fd);
+		// 文件为空
 		if (!file || unlikely(file->f_mode & mask))
 			return 0;
+		// 返回文件的值
 		return (unsigned long)file;
 	} else {
+		// files与其他进程共享
 		file = __fget(fd, mask, 1);
 		if (!file)
 			return 0;
+		// 在文件里还要加个标志
 		return FDPUT_FPUT | (unsigned long)file;
 	}
 }
+
+// mask是FMODE_PATH, 表示文件不能带有这种标志
 unsigned long __fdget(unsigned int fd)
 {
 	return __fget_light(fd, FMODE_PATH);
 }
 EXPORT_SYMBOL(__fdget);
 
+// mask是0, 表示可以获取所有类型的文件
 unsigned long __fdget_raw(unsigned int fd)
 {
 	return __fget_light(fd, 0);
@@ -1170,11 +1174,16 @@ unsigned long __fdget_raw(unsigned int fd)
 
 unsigned long __fdget_pos(unsigned int fd)
 {
+	// 获取文件
 	unsigned long v = __fdget(fd);
+	// 取出真正的文件值
 	struct file *file = (struct file *)(v & ~3);
 
+	// 若文件模式有FMODE_ATOMIC_POS
 	if (file && (file->f_mode & FMODE_ATOMIC_POS)) {
+		// 文件引用数量大于1, 则需要加pos锁
 		if (file_count(file) > 1) {
+			// 给fput的标志, 要解pos锁
 			v |= FDPUT_POS_UNLOCK;
 			mutex_lock(&file->f_pos_lock);
 		}
@@ -1182,15 +1191,15 @@ unsigned long __fdget_pos(unsigned int fd)
 	return v;
 }
 
+// 解锁pos锁
 void __f_unlock_pos(struct file *f)
 {
 	mutex_unlock(&f->f_pos_lock);
 }
 
 /*
- * We only lock f_pos if we have threads or if the file might be
- * shared with another process. In both cases we'll have an elevated
- * file count (done either by fdget() or by fork()).
+ * 我们只在有线程或者可能与其他进程共享file时才锁f_pos.
+ * 在所有的情况里我们将增加文件计数(通过fdget或fork完成).
  */
 
 void set_close_on_exec(unsigned int fd, int flag)
@@ -1198,7 +1207,10 @@ void set_close_on_exec(unsigned int fd, int flag)
 	struct files_struct *files = current->files;
 	struct fdtable *fdt;
 	spin_lock(&files->file_lock);
+	// 获取fdt
 	fdt = files_fdtable(files);
+
+	// flag: 1设置, 0取消, 这里面只是简单的设置了fd相应的位
 	if (flag)
 		__set_close_on_exec(fd, fdt);
 	else
@@ -1211,8 +1223,11 @@ bool get_close_on_exec(unsigned int fd)
 	struct files_struct *files = current->files;
 	struct fdtable *fdt;
 	bool res;
+
+	// 读fdt时, 都要加rcu锁
 	rcu_read_lock();
 	fdt = files_fdtable(files);
+	// 获取fd对的执行时关闭状态
 	res = close_on_exec(fd, fdt);
 	rcu_read_unlock();
 	return res;
@@ -1226,32 +1241,36 @@ __releases(&files->file_lock)
 	struct fdtable *fdt;
 
 	/*
-	 * We need to detect attempts to do dup2() over allocated but still
-	 * not finished descriptor.  NB: OpenBSD avoids that at the price of
-	 * extra work in their equivalent of fget() - they insert struct
-	 * file immediately after grabbing descriptor, mark it larval if
-	 * more work (e.g. actual opening) is needed and make sure that
-	 * fget() treats larval files as absent.  Potentially interesting,
-	 * but while extra work in fget() is trivial, locking implications
-	 * and amount of surgery on open()-related paths in VFS are not.
-	 * FreeBSD fails with -EBADF in the same situation, NetBSD "solution"
-	 * deadlocks in rather amusing ways, AFAICS.  All of that is out of
-	 * scope of POSIX or SUS, since neither considers shared descriptor
-	 * tables and this condition does not arise without those.
+	 * 我们需要检测尝试通过dup2过度分配但是还没完成的fd.
+	 * 注意: OpenBSD 在他们的fget里避免了它, 以一些额外的工作为代价, 他们在获取fd之后,
+	 * 立即插入文件, 并标记为larval如果需要更多的工作. 确保fget对待larval文件为不在位
+	 * 可能很有趣, 但是当fget里的额外工作是轻微的, 隐式的加锁和open里等量的工作相关路径在
+	 * vfs里不是这样的.FreeBSD在同样的情况下会失败返回-EBADF, NetBSD会死锁.
+	 * 这些都超出了POSIX和SUS的范围, 他们都没有考虑共享fdtable, 并且如果没有共享, 这些情况
+	 * 就不会出现.
 	 */
 	fdt = files_fdtable(files);
+	// 获取fd上的文件, 如果fd上有文件会关闭它
 	tofree = fdt->fd[fd];
+
+	// 关闭的文件是空, 但是fd是打开的, 则返回busy
 	if (!tofree && fd_is_open(fd, fdt))
 		goto Ebusy;
+	// 增加文件引用
 	get_file(file);
+	// 设置fd为file指针
 	rcu_assign_pointer(fdt->fd[fd], file);
+	// 设置fd打开
 	__set_open_fd(fd, fdt);
+
+	// 关闭或打开fd的执行时关闭
 	if (flags & O_CLOEXEC)
 		__set_close_on_exec(fd, fdt);
 	else
 		__clear_close_on_exec(fd, fdt);
 	spin_unlock(&files->file_lock);
 
+	// 如果需要关闭, 则关闭旧文件
 	if (tofree)
 		filp_close(tofree, files);
 
@@ -1267,16 +1286,21 @@ int replace_fd(unsigned fd, struct file *file, unsigned flags)
 	int err;
 	struct files_struct *files = current->files;
 
+	// 如果文件为空, 说明需要把fd上的文件清除,
+	// 则关闭fd上的文件, 返回
 	if (!file)
 		return __close_fd(files, fd);
 
+	// fd超过了进程允许打开的文件数
 	if (fd >= rlimit(RLIMIT_NOFILE))
 		return -EBADF;
 
 	spin_lock(&files->file_lock);
+	// 先检测是否需要扩容
 	err = expand_files(files, fd);
 	if (unlikely(err < 0))
 		goto out_unlock;
+	// 调dup2
 	return do_dup2(files, file, fd, flags);
 
 out_unlock:
@@ -1285,41 +1309,45 @@ out_unlock:
 }
 
 /**
- * __receive_fd() - Install received file into file descriptor table
+ * __receive_fd() - 安装收到的文件到fdtable
  *
- * @fd: fd to install into (if negative, a new fd will be allocated)
- * @file: struct file that was received from another process
- * @ufd: __user pointer to write new fd number to
- * @o_flags: the O_* flags to apply to the new fd entry
+ * @fd: 要安装的fd (如果是负数, 一个新的fd将会被分配)
+ * @file: 从其他进程收到的file结构
+ * @ufd: 用户空间的指针, 用来写入新的fd, 返回给用户
+ * @o_flags: 应用到新fd的文件上的 O_* 标志
  *
- * Installs a received file into the file descriptor table, with appropriate
- * checks and count updates. Optionally writes the fd number to userspace, if
- * @ufd is non-NULL.
+ * 安装一个收到的文件到fdtable, 进行适当的检查和引用计数更新
+ * 可选的, 如果 ufd 不为空, 会将新的fd写入其中
  *
- * This helper handles its own reference counting of the incoming
- * struct file.
+ * 这个函数自己会处理传入文件的引用计数
  *
- * Returns newly install fd or -ve on error.
+ * 返回新安装的fd, 或者负的错误号
  */
 int __receive_fd(int fd, struct file *file, int __user *ufd, unsigned int o_flags)
 {
 	int new_fd;
 	int error;
 
+	// 安全检查
 	error = security_file_receive(file);
 	if (error)
 		return error;
 
+	// 如果fd小于0, 则分配一个新的fd
 	if (fd < 0) {
 		new_fd = get_unused_fd_flags(o_flags);
+		// 分配fd失败直接返回
 		if (new_fd < 0)
 			return new_fd;
 	} else {
 		new_fd = fd;
 	}
 
+	// 如果ufd不为空, 则把newfd写入到ufd里
 	if (ufd) {
 		error = put_user(new_fd, ufd);
+
+		// 出错, 如果是新分配的fd, 则释放后返回
 		if (error) {
 			if (fd < 0)
 				put_unused_fd(new_fd);
@@ -1327,15 +1355,16 @@ int __receive_fd(int fd, struct file *file, int __user *ufd, unsigned int o_flag
 		}
 	}
 
-	if (fd < 0) {
+	if (fd < 0) { // fd < 0, 说明是新分配的fd, 则直接安装, 并增加文件引用
 		fd_install(new_fd, get_file(file));
 	} else {
+		// 否则替换newfd上的文件
 		error = replace_fd(new_fd, file, o_flags);
 		if (error)
 			return error;
 	}
 
-	/* Bump the sock usage counts, if any. */
+	// 如果file是socket, 则增加引用计数
 	__receive_sock(file);
 	return new_fd;
 }
@@ -1346,25 +1375,36 @@ static int ksys_dup3(unsigned int oldfd, unsigned int newfd, int flags)
 	struct file *file;
 	struct files_struct *files = current->files;
 
+	// flags只能指定O_CLOEXEC标志
 	if ((flags & ~O_CLOEXEC) != 0)
 		return -EINVAL;
 
+	// 两个fd不能一样
 	if (unlikely(oldfd == newfd))
 		return -EINVAL;
 
+	// newfd不能超过进程的限制
 	if (newfd >= rlimit(RLIMIT_NOFILE))
 		return -EBADF;
 
 	spin_lock(&files->file_lock);
+	// 新fd可能需要扩容
 	err = expand_files(files, newfd);
+	// 获取oldfd的文件
 	file = fcheck(oldfd);
+	// fd上没有文件
 	if (unlikely(!file))
 		goto Ebadf;
+
+	// 其他错误
 	if (unlikely(err < 0)) {
+		// 超过文件最大值
 		if (err == -EMFILE)
 			goto Ebadf;
 		goto out_unlock;
 	}
+
+	// 把该oldfd的文件安装在newfd上
 	return do_dup2(files, file, newfd, flags);
 
 Ebadf:
@@ -1374,47 +1414,75 @@ out_unlock:
 	return err;
 }
 
+// 同dup2, 可以指定标志
 SYSCALL_DEFINE3(dup3, unsigned int, oldfd, unsigned int, newfd, int, flags)
 {
 	return ksys_dup3(oldfd, newfd, flags);
 }
 
+static inline struct file *fcheck_files(struct files_struct *files, unsigned int fd)
+{
+	// 调用这个函数必须要rcu读锁, 并且锁住file_lock
+	RCU_LOCKDEP_WARN(!rcu_read_lock_held() &&
+			   !lockdep_is_held(&files->file_lock),
+			   "suspicious rcu_dereference_check() usage");
+	return __fcheck_files(files, fd);
+}
+
+// newfd与oldfd指向同一文件, 如果newfd已经打开, 则会把它先关闭
 SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
 {
-	if (unlikely(newfd == oldfd)) { /* corner case */
+	// 新老fd相同也是允许的
+	if (unlikely(newfd == oldfd)) {
 		struct files_struct *files = current->files;
 		int retval = oldfd;
 
 		rcu_read_lock();
+		// 老文件为NULL, 返回错误
 		if (!fcheck_files(files, oldfd))
 			retval = -EBADF;
 		rcu_read_unlock();
 		return retval;
 	}
+	// 调dup3, flag是0
 	return ksys_dup3(oldfd, newfd, 0);
 }
 
+// 分配一个新的fd, 新fd也指向fildes的文件
 SYSCALL_DEFINE1(dup, unsigned int, fildes)
 {
 	int ret = -EBADF;
+	// 获取fildes的文件引用
 	struct file *file = fget_raw(fildes);
 
+	// 若文件存在
 	if (file) {
+
+		// 获取一个没用的fd
 		ret = get_unused_fd_flags(0);
 		if (ret >= 0)
+			// 把file安装到fd的位置
 			fd_install(ret, file);
 		else
+			// 获取fd出错, 释放文件
 			fput(file);
 	}
 	return ret;
 }
 
+// dup时指定了fd的起点
 int f_dupfd(unsigned int from, struct file *file, unsigned flags)
 {
 	int err;
+
+	// 不能大于最大允许值
 	if (from >= rlimit(RLIMIT_NOFILE))
 		return -EINVAL;
+	
+	// 分配一个fd
 	err = alloc_fd(from, flags);
+
+	// 分配成功, 增加文件计数并安装
 	if (err >= 0) {
 		get_file(file);
 		fd_install(err, file);
@@ -1422,21 +1490,37 @@ int f_dupfd(unsigned int from, struct file *file, unsigned flags)
 	return err;
 }
 
+/*
+* 遍历files里的文件
+* n: 遍历起点
+* f: 回调函数
+* p: 回传给函数的数据
+*/
 int iterate_fd(struct files_struct *files, unsigned n,
 		int (*f)(const void *, struct file *, unsigned),
 		const void *p)
 {
 	struct fdtable *fdt;
 	int res = 0;
+
+	// files为空
 	if (!files)
 		return 0;
+	
 	spin_lock(&files->file_lock);
+
+	// 从n开始遍历fdt里的所有fd
 	for (fdt = files_fdtable(files); n < fdt->max_fds; n++) {
 		struct file *file;
+
+		// 获取file
 		file = rcu_dereference_check_fdtable(files, fdt->fd[n]);
 		if (!file)
 			continue;
+		// 调用回调函数
 		res = f(p, file, n);
+
+		// 返回错误退出
 		if (res)
 			break;
 	}
