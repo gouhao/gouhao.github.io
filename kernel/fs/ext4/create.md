@@ -199,9 +199,9 @@ struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
 
 	// 有目标 && 小于inode的数量
 	if (goal && goal <= le32_to_cpu(sbi->s_es->s_inodes_count)) {
-		// 算出inode所在的组
+		// 算出goal所在的组
 		group = (goal - 1) / EXT4_INODES_PER_GROUP(sb);
-		// 算出所在组的inode号
+		// 算出goal所在组的inode号
 		ino = (goal - 1) % EXT4_INODES_PER_GROUP(sb);
 		ret2 = 0;
 		// 跳到找到组
@@ -216,7 +216,7 @@ struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
 		ret2 = find_group_other(sb, dir, &group, mode);
 
 got_group:
-	// 设置目录里最后一次分配的组
+	// 设置目录里上一次分配的组
 	EXT4_I(dir)->i_last_alloc_group = group;
 	err = -ENOSPC;
 	// 没空间了
@@ -245,6 +245,7 @@ got_group:
 		brelse(inode_bitmap_bh);
 		// 读入当前表的inode位图
 		inode_bitmap_bh = ext4_read_inode_bitmap(sb, group);
+
 		// 为什么这里还要判断一次corrupt(grp)，难道是因为read_inodebitmap是个耗时操作？
 		// 如果位图读取失败，则遍历下个组
 		if (EXT4_MB_GRP_IBITMAP_CORRUPT(grp) ||
@@ -289,6 +290,8 @@ repeat_in_this_group:
 			ext4_std_error(sb, err);
 			goto out;
 		}
+
+		// 锁住组
 		ext4_lock_group(sb, group);
 		// 设置位图里相应的位
 		ret2 = ext4_test_and_set_bit(ino, inode_bitmap_bh->b_data);
@@ -297,6 +300,7 @@ repeat_in_this_group:
 		if (ret2) {
 			ret2 = find_inode_bit(sb, group, inode_bitmap_bh, &ino);
 			if (ret2) {
+				// 因为上面已经锁住了组,所以这里就直接设置
 				ext4_set_bit(ino, inode_bitmap_bh->b_data);
 				ret2 = 0;
 			} else {
@@ -401,6 +405,8 @@ got:
 
 		down_read(&grp->alloc_sem); /* protect vs itable lazyinit */
 		ext4_lock_group(sb, group); /* while we modify the bg desc */
+
+		// todo: 总共的减未使用的, 为什么是空闲的? 不应该是已使用的吗?
 		free = EXT4_INODES_PER_GROUP(sb) -
 			ext4_itable_unused_count(sb, gdp);
 		// 需要初始化inode
@@ -436,8 +442,10 @@ got:
 
 	// 设置相关组描述符校验和
 	if (ext4_has_group_desc_csum(sb)) {
+		// inode位图校验和
 		ext4_inode_bitmap_csum_set(sb, group, gdp, inode_bitmap_bh,
 					   EXT4_INODES_PER_GROUP(sb) / 8);
+		// 组描述符校验和
 		ext4_group_desc_csum_set(sb, group, gdp);
 	}
 	ext4_unlock_group(sb, group);
@@ -450,7 +458,7 @@ got:
 		goto out;
 	}
 
-	// 递减空闲inode数量
+	// 递减总磁盘的空闲inode数量
 	percpu_counter_dec(&sbi->s_freeinodes_counter);
 	// 若是目录，递增目录的数量
 	if (S_ISDIR(mode))
@@ -462,7 +470,7 @@ got:
 						flex_group)->free_inodes);
 	}
 
-	// 算出最终的ino
+	// 算出全局的ino号
 	inode->i_ino = ino + group * EXT4_INODES_PER_GROUP(sb);
 	// 块数为0
 	inode->i_blocks = 0;
@@ -470,12 +478,13 @@ got:
 	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
 	ei->i_crtime = inode->i_mtime;
 
-	// i_data清0
+	// i_data清0, i_data存放的是extent
 	memset(ei->i_data, 0, sizeof(ei->i_data));
 	ei->i_dir_start_lookup = 0;
+	// 磁盘空间为0
 	ei->i_disksize = 0;
 
-	/* Don't inherit extent flag from directory, amongst others. */
+	/* 不要从父目录继承extent的flags */
 	ei->i_flags =
 		ext4_mask_flags(mode, EXT4_I(dir)->i_flags & EXT4_FL_INHERITED);
 	ei->i_flags |= i_flags;
@@ -485,6 +494,7 @@ got:
 	ei->i_block_group = group;
 	ei->i_last_alloc_group = ~0;
 
+	// 把ext4的标志转换成标准文件系统的标志
 	ext4_set_inode_flags(inode);
 
 	// 目录同步
@@ -512,6 +522,7 @@ got:
 		__le32 gen = cpu_to_le32(inode->i_generation);
 		csum = ext4_chksum(sbi, sbi->s_csum_seed, (__u8 *)&inum,
 				   sizeof(inum));
+		// 算出种子
 		ei->i_csum_seed = ext4_chksum(sbi, csum, (__u8 *)&gen,
 					      sizeof(gen));
 	}
