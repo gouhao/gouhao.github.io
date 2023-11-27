@@ -1,58 +1,58 @@
 # 挂载
 源码基于5.10
 
-## 数据结构
+## 1. 数据结构
 ```c
 struct ext4_sb_info {
-	unsigned long s_desc_size;	/* Size of a group descriptor in bytes */
-	unsigned long s_inodes_per_block;/* Number of inodes per block */
-	unsigned long s_blocks_per_group;/* Number of blocks in a group */
-	unsigned long s_clusters_per_group; /* Number of clusters in a group */
-	unsigned long s_inodes_per_group;/* Number of inodes in a group */
-	unsigned long s_itb_per_group;	/* Number of inode table blocks per group */
-	unsigned long s_gdb_count;	/* Number of group descriptor blocks */
-	unsigned long s_desc_per_block;	/* Number of group descriptors per block */
-	ext4_group_t s_groups_count;	/* Number of groups in the fs */
-	ext4_group_t s_blockfile_groups;/* Groups acceptable for non-extent files */
+	unsigned long s_desc_size; // 组描述符大小(byte)
+	unsigned long s_inodes_per_block; // 每个块的inode数量
+	unsigned long s_blocks_per_group; // 每组块的数量
+	unsigned long s_clusters_per_group; // 每组cluster数量
+	unsigned long s_inodes_per_group; // 每组的inode数量
+	unsigned long s_itb_per_group;	// 每组inode表的块数
+	unsigned long s_gdb_count;	// 组描述符的块数
+	unsigned long s_desc_per_block;	// 每个块组描述符的数量
+	ext4_group_t s_groups_count;	// 文件系统内组的数量
+	ext4_group_t s_blockfile_groups;// 非extent文件所接受的组数
 	unsigned long s_overhead;  /* # of fs overhead clusters */
-	unsigned int s_cluster_ratio;	/* Number of blocks per cluster */
-	unsigned int s_cluster_bits;	/* log2 of s_cluster_ratio */
-	loff_t s_bitmap_maxbytes;	/* max bytes for bitmap files */
-	struct buffer_head * s_sbh;	/* Buffer containing the super block */
-	struct ext4_super_block *s_es;	/* Pointer to the super block in the buffer */
-	struct buffer_head * __rcu *s_group_desc;
-	unsigned int s_mount_opt;
-	unsigned int s_mount_opt2;
-	unsigned long s_mount_flags;
-	unsigned int s_def_mount_opt;
-	ext4_fsblk_t s_sb_block;
+	unsigned int s_cluster_ratio;	// 每个cluster的块数量
+	unsigned int s_cluster_bits;	// s_cluster_ratio的幂
+	loff_t s_bitmap_maxbytes;	// 位图文件的最大bytes
+	struct buffer_head * s_sbh;	// 包含超级块的bh
+	struct ext4_super_block *s_es;	// 指向磁盘上超级块的起点
+	struct buffer_head * __rcu *s_group_desc; // 组描述符起点
+	unsigned int s_mount_opt; // 挂载选项
+	unsigned int s_mount_opt2; // 挂载选项2
+	unsigned long s_mount_flags; // 挂载标志
+	unsigned int s_def_mount_opt; // 默认挂载选项
+	ext4_fsblk_t s_sb_block; // 超级块块号
 	atomic64_t s_resv_clusters;
 	kuid_t s_resuid;
 	kgid_t s_resgid;
-	unsigned short s_mount_state;
+	unsigned short s_mount_state; // 挂载状态
 	unsigned short s_pad;
-	int s_addr_per_block_bits;
-	int s_desc_per_block_bits;
-	int s_inode_size;
-	int s_first_ino;
-	unsigned int s_inode_readahead_blks;
+	int s_addr_per_block_bits; // 每个块可放地址数量的幂
+	int s_desc_per_block_bits; // 每个块可放组描述符数量的幂
+	int s_inode_size; // inode大小
+	int s_first_ino; // 第一个inode号
+	unsigned int s_inode_readahead_blks; //预计块数量
 	unsigned int s_inode_goal;
-	u32 s_hash_seed[4];
-	int s_def_hash_version;
-	int s_hash_unsigned;	/* 3 if hash should be signed, 0 if not */
-	struct percpu_counter s_freeclusters_counter;
-	struct percpu_counter s_freeinodes_counter;
-	struct percpu_counter s_dirs_counter;
-	struct percpu_counter s_dirtyclusters_counter;
+	u32 s_hash_seed[4]; // 哈希种子
+	int s_def_hash_version; // 哈希版本
+	int s_hash_unsigned;	/* 3: 如果哈希是有符号的, 反之为0 */
+	struct percpu_counter s_freeclusters_counter; // 空闲 cluster 数量
+	struct percpu_counter s_freeinodes_counter; // 空闲 inode 数量
+	struct percpu_counter s_dirs_counter; // 目录数量
+	struct percpu_counter s_dirtyclusters_counter; // 脏cluster数量
 	struct percpu_counter s_sra_exceeded_retry_limit;
 	struct blockgroup_lock *s_blockgroup_lock;
 	struct proc_dir_entry *s_proc;
 	struct kobject s_kobj;
 	struct completion s_kobj_unregister;
-	struct super_block *s_sb;
+	struct super_block *s_sb; // vfs的超级块指针
 	struct buffer_head *s_mmp_bh;
 
-	/* Journaling */
+	/* 日志相关 */
 	struct journal_s *s_journal;
 	struct list_head s_orphan;
 	struct mutex s_orphan_lock;
@@ -79,13 +79,13 @@ struct ext4_sb_info {
 	unsigned long s_ext_extents;
 #endif
 
-	/* for buddy allocator */
-	struct ext4_group_info ** __rcu *s_group_info;
-	struct inode *s_buddy_cache;
+	/* buddy分配器 */
+	struct ext4_group_info ** __rcu *s_group_info; // 组信息
+	struct inode *s_buddy_cache; // buddy的inode
 	spinlock_t s_md_lock;
-	unsigned short *s_mb_offsets;
-	unsigned int *s_mb_maxs;
-	unsigned int s_group_info_size;
+	unsigned short *s_mb_offsets; // 每个buddy的偏移
+	unsigned int *s_mb_maxs; // 每个buddy的最大值
+	unsigned int s_group_info_size; // 组信息大小
 	unsigned int s_mb_free_pending;
 	struct list_head s_freed_data_list;	/* List of blocks to be freed
 						   after commit completed */
@@ -106,7 +106,7 @@ struct ext4_sb_info {
 	unsigned int s_mb_prefetch;
 	unsigned int s_mb_prefetch_limit;
 
-	/* stats for buddy allocator */
+	/* buddy分配器的状态 */
 	atomic_t s_bal_reqs;	/* number of reqs with len > 1 */
 	atomic_t s_bal_success;	/* we found long enough chunks */
 	atomic_t s_bal_allocated;	/* in blocks */
@@ -132,7 +132,9 @@ struct ext4_sb_info {
 	/* the size of zero-out chunk */
 	unsigned int s_extent_max_zeroout_kb;
 
+	// 每个flex里组的数量的幂
 	unsigned int s_log_groups_per_flex;
+	// flex数量
 	struct flex_groups * __rcu *s_flex_groups;
 	ext4_group_t s_flex_groups_allocated;
 
@@ -159,16 +161,16 @@ struct ext4_sb_info {
 	/* Precomputed FS UUID checksum for seeding other checksums */
 	__u32 s_csum_seed;
 
-	/* Reclaim extents from extent status tree */
+	/* 从extents状态树回收资源 */
 	struct shrinker s_es_shrinker;
-	struct list_head s_es_list;	/* List of inodes with reclaimable extents */
+	struct list_head s_es_list;	// 有可回收extent的索引结点列表
 	long s_es_nr_inode;
 	struct ext4_es_stats s_es_stats;
 	struct mb_cache *s_ea_block_cache;
 	struct mb_cache *s_ea_inode_cache;
 	spinlock_t s_es_lock ____cacheline_aligned_in_smp;
 
-	/* Ratelimit ext4 messages. */
+	/* 消息频率限制 */
 	struct ratelimit_state s_err_ratelimit_state;
 	struct ratelimit_state s_warning_ratelimit_state;
 	struct ratelimit_state s_msg_ratelimit_state;
@@ -217,7 +219,138 @@ struct ext4_sb_info {
 #ifdef CONFIG_EXT4_DEBUG
 	int s_fc_debug_max_replay;
 #endif
+	// replay状态
 	struct ext4_fc_replay_state s_fc_replay_state;
+};
+
+struct ext4_super_block {
+/*00*/	__le32	s_inodes_count;		/* Inodes count */
+	__le32	s_blocks_count_lo;	/* Blocks count */
+	__le32	s_r_blocks_count_lo;	/* Reserved blocks count */
+	__le32	s_free_blocks_count_lo;	/* Free blocks count */
+/*10*/	__le32	s_free_inodes_count;	/* Free inodes count */
+	__le32	s_first_data_block;	/* First Data Block */
+	__le32	s_log_block_size;	/* Block size */
+	__le32	s_log_cluster_size;	/* Allocation cluster size */
+/*20*/	__le32	s_blocks_per_group;	/* # Blocks per group */
+	__le32	s_clusters_per_group;	/* # Clusters per group */
+	__le32	s_inodes_per_group;	/* # Inodes per group */
+	__le32	s_mtime;		/* Mount time */
+/*30*/	__le32	s_wtime;		/* Write time */
+	__le16	s_mnt_count;		/* Mount count */
+	__le16	s_max_mnt_count;	/* Maximal mount count */
+	__le16	s_magic;		/* Magic signature */
+	__le16	s_state;		/* File system state */
+	__le16	s_errors;		/* Behaviour when detecting errors */
+	__le16	s_minor_rev_level;	/* minor revision level */
+/*40*/	__le32	s_lastcheck;		/* time of last check */
+	__le32	s_checkinterval;	/* max. time between checks */
+	__le32	s_creator_os;		/* OS */
+	__le32	s_rev_level;		/* Revision level */
+/*50*/	__le16	s_def_resuid;		/* Default uid for reserved blocks */
+	__le16	s_def_resgid;		/* Default gid for reserved blocks */
+	/*
+	 * These fields are for EXT4_DYNAMIC_REV superblocks only.
+	 *
+	 * Note: the difference between the compatible feature set and
+	 * the incompatible feature set is that if there is a bit set
+	 * in the incompatible feature set that the kernel doesn't
+	 * know about, it should refuse to mount the filesystem.
+	 *
+	 * e2fsck's requirements are more strict; if it doesn't know
+	 * about a feature in either the compatible or incompatible
+	 * feature set, it must abort and not try to meddle with
+	 * things it doesn't understand...
+	 */
+	__le32	s_first_ino;		/* First non-reserved inode */
+	__le16  s_inode_size;		/* size of inode structure */
+	__le16	s_block_group_nr;	/* block group # of this superblock */
+	__le32	s_feature_compat;	/* compatible feature set */
+/*60*/	__le32	s_feature_incompat;	/* incompatible feature set */
+	__le32	s_feature_ro_compat;	/* readonly-compatible feature set */
+/*68*/	__u8	s_uuid[16];		/* 128-bit uuid for volume */
+/*78*/	char	s_volume_name[16];	/* volume name */
+/*88*/	char	s_last_mounted[64] __nonstring;	/* directory where last mounted */
+/*C8*/	__le32	s_algorithm_usage_bitmap; /* For compression */
+	/*
+	 * Performance hints.  Directory preallocation should only
+	 * happen if the EXT4_FEATURE_COMPAT_DIR_PREALLOC flag is on.
+	 */
+	__u8	s_prealloc_blocks;	/* Nr of blocks to try to preallocate*/
+	__u8	s_prealloc_dir_blocks;	/* Nr to preallocate for dirs */
+	__le16	s_reserved_gdt_blocks;	/* Per group desc for online growth */
+	/*
+	 * Journaling support valid if EXT4_FEATURE_COMPAT_HAS_JOURNAL set.
+	 */
+/*D0*/	__u8	s_journal_uuid[16];	/* uuid of journal superblock */
+/*E0*/	__le32	s_journal_inum;		/* inode number of journal file */
+	__le32	s_journal_dev;		/* device number of journal file */
+	__le32	s_last_orphan;		/* start of list of inodes to delete */
+	__le32	s_hash_seed[4];		/* HTREE hash seed */
+	__u8	s_def_hash_version;	/* Default hash version to use */
+	__u8	s_jnl_backup_type;
+	__le16  s_desc_size;		/* size of group descriptor */
+/*100*/	__le32	s_default_mount_opts;
+	__le32	s_first_meta_bg;	/* First metablock block group */
+	__le32	s_mkfs_time;		/* When the filesystem was created */
+	__le32	s_jnl_blocks[17];	/* Backup of the journal inode */
+	/* 64bit support valid if EXT4_FEATURE_COMPAT_64BIT */
+/*150*/	__le32	s_blocks_count_hi;	/* Blocks count */
+	__le32	s_r_blocks_count_hi;	/* Reserved blocks count */
+	__le32	s_free_blocks_count_hi;	/* Free blocks count */
+	__le16	s_min_extra_isize;	/* All inodes have at least # bytes */
+	__le16	s_want_extra_isize; 	/* New inodes should reserve # bytes */
+	__le32	s_flags;		/* Miscellaneous flags */
+	__le16  s_raid_stride;		/* RAID stride */
+	__le16  s_mmp_update_interval;  /* # seconds to wait in MMP checking */
+	__le64  s_mmp_block;            /* Block for multi-mount protection */
+	__le32  s_raid_stripe_width;    /* blocks on all data disks (N*stride)*/
+	__u8	s_log_groups_per_flex;  /* FLEX_BG group size */
+	__u8	s_checksum_type;	/* metadata checksum algorithm used */
+	__u8	s_encryption_level;	/* versioning level for encryption */
+	__u8	s_reserved_pad;		/* Padding to next 32bits */
+	__le64	s_kbytes_written;	/* nr of lifetime kilobytes written */
+	__le32	s_snapshot_inum;	/* Inode number of active snapshot */
+	__le32	s_snapshot_id;		/* sequential ID of active snapshot */
+	__le64	s_snapshot_r_blocks_count; /* reserved blocks for active
+					      snapshot's future use */
+	__le32	s_snapshot_list;	/* inode number of the head of the
+					   on-disk snapshot list */
+#define EXT4_S_ERR_START offsetof(struct ext4_super_block, s_error_count)
+	__le32	s_error_count;		/* number of fs errors */
+	__le32	s_first_error_time;	/* first time an error happened */
+	__le32	s_first_error_ino;	/* inode involved in first error */
+	__le64	s_first_error_block;	/* block involved of first error */
+	__u8	s_first_error_func[32] __nonstring;	/* function where the error happened */
+	__le32	s_first_error_line;	/* line number where error happened */
+	__le32	s_last_error_time;	/* most recent time of an error */
+	__le32	s_last_error_ino;	/* inode involved in last error */
+	__le32	s_last_error_line;	/* line number where error happened */
+	__le64	s_last_error_block;	/* block involved of last error */
+	__u8	s_last_error_func[32] __nonstring;	/* function where the error happened */
+#define EXT4_S_ERR_END offsetof(struct ext4_super_block, s_mount_opts)
+	__u8	s_mount_opts[64];
+	__le32	s_usr_quota_inum;	/* inode for tracking user quota */
+	__le32	s_grp_quota_inum;	/* inode for tracking group quota */
+	__le32	s_overhead_clusters;	/* overhead blocks/clusters in fs */
+	__le32	s_backup_bgs[2];	/* groups with sparse_super2 SBs */
+	__u8	s_encrypt_algos[4];	/* Encryption algorithms in use  */
+	__u8	s_encrypt_pw_salt[16];	/* Salt used for string2key algorithm */
+	__le32	s_lpf_ino;		/* Location of the lost+found inode */
+	__le32	s_prj_quota_inum;	/* inode for tracking project quota */
+	__le32	s_checksum_seed;	/* crc32c(uuid) if csum_seed set */
+	__u8	s_wtime_hi;
+	__u8	s_mtime_hi;
+	__u8	s_mkfs_time_hi;
+	__u8	s_lastcheck_hi;
+	__u8	s_first_error_time_hi;
+	__u8	s_last_error_time_hi;
+	__u8	s_first_error_errcode;
+	__u8    s_last_error_errcode;
+	__le16  s_encoding;		/* Filename charset encoding */
+	__le16  s_encoding_flags;	/* Filename charset encoding flags */
+	__le32	s_reserved[95];		/* Padding to the end of the block */
+	__le32	s_checksum;		/* crc32c(superblock) */
 };
 ```
 ## ext4_mount
@@ -232,6 +365,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 {
 	// dax设备
 	struct dax_device *dax_dev = fs_dax_get_by_bdev(sb->s_bdev);
+	// 用户传下来的挂载数据
 	char *orig_data = kstrdup(data, GFP_KERNEL);
 	struct buffer_head *bh, **group_desc;
 	struct ext4_super_block *es = NULL;
@@ -274,22 +408,22 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 
 	// 预读块数量，EXT4_DEF_INODE_READAHEAD_BLKS=32
 	sbi->s_inode_readahead_blks = EXT4_DEF_INODE_READAHEAD_BLKS;
-	// 设置超级块序号
+	// 设置超级块块号
 	sbi->s_sb_block = sb_block;
 	// todo: what?
 	if (sb->s_bdev->bd_part)
 		sbi->s_sectors_written_start =
 			part_stat_read(sb->s_bdev->bd_part, sectors[STAT_WRITE]);
 
-	// 起名字里的 / 替换成 !，todo: 为什么要替换
+	// 将名字里的 / 替换成 !, 因为 '/' 是路径的分隔符
 	strreplace(sb->s_id, '/', '!');
 
 	/* -EINVAL is default */
 	ret = -EINVAL;
-	// 获取最小块大小，最小不能超过EXT4_DEF_INODE_READAHEAD_BLKS(1024)
+	// 获取设备的最小块大小，最小不能超过EXT4_MIN_BLOCK_SIZE(1024)
 	blocksize = sb_min_blocksize(sb, EXT4_MIN_BLOCK_SIZE);
 
-	// 设置失败
+	// 返回0是设置失败
 	if (!blocksize) {
 		ext4_msg(sb, KERN_ERR, "unable to set blocksize");
 		goto out_fail;
@@ -297,12 +431,13 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 
 	// 如果不是最小值，则重新计算超级块序号
 	if (blocksize != EXT4_MIN_BLOCK_SIZE) {
-		// 基于最小块大小的长度
+		// 基于最小块大小的起点
 		logical_sb_block = sb_block * EXT4_MIN_BLOCK_SIZE;
-		// 计算块序号和块内的偏移，do_div修改2个值：
-		// 1. logical_sb_block /= blocksize。2. offset = logical_sb_block % blocksize
+		// 计算blocksize下的块序号和块内的偏移，do_div修改2个值：
+		// 1. logical_sb_block /= blocksize. 2. offset = logical_sb_block % blocksize
 		offset = do_div(logical_sb_block, blocksize);
 	} else {
+		// 否则就等于之前的块号
 		logical_sb_block = sb_block;
 	}
 
@@ -321,7 +456,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	// 魔数不相等就错了，EXT2/3/4的魔数都是0xEF53
 	if (sb->s_magic != EXT4_SUPER_MAGIC)
 		goto cantfind_ext4;
-	// todo: 这个变量是什么？
+	// 已写入kb数量
 	sbi->s_kbytes_written = le64_to_cpu(es->s_kbytes_written);
 
 	// 元数据校验和gdt校验不能同时设置
