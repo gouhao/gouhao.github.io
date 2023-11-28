@@ -353,7 +353,7 @@ struct ext4_super_block {
 	__le32	s_checksum;		/* crc32c(superblock) */
 };
 ```
-## ext4_mount
+## 2. ext4_mount
 ```c
 static struct dentry *ext4_mount(struct file_system_type *fs_type, int flags,
 		       const char *dev_name, void *data)
@@ -505,7 +505,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	// 是否调试
 	if (def_mount_opts & EXT4_DEFM_DEBUG)
 		set_opt(sb, DEBUG);
-	// what?
+	// bsd group?
 	if (def_mount_opts & EXT4_DEFM_BSDGROUPS)
 		set_opt(sb, GRPID);
 	// 16位uid？
@@ -513,14 +513,14 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		set_opt(sb, NO_UID32);
 	// 默认支持扩展属性
 	set_opt(sb, XATTR_USER);
-	// 默认支持acl
+	// 支持acl
 #ifdef CONFIG_EXT4_FS_POSIX_ACL
 	set_opt(sb, POSIX_ACL);
 #endif
 	// 日志快速提交
 	if (ext4_has_feature_fast_commit(sb))
 		set_opt2(sb, JOURNAL_FAST_COMMIT);
-	// 当元数据检验开启的时候，要开启日志校验
+	// 当元数据检验开启的时候，日志校验也要开启
 	if (ext4_has_metadata_csum(sb))
 		set_opt(sb, JOURNAL_CHECKSUM);
 
@@ -548,14 +548,14 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	// fs的主人
 	sbi->s_resuid = make_kuid(&init_user_ns, le16_to_cpu(es->s_def_resuid));
 	sbi->s_resgid = make_kgid(&init_user_ns, le16_to_cpu(es->s_def_resgid));
-	// 提交间隔5秒。
+	// 日志提交间隔5秒。
 	sbi->s_commit_interval = JBD2_DEFAULT_MAX_COMMIT_AGE * HZ;
 	// 最小批量时间0
 	sbi->s_min_batch_time = EXT4_DEF_MIN_BATCH_TIME;
 	// 最大批量时间15毫秒
 	sbi->s_max_batch_time = EXT4_DEF_MAX_BATCH_TIME;
 
-	// todo: 没有栅栏
+	// 没有内存屏障
 	if ((def_mount_opts & EXT4_DEFM_NOBARRIER) == 0)
 		set_opt(sb, BARRIER);
 
@@ -594,7 +594,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	// 逻辑块里的块大小
 	blocksize = EXT4_MIN_BLOCK_SIZE << le32_to_cpu(es->s_log_block_size);
 
-	// 等于块大小的时候，dio读不用加锁？
+	// 页大小等于块大小的时候，dio读不用加锁？
 	if (blocksize == PAGE_SIZE)
 		set_opt(sb, DIOREAD_NOLOCK);
 
@@ -629,7 +629,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 			goto failed_mount;
 		}
 		// 检查inode的大小能否能存的下最后一个字段。
-		// todo: 最后一个字段是i_crtime_extra呀
+		// todo: 最后一个字段是i_projid
 		if (sbi->s_inode_size >= offsetof(struct ext4_inode, i_atime_extra) +
 			sizeof(((struct ext4_inode *)0)->i_atime_extra)) {
 			// 每秒的时间间隔？
@@ -648,7 +648,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 
 	// inode_size > 128
 	if (sbi->s_inode_size > EXT4_GOOD_OLD_INODE_SIZE) {
-		// 额外需要的空间
+		// 需要的额外空间大小
 		sbi->s_want_extra_isize = sizeof(struct ext4_inode) -
 			EXT4_GOOD_OLD_INODE_SIZE;
 		// 有extra_size特性
@@ -689,7 +689,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 					      GFP_KERNEL);
 		if (!s_mount_opts)
 			goto failed_mount;
-		// todo: 解析参数后面再看
+		// 解析盘上的挂载选项
 		if (!parse_options(s_mount_opts, sb, &journal_devnum,
 				   &journal_ioprio, 0)) {
 			ext4_msg(sb, KERN_WARNING,
@@ -743,13 +743,14 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	}
 #endif
 
-	// 使用 data=journal挂载.todo：这个挂载什么意思
 	if (test_opt(sb, DATA_FLAGS) == EXT4_MOUNT_JOURNAL_DATA) {
+		// 使用 data=journal挂载. 所有数据(data+meta)写入文件系统前先写入日志
+
 		printk_once(KERN_WARNING "EXT4-fs: Warning: mounting with data=journal disables delayed allocation, dioread_nolock, O_DIRECT and fast_commit support!\n");
 		// dioread_noblock与fast_commit与它data=journal共存
 		clear_opt(sb, DIOREAD_NOLOCK);
 		clear_opt2(sb, JOURNAL_FAST_COMMIT);
-		// 不能有直接延迟分配?todo:what?
+		// 不能有直接延迟分配
 		if (test_opt2(sb, EXPLICIT_DELALLOC)) {
 			ext4_msg(sb, KERN_ERR, "can't mount with "
 				 "both data=journal and delalloc");
@@ -771,7 +772,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		if (test_opt(sb, DELALLOC))
 			clear_opt(sb, DELALLOC);
 	} else {
-		// cg writeback?
+		// ordered和writeback日志模式
 		sb->s_iflags |= SB_I_CGROUPWB;
 	}
 
@@ -788,7 +789,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		       "feature flags set on rev 0 fs, "
 		       "running e2fsck is recommended");
 
-	// hurd操作系统。todo： 暂时不看
+	// hurd操作系统, 暂时不看
 	if (es->s_creator_os == cpu_to_le32(EXT4_OS_HURD)) {
 		set_opt2(sb, HURD_COMPAT);
 		if (ext4_has_feature_64bit(sb)) {
@@ -920,7 +921,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 
 	// 有巨文件特性
 	has_huge_files = ext4_has_feature_huge_file(sb);
-	// 
+	// 位图最大大小
 	sbi->s_bitmap_maxbytes = ext4_max_bitmap_size(sb->s_blocksize_bits,
 						      has_huge_files);
 	// 算出位置最大长度？
@@ -955,7 +956,8 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	// 一个块连一个inode都存不下！！
 	if (sbi->s_inodes_per_block == 0)
 		goto cantfind_ext4;
-	// 组inode数不能小于块inode数 || 组inode数大于8倍的块大小，则无效。why?
+	// 组inode数不能小于块inode数 || 组inode数大于8倍的块大小，则无效。
+	// 因为inode位图只有一个块,最多能记录(blocksize * 8)个位
 	if (sbi->s_inodes_per_group < sbi->s_inodes_per_block ||
 	    sbi->s_inodes_per_group > blocksize * 8) {
 		ext4_msg(sb, KERN_ERR, "invalid inodes per group: %lu\n",
@@ -967,10 +969,10 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->s_itb_per_group = sbi->s_inodes_per_group /
 					sbi->s_inodes_per_block;
 	// 每个块里组描述符的数量
-	sbi->s_desc_per_block = blocksize / EXT4_DESC_SIZE(sb);
+	s bi->s_desc_per_block = blocksize / EXT4_DESC_SIZE(sb);
 	// 记录超级块的bh
 	sbi->s_sbh = bh;
-	// 挂载状态？
+	// 挂载状态
 	sbi->s_mount_state = le16_to_cpu(es->s_state);
 	// 每个块能存放的地址数（2的幂）
 	sbi->s_addr_per_block_bits = ilog2(EXT4_ADDR_PER_BLOCK(sb));
@@ -982,7 +984,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		sbi->s_hash_seed[i] = le32_to_cpu(es->s_hash_seed[i]);
 	// 哈希版本
 	sbi->s_def_hash_version = es->s_def_hash_version;
-	// 目录索引？todo: what?
+	// 有目录索引特性, 计算s_hash_unsigned值
 	if (ext4_has_feature_dir_index(sb)) {
 		i = le32_to_cpu(es->s_flags);
 		if (i & EXT2_FLAGS_UNSIGNED_HASH)
@@ -1001,7 +1003,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		}
 	}
 
-	// 簇大小
+	// 簇大小, 目前ext4都是以cluster为块分配的最小单位
 	clustersize = BLOCK_SIZE << le32_to_cpu(es->s_log_cluster_size);
 
 	// 大分配
@@ -1019,7 +1021,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		// 每个组的簇数
 		sbi->s_clusters_per_group =
 			le32_to_cpu(es->s_clusters_per_group);
-		// 每个组的簇数不能大于8倍的块大小，因为每个簇的使用只用一个块来存储
+		// 每个组的簇数不能大于8倍的块大小，因为每个组的使用只用一个块来存储位图
 		if (sbi->s_clusters_per_group > blocksize * 8) {
 			ext4_msg(sb, KERN_ERR,
 				 "#clusters per group too big: %lu",
@@ -1055,7 +1057,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		// 簇数量的2的幂
 		sbi->s_cluster_bits = 0;
 	}
-	// 簇的比例
+	// 簇与块的比例
 	sbi->s_cluster_ratio = clustersize / blocksize;
 
 	// 每组块数和簇的数量相等，则是标准的组大小
@@ -1724,3 +1726,15 @@ out_free_base:
 	return err ? err : ret;
 }
 ```
+1. 确定起始块号, 并读出超级块
+2. 检查元数据校验和特性, 加载相关驱动, 校验超级块的检验和
+3. 根据es里的一些选项, 设置默认选项
+4. 设置uid/gid, 块大小, cluster大小等
+5. 确定inode-size和第一个ino, time_gran等信息,计算额外空间
+6. 参数解析, 先解析盘上的,再解析用户传下来的
+7. 处理unicode
+8. 打开journal日志模式时,要关闭一些特性
+9. 如果挂载的是ext2/3, 则检查是否有不兼容的特性
+10. 如果之前的块大小和实际读出来的块大小不一致,则需要重读一次超级块
+11. 设置sbi里的相关字段
+12. 确定cluster的大小
