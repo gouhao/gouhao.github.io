@@ -1501,7 +1501,7 @@ no_journal:
 	ext4_fc_replay_cleanup(sb);
 	// 初始化extent
 	ext4_ext_init(sb);
-	// 初始化mb，todo: what is mb
+	// 初始化buddy分配器
 	err = ext4_mb_init(sb);
 	if (err) {
 		ext4_msg(sb, KERN_ERR, "failed to initialize mballoc (%d)",
@@ -1521,7 +1521,7 @@ no_journal:
 	
 	// 设置校验和
 	ext4_superblock_csum_set(sb);
-	// 空闲簇的数量
+	// percpu空闲块的数量
 	err = percpu_counter_init(&sbi->s_freeclusters_counter, block,
 				  GFP_KERNEL);
 	if (!err) {
@@ -1537,7 +1537,7 @@ no_journal:
 	if (!err)
 		err = percpu_counter_init(&sbi->s_dirs_counter,
 					  ext4_count_dirs(sb), GFP_KERNEL);
-	// 脏簇数量
+	// 脏cluster数量
 	if (!err)
 		err = percpu_counter_init(&sbi->s_dirtyclusters_counter, 0,
 					  GFP_KERNEL);
@@ -1545,6 +1545,7 @@ no_journal:
 	if (!err)
 		err = percpu_counter_init(&sbi->s_sra_exceeded_retry_limit, 0,
 					  GFP_KERNEL);
+	// writepage时的信号量
 	if (!err)
 		err = percpu_init_rwsem(&sbi->s_writepages_rwsem);
 
@@ -1592,11 +1593,11 @@ no_journal:
 	// 超级块引用
 	sb->s_bdev->bd_super = sb;
 
-	// 处理孤儿相关
+	// 处理孤儿文件
 	EXT4_SB(sb)->s_mount_state |= EXT4_ORPHAN_FS;
 	ext4_orphan_cleanup(sb, es);
 	EXT4_SB(sb)->s_mount_state &= ~EXT4_ORPHAN_FS;
-	// 设置恢复完成
+	// 如果需要恢复, 经过上面的ext4_orphan_cleanup之后,设置恢复完成
 	if (needs_recovery) {
 		ext4_msg(sb, KERN_INFO, "recovery complete");
 		err = ext4_mark_recovery_complete(sb, es);
@@ -1748,7 +1749,14 @@ out_free_base:
 16. 加载journal日志，设置日志校验和，对日志的一些特性做检查
 17. 获取根结点inode，创建dentry，设置超级块
 18. 设置预留块
-19. 初始化extent, multi-block分配器
+19. 初始化extent
+20. 初始化buddy分配器
+21. 计算空闲块, 设置校验和, 计算空闲inode数量
+22. 初始化灵活组信息
+23. 注册li请求, sysfs, 设置超级块引用
+24. 清理孤儿文件
+25. 如果有discard特性, 则判断设备是否支持
+26. 初始化消息打印频率, 错误上报时间等
 
 
 ## 2. ext4_setup_super
@@ -1809,10 +1817,7 @@ done:
 	cleancache_init_fs(sb);
 	return err;
 }
-```
 
-
-```c
 void ext4_ext_init(struct super_block *sb)
 {
 	/*
@@ -1839,5 +1844,309 @@ void ext4_ext_init(struct super_block *sb)
 		EXT4_SB(sb)->s_ext_max = 0;
 #endif
 	}
+}
+
+ext4_fsblk_t ext4_count_free_clusters(struct super_block *sb)
+{
+	ext4_fsblk_t desc_count;
+	struct ext4_group_desc *gdp;
+	ext4_group_t i;
+	ext4_group_t ngroups = ext4_get_groups_count(sb);
+	struct ext4_group_info *grp;
+#ifdef EXT4FS_DEBUG
+	struct ext4_super_block *es;
+	ext4_fsblk_t bitmap_count;
+	unsigned int x;
+	struct buffer_head *bitmap_bh = NULL;
+
+	es = EXT4_SB(sb)->s_es;
+	desc_count = 0;
+	bitmap_count = 0;
+	gdp = NULL;
+
+	for (i = 0; i < ngroups; i++) {
+		gdp = ext4_get_group_desc(sb, i, NULL);
+		if (!gdp)
+			continue;
+		grp = NULL;
+		if (EXT4_SB(sb)->s_group_info)
+			grp = ext4_get_group_info(sb, i);
+		if (!grp || !EXT4_MB_GRP_BBITMAP_CORRUPT(grp))
+			desc_count += ext4_free_group_clusters(sb, gdp);
+		brelse(bitmap_bh);
+		bitmap_bh = ext4_read_block_bitmap(sb, i);
+		if (IS_ERR(bitmap_bh)) {
+			bitmap_bh = NULL;
+			continue;
+		}
+
+		x = ext4_count_free(bitmap_bh->b_data,
+				    EXT4_CLUSTERS_PER_GROUP(sb) / 8);
+		printk(KERN_DEBUG "group %u: stored = %d, counted = %u\n",
+			i, ext4_free_group_clusters(sb, gdp), x);
+		bitmap_count += x;
+	}
+	brelse(bitmap_bh);
+	printk(KERN_DEBUG "ext4_count_free_clusters: stored = %llu"
+	       ", computed = %llu, %llu\n",
+	       EXT4_NUM_B2C(EXT4_SB(sb), ext4_free_blocks_count(es)),
+	       desc_count, bitmap_count);
+	return bitmap_count;
+#else
+	desc_count = 0;
+	for (i = 0; i < ngroups; i++) {
+		gdp = ext4_get_group_desc(sb, i, NULL);
+		if (!gdp)
+			continue;
+		grp = NULL;
+		if (EXT4_SB(sb)->s_group_info)
+			grp = ext4_get_group_info(sb, i);
+		if (!grp || !EXT4_MB_GRP_BBITMAP_CORRUPT(grp))
+			desc_count += ext4_free_group_clusters(sb, gdp);
+	}
+
+	return desc_count;
+#endif
+}
+
+int ext4_register_li_request(struct super_block *sb,
+			     ext4_group_t first_not_zeroed)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct ext4_li_request *elr = NULL;
+	ext4_group_t ngroups = sbi->s_groups_count;
+	int ret = 0;
+
+	mutex_lock(&ext4_li_mtx);
+	if (sbi->s_li_request != NULL) {
+		/*
+		 * Reset timeout so it can be computed again, because
+		 * s_li_wait_mult might have changed.
+		 */
+		sbi->s_li_request->lr_timeout = 0;
+		goto out;
+	}
+
+	if (!test_opt(sb, PREFETCH_BLOCK_BITMAPS) &&
+	    (first_not_zeroed == ngroups || sb_rdonly(sb) ||
+	     !test_opt(sb, INIT_INODE_TABLE)))
+		goto out;
+
+	elr = ext4_li_request_new(sb, first_not_zeroed);
+	if (!elr) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (NULL == ext4_li_info) {
+		ret = ext4_li_info_new();
+		if (ret)
+			goto out;
+	}
+
+	mutex_lock(&ext4_li_info->li_list_mtx);
+	list_add(&elr->lr_request, &ext4_li_info->li_request_list);
+	mutex_unlock(&ext4_li_info->li_list_mtx);
+
+	sbi->s_li_request = elr;
+	/*
+	 * set elr to NULL here since it has been inserted to
+	 * the request_list and the removal and free of it is
+	 * handled by ext4_clear_request_list from now on.
+	 */
+	elr = NULL;
+
+	if (!(ext4_li_info->li_state & EXT4_LAZYINIT_RUNNING)) {
+		ret = ext4_run_lazyinit_thread();
+		if (ret)
+			goto out;
+	}
+out:
+	mutex_unlock(&ext4_li_mtx);
+	if (ret)
+		kfree(elr);
+	return ret;
+}
+
+static int ext4_fill_flex_info(struct super_block *sb)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct ext4_group_desc *gdp = NULL;
+	struct flex_groups *fg;
+	ext4_group_t flex_group;
+	int i, err;
+
+	sbi->s_log_groups_per_flex = sbi->s_es->s_log_groups_per_flex;
+	if (sbi->s_log_groups_per_flex < 1 || sbi->s_log_groups_per_flex > 31) {
+		sbi->s_log_groups_per_flex = 0;
+		return 1;
+	}
+
+	err = ext4_alloc_flex_bg_array(sb, sbi->s_groups_count);
+	if (err)
+		goto failed;
+
+	for (i = 0; i < sbi->s_groups_count; i++) {
+		gdp = ext4_get_group_desc(sb, i, NULL);
+
+		flex_group = ext4_flex_group(sbi, i);
+		fg = sbi_array_rcu_deref(sbi, s_flex_groups, flex_group);
+		atomic_add(ext4_free_inodes_count(sb, gdp), &fg->free_inodes);
+		atomic64_add(ext4_free_group_clusters(sb, gdp),
+			     &fg->free_clusters);
+		atomic_add(ext4_used_dirs_count(sb, gdp), &fg->used_dirs);
+	}
+
+	return 1;
+failed:
+	return 0;
+}
+```
+
+```c
+static void ext4_orphan_cleanup(struct super_block *sb,
+				struct ext4_super_block *es)
+{
+	unsigned int s_flags = sb->s_flags;
+	int ret, nr_orphans = 0, nr_truncates = 0;
+#ifdef CONFIG_QUOTA
+	int quota_update = 0;
+	int i;
+#endif
+	if (!es->s_last_orphan) {
+		jbd_debug(4, "no orphan inodes to clean up\n");
+		return;
+	}
+
+	if (bdev_read_only(sb->s_bdev)) {
+		ext4_msg(sb, KERN_ERR, "write access "
+			"unavailable, skipping orphan cleanup");
+		return;
+	}
+
+	/* Check if feature set would not allow a r/w mount */
+	if (!ext4_feature_set_ok(sb, 0)) {
+		ext4_msg(sb, KERN_INFO, "Skipping orphan cleanup due to "
+			 "unknown ROCOMPAT features");
+		return;
+	}
+
+	if (EXT4_SB(sb)->s_mount_state & EXT4_ERROR_FS) {
+		/* don't clear list on RO mount w/ errors */
+		if (es->s_last_orphan && !(s_flags & SB_RDONLY)) {
+			ext4_msg(sb, KERN_INFO, "Errors on filesystem, "
+				  "clearing orphan list.\n");
+			es->s_last_orphan = 0;
+		}
+		jbd_debug(1, "Skipping orphan recovery on fs with errors.\n");
+		return;
+	}
+
+	if (s_flags & SB_RDONLY) {
+		ext4_msg(sb, KERN_INFO, "orphan cleanup on readonly fs");
+		sb->s_flags &= ~SB_RDONLY;
+	}
+#ifdef CONFIG_QUOTA
+	/*
+	 * Turn on quotas which were not enabled for read-only mounts if
+	 * filesystem has quota feature, so that they are updated correctly.
+	 */
+	if (ext4_has_feature_quota(sb) && (s_flags & SB_RDONLY)) {
+		int ret = ext4_enable_quotas(sb);
+
+		if (!ret)
+			quota_update = 1;
+		else
+			ext4_msg(sb, KERN_ERR,
+				"Cannot turn on quotas: error %d", ret);
+	}
+
+	/* Turn on journaled quotas used for old sytle */
+	for (i = 0; i < EXT4_MAXQUOTAS; i++) {
+		if (EXT4_SB(sb)->s_qf_names[i]) {
+			int ret = ext4_quota_on_mount(sb, i);
+
+			if (!ret)
+				quota_update = 1;
+			else
+				ext4_msg(sb, KERN_ERR,
+					"Cannot turn on journaled "
+					"quota: type %d: error %d", i, ret);
+		}
+	}
+#endif
+
+	while (es->s_last_orphan) {
+		struct inode *inode;
+
+		/*
+		 * We may have encountered an error during cleanup; if
+		 * so, skip the rest.
+		 */
+		if (EXT4_SB(sb)->s_mount_state & EXT4_ERROR_FS) {
+			jbd_debug(1, "Skipping orphan recovery on fs with errors.\n");
+			es->s_last_orphan = 0;
+			break;
+		}
+
+		inode = ext4_orphan_get(sb, le32_to_cpu(es->s_last_orphan));
+		if (IS_ERR(inode)) {
+			es->s_last_orphan = 0;
+			break;
+		}
+
+		list_add(&EXT4_I(inode)->i_orphan, &EXT4_SB(sb)->s_orphan);
+		dquot_initialize(inode);
+		if (inode->i_nlink) {
+			if (test_opt(sb, DEBUG))
+				ext4_msg(sb, KERN_DEBUG,
+					"%s: truncating inode %lu to %lld bytes",
+					__func__, inode->i_ino, inode->i_size);
+			jbd_debug(2, "truncating inode %lu to %lld bytes\n",
+				  inode->i_ino, inode->i_size);
+			inode_lock(inode);
+			truncate_inode_pages(inode->i_mapping, inode->i_size);
+			ret = ext4_truncate(inode);
+			if (ret) {
+				/*
+				 * We need to clean up the in-core orphan list
+				 * manually if ext4_truncate() failed to get a
+				 * transaction handle.
+				 */
+				ext4_orphan_del(NULL, inode);
+				ext4_std_error(inode->i_sb, ret);
+			}
+			inode_unlock(inode);
+			nr_truncates++;
+		} else {
+			if (test_opt(sb, DEBUG))
+				ext4_msg(sb, KERN_DEBUG,
+					"%s: deleting unreferenced inode %lu",
+					__func__, inode->i_ino);
+			jbd_debug(2, "deleting unreferenced inode %lu\n",
+				  inode->i_ino);
+			nr_orphans++;
+		}
+		iput(inode);  /* The delete magic happens here! */
+	}
+
+#define PLURAL(x) (x), ((x) == 1) ? "" : "s"
+
+	if (nr_orphans)
+		ext4_msg(sb, KERN_INFO, "%d orphan inode%s deleted",
+		       PLURAL(nr_orphans));
+	if (nr_truncates)
+		ext4_msg(sb, KERN_INFO, "%d truncate%s cleaned up",
+		       PLURAL(nr_truncates));
+#ifdef CONFIG_QUOTA
+	/* Turn off quotas if they were enabled for orphan cleanup */
+	if (quota_update) {
+		for (i = 0; i < EXT4_MAXQUOTAS; i++) {
+			if (sb_dqopt(sb)->files[i])
+				dquot_quota_off(sb, i);
+		}
+	}
+#endif
+	sb->s_flags = s_flags; /* Restore SB_RDONLY status */
 }
 ```

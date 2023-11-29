@@ -93,9 +93,8 @@ noinline int __add_to_page_cache_locked(struct page *page,
 	gfp &= GFP_RECLAIM_MASK;
 
 	// 把 page插入 address_space的xarray中
-	// todo: xarray没仔细研究
 	do {
-		// 页大小的order?
+		// 页大小的order
 		unsigned int order = xa_get_order(xas.xa, xas.xa_index);
 		void *entry, *old = NULL;
 
@@ -105,7 +104,7 @@ noinline int __add_to_page_cache_locked(struct page *page,
 					order, gfp);
 		xas_lock_irq(&xas);
 
-		// 查找是否有重复的?
+		// 查找是否有重复的
 		xas_for_each_conflict(&xas, entry) {
 			old = entry;
 			if (!xa_is_value(entry)) {
@@ -114,7 +113,7 @@ noinline int __add_to_page_cache_locked(struct page *page,
 			}
 		}
 
-		// todo: 没看懂
+		// 分割老的页
 		if (old) {
 			if (shadowp)
 				*shadowp = old;
@@ -136,7 +135,7 @@ noinline int __add_to_page_cache_locked(struct page *page,
 		mapping->nrpages++;
 
 		if (!huge)
-			// cgroup相关？
+			// cgroup相关
 			__inc_lruvec_page_state(page, NR_FILE_PAGES);
 unlock:
 		xas_unlock_irq(&xas);
@@ -262,7 +261,7 @@ static void pagevec_lru_move_fn(struct pagevec *pvec,
 	// 遍历page里的每个页
 	for (i = 0; i < pagevec_count(pvec); i++) {
 		struct page *page = pvec->pages[i];
-		// page所有的结点实例
+		// page对应的numa
 		struct pglist_data *pagepgdat = page_pgdat(page);
 
 		// 如果结点实例变化，给新的上锁，解锁旧的
@@ -588,6 +587,46 @@ no_page:
 		if (page && (fgp_flags & FGP_FOR_MMAP))
 			unlock_page(page);
 	}
+
+	return page;
+}
+
+struct page *find_get_entry(struct address_space *mapping, pgoff_t index)
+{
+	XA_STATE(xas, &mapping->i_pages, index);
+	struct page *page;
+
+	rcu_read_lock();
+repeat:
+	xas_reset(&xas);
+
+	// 获取page
+	page = xas_load(&xas);
+	if (xas_retry(&xas, page))
+		goto repeat;
+	/*
+	 * A shadow entry of a recently evicted page, or a swap entry from
+	 * shmem/tmpfs.  Return it without attempting to raise page count.
+	 */
+	if (!page || xa_is_value(page))
+		goto out;
+
+	// 增加引用
+	if (!page_cache_get_speculative(page))
+		goto repeat;
+
+	/*
+	 * Has the page moved or been split?
+	 * This is part of the lockless pagecache protocol. See
+	 * include/linux/pagemap.h for details.
+	 */
+	// page变了
+	if (unlikely(page != xas_reload(&xas))) {
+		put_page(page);
+		goto repeat;
+	}
+out:
+	rcu_read_unlock();
 
 	return page;
 }
@@ -1481,5 +1520,101 @@ static unsigned long get_next_ra_size(struct file_ra_state *ra,
 		return 2 * cur;
 	// 其它情况返回最大值
 	return max;
+}
+```
+
+## delete_from_page_cache
+```c
+void delete_from_page_cache(struct page *page)
+{
+	struct address_space *mapping = page_mapping(page);
+	unsigned long flags;
+
+	// 页必须被锁
+	BUG_ON(!PageLocked(page));
+	// 加锁
+	xa_lock_irqsave(&mapping->i_pages, flags);
+	// 从page_cache里删除
+	__delete_from_page_cache(page, NULL/*这个值是shadow*/);
+	xa_unlock_irqrestore(&mapping->i_pages, flags);
+
+	// 释放页, 如果没人用的话
+	page_cache_free_page(mapping, page);
+}
+
+void __delete_from_page_cache(struct page *page, void *shadow)
+{
+	struct address_space *mapping = page->mapping;
+
+	trace_mm_filemap_delete_from_page_cache(page);
+
+	// 统计相关
+	unaccount_page_cache_page(mapping, page);
+
+	// 从基数树里删除
+	page_cache_delete(mapping, page, shadow);
+}
+
+static void page_cache_delete(struct address_space *mapping,
+				   struct page *page, void *shadow)
+{
+	XA_STATE(xas, &mapping->i_pages, page->index);
+	unsigned int nr = 1;
+
+	// 设置更新函数
+	mapping_set_update(&xas, mapping);
+
+	// 不是大页的话,设置页的order, 大页只保存一个值.
+	if (!PageHuge(page)) {
+		xas_set_order(&xas, page->index, compound_order(page));
+		nr = compound_nr(page);
+	}
+
+	// 错误判断
+	VM_BUG_ON_PAGE(!PageLocked(page), page);
+	VM_BUG_ON_PAGE(PageTail(page), page);
+	VM_BUG_ON_PAGE(nr != 1 && shadow, page);
+
+	// 保存shadow值
+	xas_store(&xas, shadow);
+	xas_init_marks(&xas);
+
+	// 取消mapping引用
+	page->mapping = NULL;
+	/* Leave page->index set: truncation lookup relies upon it */
+
+	if (shadow) {
+		mapping->nrexceptional += nr;
+		/*
+		 * Make sure the nrexceptional update is committed before
+		 * the nrpages update so that final truncate racing
+		 * with reclaim does not see both counters 0 at the
+		 * same time and miss a shadow entry.
+		 */
+		smp_wmb();
+	}
+
+	// 减少mapping里的页数
+	mapping->nrpages -= nr;
+}
+
+static void page_cache_free_page(struct address_space *mapping,
+				struct page *page)
+{
+	void (*freepage)(struct page *);
+
+	// 调用具体文件系统的指针来释放
+	freepage = mapping->a_ops->freepage;
+	if (freepage)
+		freepage(page);
+
+	// 是透明大页 && 不是大页, 减少page引用
+	if (PageTransHuge(page) && !PageHuge(page)) {
+		page_ref_sub(page, thp_nr_pages(page));
+		VM_BUG_ON_PAGE(page_count(page) <= 0, page);
+	} else {
+		// 普通页, 直接释放引用, 如果引用为0, 会归还给buddy
+		put_page(page);
+	}
 }
 ```

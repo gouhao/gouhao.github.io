@@ -15,7 +15,7 @@ int ext4_mb_init(struct super_block *sb)
 	// s_mb_offsets是4倍块大小？
 	i = (sb->s_blocksize_bits + 2) * sizeof(*sbi->s_mb_offsets);
 
-	// 分配空间
+	// 分配空间, offsets里保存的是各buddy的偏移字节数
 	sbi->s_mb_offsets = kmalloc(i, GFP_KERNEL);
 	if (sbi->s_mb_offsets == NULL) {
 		ret = -ENOMEM;
@@ -25,12 +25,14 @@ int ext4_mb_init(struct super_block *sb)
 	// s_mb_maxs是unsigned int *
 	// max的数量
 	i = (sb->s_blocksize_bits + 2) * sizeof(*sbi->s_mb_maxs);
+
+	// mb_maxs里保存的是每个buddy的最大位数
 	sbi->s_mb_maxs = kmalloc(i, GFP_KERNEL);
 	if (sbi->s_mb_maxs == NULL) {
 		ret = -ENOMEM;
 		goto out;
 	}
-	// 创建块大小的slab
+	// 创建groupinfo的slab
 	ret = ext4_groupinfo_create_slab(sb->s_blocksize);
 	if (ret < 0)
 		goto out;
@@ -40,7 +42,7 @@ int ext4_mb_init(struct super_block *sb)
 	sbi->s_mb_maxs[0] = sb->s_blocksize << 3;
 	sbi->s_mb_offsets[0] = 0;
 
-	// 从order1开始
+	// 从order1开始, 0已经初始化了
 	i = 1;
 	offset = 0;
 	// order1的空间为块大小一半
@@ -48,15 +50,15 @@ int ext4_mb_init(struct super_block *sb)
 	// order1的空间只占块的一半，一字节有8位，所以最大值为块大小的4倍
 	max = sb->s_blocksize << 2;
 
-	
+	// 初始化所有buddy的最大值及偏移量
 	do {
 		//  每个order的偏移
 		sbi->s_mb_offsets[i] = offset;
 		// 每个order最朋值
 		sbi->s_mb_maxs[i] = max;
-		// 增加偏移
+		// 下一个buddy的偏移
 		offset += offset_incr;
-		// 偏移值再减半
+		// 下一个buddy偏移的增加值
 		offset_incr = offset_incr >> 1;
 		// 最大值也减半
 		max = max >> 1;
@@ -66,6 +68,7 @@ int ext4_mb_init(struct super_block *sb)
 		// order的不能大于块大小的幂
 	} while (i <= sb->s_blocksize_bits + 1);
 
+	// 各种初始化
 	spin_lock_init(&sbi->s_md_lock);
 	spin_lock_init(&sbi->s_bal_lock);
 	sbi->s_mb_free_pending = 0;
@@ -114,7 +117,7 @@ int ext4_mb_init(struct super_block *sb)
 		goto out;
 	}
 
-	// 初始化每个cpu的s_locality_groups
+	// 初始化每个cpu的s_locality_groups的锁及表头
 	for_each_possible_cpu(i) {
 		struct ext4_locality_group *lg;
 		lg = per_cpu_ptr(sbi->s_locality_groups, i);
@@ -216,7 +219,7 @@ static int ext4_mb_init_backend(struct super_block *sb)
 	// buddy inode不占用磁盘空间
 	EXT4_I(sbi->s_buddy_cache)->i_disksize = 0;
 
-	// 遍历所有组，添加组信息
+	// 遍历所有组，添加组描述符信息
 	for (i = 0; i < ngroups; i++) {
 		cond_resched();
 		// 组描述符
@@ -225,13 +228,14 @@ static int ext4_mb_init_backend(struct super_block *sb)
 			ext4_msg(sb, KERN_ERR, "can't read descriptor %u", i);
 			goto err_freebuddy;
 		}
-		// 添加并初始化组相关信息
+		// 添加并初始化组的元数据相关信息
 		if (ext4_mb_add_groupinfo(sb, i, desc) != 0)
 			goto err_freebuddy;
 	}
 
-	// 初始化块预取?
+	// 初始化块预取块数
 	if (ext4_has_feature_flex_bg(sb)) {
+		// 灵活组
 		/* a single flex group is supposed to be read by a single IO.
 		 * 2 ^ s_log_groups_per_flex != UINT_MAX as s_mb_prefetch is
 		 * unsigned integer, so the maximum shift is 32.
@@ -245,10 +249,11 @@ static int ext4_mb_init_backend(struct super_block *sb)
 			BLK_MAX_SEGMENT_SIZE >> (sb->s_blocksize_bits - 9));
 		sbi->s_mb_prefetch *= 8; /* 8 prefetch IOs in flight at most */
 	} else {
+		// 普通情况
 		sbi->s_mb_prefetch = 32;
 	}
 
-	// 预取最大只能大于组数量
+	// 预取最大不能大于组数量
 	if (sbi->s_mb_prefetch > ext4_get_groups_count(sb))
 		sbi->s_mb_prefetch = ext4_get_groups_count(sb);
 	/* now many real IOs to prefetch within a single allocation at cr=0
@@ -292,7 +297,7 @@ int ext4_mb_alloc_groupinfo(struct super_block *sb, ext4_group_t ngroups)
 	// 组的数量
 	size = (ngroups + EXT4_DESC_PER_BLOCK(sb) - 1) >>
 		EXT4_DESC_PER_BLOCK_BITS(sb);
-	// 如果大小给以前的组小，那就不用分配了，直接返回
+	// 如果大小比以前的组小，那就不用分配了，直接返回
 	if (size <= sbi->s_group_info_size)
 		return 0;
 
@@ -341,7 +346,7 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 	 * If it's true, we have to allocate a new table of pointers
 	 * to ext4_group_info structures
 	 */
-	// 如果是第0个组,则分配组元数据
+	// 每个块上的第一个组之前,要分配一些组的元数据
 	if (group % EXT4_DESC_PER_BLOCK(sb) == 0) {
 		// 元数据大小,为块上所有组的大小
 		metalen = sizeof(*meta_group_info) <<
@@ -365,7 +370,7 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 	// 块内偏移
 	i = group & (EXT4_DESC_PER_BLOCK(sb) - 1);
 
-	// 分配元数据信息
+	// 分配该组的元数据内存
 	meta_group_info[i] = kmem_cache_zalloc(cachep, GFP_NOFS);
 	if (meta_group_info[i] == NULL) {
 		ext4_msg(sb, KERN_ERR, "can't allocate buddy mem");
@@ -379,10 +384,10 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 	 * initialize bb_free to be able to skip
 	 * empty groups without initialization
 	 */
-	// 初始化bb_free
+	// 初始化空闲块
 	if (ext4_has_group_desc_csum(sb) &&
 	    (desc->bg_flags & cpu_to_le16(EXT4_BG_BLOCK_UNINIT))) {
-		
+		// todo: ?
 		meta_group_info[i]->bb_free =
 			ext4_free_clusters_after_init(sb, group, desc);
 	} else {
@@ -394,9 +399,11 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 	INIT_LIST_HEAD(&meta_group_info[i]->bb_prealloc_list);
 	init_rwsem(&meta_group_info[i]->alloc_sem);
 
-	// #define RB_ROOT	(struct rb_root) { NULL, }
+	// 空闲根节点 #define RB_ROOT (struct rb_root) { NULL, }
 	meta_group_info[i]->bb_free_root = RB_ROOT;
-	meta_group_info[i]->bb_largest_free_order = -1;  /* uninit */
+
+	// 最大的空闲order, -1是未初始化的意思
+	meta_group_info[i]->bb_largest_free_order = -1;
 
 	// 调试用
 	mb_group_bb_bitmap_alloc(sb, meta_group_info[i], group);
