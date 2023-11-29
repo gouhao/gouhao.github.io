@@ -1103,6 +1103,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		goto failed_mount;
 	}
 
+	// 可用的块数量
 	blocks_count = (ext4_blocks_count(es) -
 			le32_to_cpu(es->s_first_data_block) +
 			EXT4_BLOCKS_PER_GROUP(sb) - 1);
@@ -1120,6 +1121,8 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	}
 	// 组数
 	sbi->s_groups_count = blocks_count;
+
+	// todo: what?
 	sbi->s_blockfile_groups = min_t(ext4_group_t, sbi->s_groups_count,
 			(EXT4_MAX_BLOCK_FILE_PHYS / EXT4_BLOCKS_PER_GROUP(sb)));
 
@@ -1168,6 +1171,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		ext4_sb_breadahead_unmovable(sb, block);
 	}
 
+	// 读每个组描述符的块，并设置之
 	for (i = 0; i < db_count; i++) {
 		struct buffer_head *bh;
 
@@ -1415,7 +1419,7 @@ no_journal:
 		}
 	}
 
-	// 仅支持块大小等于页大小？
+	// 有verity特性时，仅支持块大小等于页大小
 	if (ext4_has_feature_verity(sb) && blocksize != PAGE_SIZE) {
 		ext4_msg(sb, KERN_ERR, "Unsupported blocksize for fs-verity");
 		goto failed_mount_wq;
@@ -1738,3 +1742,102 @@ out_free_base:
 10. 如果之前的块大小和实际读出来的块大小不一致,则需要重读一次超级块
 11. 设置sbi里的相关字段
 12. 确定cluster的大小
+13. 读出所有组描述符的bh块
+14. 注册内存回收器、设置各种操作函数表
+15. 对sbi里的一些基本字段做初始化
+16. 加载journal日志，设置日志校验和，对日志的一些特性做检查
+17. 获取根结点inode，创建dentry，设置超级块
+18. 设置预留块
+19. 初始化extent, multi-block分配器
+
+
+## 2. ext4_setup_super
+```c
+static int ext4_setup_super(struct super_block *sb, struct ext4_super_block *es,
+			    int read_only)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	int err = 0;
+
+	if (le32_to_cpu(es->s_rev_level) > EXT4_MAX_SUPP_REV) {
+		ext4_msg(sb, KERN_ERR, "revision level too high, "
+			 "forcing read-only mode");
+		err = -EROFS;
+		goto done;
+	}
+	if (read_only)
+		goto done;
+	if (!(sbi->s_mount_state & EXT4_VALID_FS))
+		ext4_msg(sb, KERN_WARNING, "warning: mounting unchecked fs, "
+			 "running e2fsck is recommended");
+	else if (sbi->s_mount_state & EXT4_ERROR_FS)
+		ext4_msg(sb, KERN_WARNING,
+			 "warning: mounting fs with errors, "
+			 "running e2fsck is recommended");
+	else if ((__s16) le16_to_cpu(es->s_max_mnt_count) > 0 &&
+		 le16_to_cpu(es->s_mnt_count) >=
+		 (unsigned short) (__s16) le16_to_cpu(es->s_max_mnt_count))
+		ext4_msg(sb, KERN_WARNING,
+			 "warning: maximal mount count reached, "
+			 "running e2fsck is recommended");
+	else if (le32_to_cpu(es->s_checkinterval) &&
+		 (ext4_get_tstamp(es, s_lastcheck) +
+		  le32_to_cpu(es->s_checkinterval) <= ktime_get_real_seconds()))
+		ext4_msg(sb, KERN_WARNING,
+			 "warning: checktime reached, "
+			 "running e2fsck is recommended");
+	if (!sbi->s_journal)
+		es->s_state &= cpu_to_le16(~EXT4_VALID_FS);
+	if (!(__s16) le16_to_cpu(es->s_max_mnt_count))
+		es->s_max_mnt_count = cpu_to_le16(EXT4_DFL_MAX_MNT_COUNT);
+	le16_add_cpu(&es->s_mnt_count, 1);
+	ext4_update_tstamp(es, s_mtime);
+	if (sbi->s_journal)
+		ext4_set_feature_journal_needs_recovery(sb);
+
+	err = ext4_commit_super(sb, 1);
+done:
+	if (test_opt(sb, DEBUG))
+		printk(KERN_INFO "[EXT4 FS bs=%lu, gc=%u, "
+				"bpg=%lu, ipg=%lu, mo=%04x, mo2=%04x]\n",
+			sb->s_blocksize,
+			sbi->s_groups_count,
+			EXT4_BLOCKS_PER_GROUP(sb),
+			EXT4_INODES_PER_GROUP(sb),
+			sbi->s_mount_opt, sbi->s_mount_opt2);
+
+	cleancache_init_fs(sb);
+	return err;
+}
+```
+
+
+```c
+void ext4_ext_init(struct super_block *sb)
+{
+	/*
+	 * possible initialization would be here
+	 */
+
+	if (ext4_has_feature_extents(sb)) {
+#if defined(AGGRESSIVE_TEST) || defined(CHECK_BINSEARCH) || defined(EXTENTS_STATS)
+		printk(KERN_INFO "EXT4-fs: file extents enabled"
+#ifdef AGGRESSIVE_TEST
+		       ", aggressive tests"
+#endif
+#ifdef CHECK_BINSEARCH
+		       ", check binsearch"
+#endif
+#ifdef EXTENTS_STATS
+		       ", stats"
+#endif
+		       "\n");
+#endif
+#ifdef EXTENTS_STATS
+		spin_lock_init(&EXT4_SB(sb)->s_ext_stats_lock);
+		EXT4_SB(sb)->s_ext_min = 1 << 30;
+		EXT4_SB(sb)->s_ext_max = 0;
+#endif
+	}
+}
+```
