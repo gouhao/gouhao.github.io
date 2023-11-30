@@ -1514,25 +1514,30 @@ no_journal:
 		sbi->s_journal->j_commit_callback =
 			ext4_journal_commit_callback;
 
-	// 重新计算并设置空闲块大小
+	// 统计每个组的空闲块数
 	block = ext4_count_free_clusters(sb);
+	// 再设置超级块里的空闲块数, 设置时会把cluster转成block
 	ext4_free_blocks_count_set(sbi->s_es, 
 				   EXT4_C2B(sbi, block));
 	
-	// 设置校验和
+	// 设置超级块校验和
 	ext4_superblock_csum_set(sb);
 	// percpu空闲块的数量
 	err = percpu_counter_init(&sbi->s_freeclusters_counter, block,
 				  GFP_KERNEL);
 	if (!err) {
-		// 计算并初始化空闲inode数量
+		// 统计所有组的inode总数
 		unsigned long freei = ext4_count_free_inodes(sb);
+		// 设置到超级块里
 		sbi->s_es->s_free_inodes_count = cpu_to_le32(freei);
+		// 再重新计算超级块的校验和
 		ext4_superblock_csum_set(sb);
+		// 初始化percpu空闲inode
 		err = percpu_counter_init(&sbi->s_freeinodes_counter, freei,
 					  GFP_KERNEL);
 	}
 
+	// 下面是一些percpu变量的起始化
 	// 目录数量
 	if (!err)
 		err = percpu_counter_init(&sbi->s_dirs_counter,
@@ -1851,62 +1856,27 @@ ext4_fsblk_t ext4_count_free_clusters(struct super_block *sb)
 	ext4_fsblk_t desc_count;
 	struct ext4_group_desc *gdp;
 	ext4_group_t i;
+	// 组数
 	ext4_group_t ngroups = ext4_get_groups_count(sb);
 	struct ext4_group_info *grp;
-#ifdef EXT4FS_DEBUG
-	struct ext4_super_block *es;
-	ext4_fsblk_t bitmap_count;
-	unsigned int x;
-	struct buffer_head *bitmap_bh = NULL;
 
-	es = EXT4_SB(sb)->s_es;
 	desc_count = 0;
-	bitmap_count = 0;
-	gdp = NULL;
-
 	for (i = 0; i < ngroups; i++) {
+		// 获取第i个组描述符
 		gdp = ext4_get_group_desc(sb, i, NULL);
 		if (!gdp)
 			continue;
 		grp = NULL;
+		// 获取组信息
 		if (EXT4_SB(sb)->s_group_info)
 			grp = ext4_get_group_info(sb, i);
+		// grp不为空 || 组位图未被破坏, 则统计空闲块数
 		if (!grp || !EXT4_MB_GRP_BBITMAP_CORRUPT(grp))
-			desc_count += ext4_free_group_clusters(sb, gdp);
-		brelse(bitmap_bh);
-		bitmap_bh = ext4_read_block_bitmap(sb, i);
-		if (IS_ERR(bitmap_bh)) {
-			bitmap_bh = NULL;
-			continue;
-		}
-
-		x = ext4_count_free(bitmap_bh->b_data,
-				    EXT4_CLUSTERS_PER_GROUP(sb) / 8);
-		printk(KERN_DEBUG "group %u: stored = %d, counted = %u\n",
-			i, ext4_free_group_clusters(sb, gdp), x);
-		bitmap_count += x;
-	}
-	brelse(bitmap_bh);
-	printk(KERN_DEBUG "ext4_count_free_clusters: stored = %llu"
-	       ", computed = %llu, %llu\n",
-	       EXT4_NUM_B2C(EXT4_SB(sb), ext4_free_blocks_count(es)),
-	       desc_count, bitmap_count);
-	return bitmap_count;
-#else
-	desc_count = 0;
-	for (i = 0; i < ngroups; i++) {
-		gdp = ext4_get_group_desc(sb, i, NULL);
-		if (!gdp)
-			continue;
-		grp = NULL;
-		if (EXT4_SB(sb)->s_group_info)
-			grp = ext4_get_group_info(sb, i);
-		if (!grp || !EXT4_MB_GRP_BBITMAP_CORRUPT(grp))
+			// 这个获取的是gdp->bg_free_blocks_count_lo
 			desc_count += ext4_free_group_clusters(sb, gdp);
 	}
 
 	return desc_count;
-#endif
 }
 
 int ext4_register_li_request(struct super_block *sb,
@@ -1976,19 +1946,24 @@ static int ext4_fill_flex_info(struct super_block *sb)
 	ext4_group_t flex_group;
 	int i, err;
 
+	// 每个flex的组数
 	sbi->s_log_groups_per_flex = sbi->s_es->s_log_groups_per_flex;
+	// flex数非法, 则关闭之
 	if (sbi->s_log_groups_per_flex < 1 || sbi->s_log_groups_per_flex > 31) {
 		sbi->s_log_groups_per_flex = 0;
 		return 1;
 	}
 
+	// 分配flex_bg数组
 	err = ext4_alloc_flex_bg_array(sb, sbi->s_groups_count);
 	if (err)
 		goto failed;
 
 	for (i = 0; i < sbi->s_groups_count; i++) {
+		// 组描述符
 		gdp = ext4_get_group_desc(sb, i, NULL);
 
+		// 算出第i个组属于哪个flex
 		flex_group = ext4_flex_group(sbi, i);
 		fg = sbi_array_rcu_deref(sbi, s_flex_groups, flex_group);
 		atomic_add(ext4_free_inodes_count(sb, gdp), &fg->free_inodes);
@@ -1999,6 +1974,58 @@ static int ext4_fill_flex_info(struct super_block *sb)
 
 	return 1;
 failed:
+	return 0;
+}
+
+int ext4_alloc_flex_bg_array(struct super_block *sb, ext4_group_t ngroup)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct flex_groups **old_groups, **new_groups;
+	int size, i, j;
+
+	// 不支持flex
+	if (!sbi->s_log_groups_per_flex)
+		return 0;
+	// flex的数量 = 最后一个组号右移s_log_groups_per_flex
+	// 相当于 group_count / 2^s_log_groups_per_flex + 1
+	size = ext4_flex_group(sbi, ngroup - 1) + 1;
+	// 如果小于已经分配的flex长度, 直接返回
+	if (size <= sbi->s_flex_groups_allocated)
+		return 0;
+
+	// 分配内存, 分配的内存大小会对齐到2的幂
+	new_groups = kvzalloc(roundup_pow_of_two(size *
+			      sizeof(*sbi->s_flex_groups)), GFP_KERNEL);
+	if (!new_groups) {
+		ext4_msg(sb, KERN_ERR,
+			 "not enough memory for %d flex group pointers", size);
+		return -ENOMEM;
+	}
+	// 分配各flex_group元素
+	for (i = sbi->s_flex_groups_allocated; i < size; i++) {
+		new_groups[i] = kvzalloc(roundup_pow_of_two(
+					 sizeof(struct flex_groups)),
+					 GFP_KERNEL);
+		if (!new_groups[i]) {
+			for (j = sbi->s_flex_groups_allocated; j < i; j++)
+				kvfree(new_groups[j]);
+			kvfree(new_groups);
+			ext4_msg(sb, KERN_ERR,
+				 "not enough memory for %d flex groups", size);
+			return -ENOMEM;
+		}
+	}
+	rcu_read_lock();
+	old_groups = rcu_dereference(sbi->s_flex_groups);
+	if (old_groups)
+		memcpy(new_groups, old_groups,
+		       (sbi->s_flex_groups_allocated *
+			sizeof(struct flex_groups *)));
+	rcu_read_unlock();
+	rcu_assign_pointer(sbi->s_flex_groups, new_groups);
+	sbi->s_flex_groups_allocated = size;
+	if (old_groups)
+		ext4_kvfree_array_rcu(old_groups);
 	return 0;
 }
 ```
