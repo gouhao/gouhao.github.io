@@ -1568,7 +1568,7 @@ no_journal:
 			ret = -ENOMEM;
 			goto failed_mount6;
 		}
-	// todo: what is li？
+	// 注册延迟初始化inode表的请求相关
 	err = ext4_register_li_request(sb, first_not_zeroed);
 	if (err)
 		goto failed_mount6;
@@ -1884,10 +1884,12 @@ int ext4_register_li_request(struct super_block *sb,
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct ext4_li_request *elr = NULL;
+	// 组数
 	ext4_group_t ngroups = sbi->s_groups_count;
 	int ret = 0;
 
 	mutex_lock(&ext4_li_mtx);
+	// 重新计算request的超时时间
 	if (sbi->s_li_request != NULL) {
 		/*
 		 * Reset timeout so it can be computed again, because
@@ -1897,36 +1899,42 @@ int ext4_register_li_request(struct super_block *sb,
 		goto out;
 	}
 
+	// todo: what
 	if (!test_opt(sb, PREFETCH_BLOCK_BITMAPS) &&
 	    (first_not_zeroed == ngroups || sb_rdonly(sb) ||
 	     !test_opt(sb, INIT_INODE_TABLE)))
 		goto out;
 
+	// 分配一个请求对象
 	elr = ext4_li_request_new(sb, first_not_zeroed);
 	if (!elr) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
+	// 分配一个li_info
 	if (NULL == ext4_li_info) {
 		ret = ext4_li_info_new();
 		if (ret)
 			goto out;
 	}
 
+	// 把分配的请求加到info的请求列表
 	mutex_lock(&ext4_li_info->li_list_mtx);
 	list_add(&elr->lr_request, &ext4_li_info->li_request_list);
 	mutex_unlock(&ext4_li_info->li_list_mtx);
 
+	// 把elr设置到超级块请求里
 	sbi->s_li_request = elr;
 	/*
-	 * set elr to NULL here since it has been inserted to
-	 * the request_list and the removal and free of it is
-	 * handled by ext4_clear_request_list from now on.
+	 * 将elr设置成NULL，因为它已经被插入请求列表了, 从现在开始将会在
+	 * ext4_clear_request_list里删除和释放
 	 */
 	elr = NULL;
 
+	// 如果li状态不是运行的话,则运行该线程
 	if (!(ext4_li_info->li_state & EXT4_LAZYINIT_RUNNING)) {
+		// todo: thread的运行后面再看
 		ret = ext4_run_lazyinit_thread();
 		if (ret)
 			goto out;
@@ -1936,6 +1944,78 @@ out:
 	if (ret)
 		kfree(elr);
 	return ret;
+}
+
+struct ext4_li_request {
+	struct super_block	*lr_super;
+	enum ext4_li_mode	lr_mode;
+	ext4_group_t		lr_first_not_zeroed;
+	ext4_group_t		lr_next_group;
+	struct list_head	lr_request;
+	unsigned long		lr_next_sched;
+	unsigned long		lr_timeout;
+};
+
+static struct ext4_li_request *ext4_li_request_new(struct super_block *sb,
+					    ext4_group_t start)
+{
+	struct ext4_li_request *elr;
+
+	// 分配对象
+	elr = kzalloc(sizeof(*elr), GFP_KERNEL);
+	if (!elr)
+		return NULL;
+
+	// 超级块
+	elr->lr_super = sb;
+	// 第一个不为空的块
+	elr->lr_first_not_zeroed = start;
+
+	// 是否有预取块位图
+	if (test_opt(sb, PREFETCH_BLOCK_BITMAPS))
+		elr->lr_mode = EXT4_LI_MODE_PREFETCH_BBITMAP;
+	else {
+		elr->lr_mode = EXT4_LI_MODE_ITABLE;
+		elr->lr_next_group = start;
+	}
+
+	/*
+	 * 随机化请求第一次调度的时间, 更好的分散索引节点表的初始化
+	 * 请求
+	 */
+	elr->lr_next_sched = jiffies + (prandom_u32() %
+				(EXT4_DEF_LI_MAX_START_DELAY * HZ));
+	return elr;
+}
+
+/*
+ * Lazy inode table initialization info
+ */
+struct ext4_lazy_init {
+	unsigned long		li_state;
+	struct list_head	li_request_list;
+	struct mutex		li_list_mtx;
+};
+
+static int ext4_li_info_new(void)
+{
+	struct ext4_lazy_init *eli = NULL;
+
+	// 分配一个eli
+	eli = kzalloc(sizeof(*eli), GFP_KERNEL);
+	if (!eli)
+		return -ENOMEM;
+
+	// 初始化
+	INIT_LIST_HEAD(&eli->li_request_list);
+	mutex_init(&eli->li_list_mtx);
+
+	// 状态是初始化
+	eli->li_state |= EXT4_LAZYINIT_QUIT;
+
+	ext4_li_info = eli;
+
+	return 0;
 }
 
 static int ext4_fill_flex_info(struct super_block *sb)
@@ -1965,15 +2045,37 @@ static int ext4_fill_flex_info(struct super_block *sb)
 
 		// 算出第i个组属于哪个flex
 		flex_group = ext4_flex_group(sbi, i);
+		// 取出fg元素
 		fg = sbi_array_rcu_deref(sbi, s_flex_groups, flex_group);
+		// 统计flex_gruop的空闲inode数量
 		atomic_add(ext4_free_inodes_count(sb, gdp), &fg->free_inodes);
+		// 统计flex_group的空闲块数
 		atomic64_add(ext4_free_group_clusters(sb, gdp),
 			     &fg->free_clusters);
+		// 统计flex_group已使用目录数
 		atomic_add(ext4_used_dirs_count(sb, gdp), &fg->used_dirs);
 	}
 
 	return 1;
 failed:
+	return 0;
+}
+
+static int ext4_run_lazyinit_thread(void)
+{
+	ext4_lazyinit_task = kthread_run(ext4_lazyinit_thread,
+					 ext4_li_info, "ext4lazyinit");
+	if (IS_ERR(ext4_lazyinit_task)) {
+		int err = PTR_ERR(ext4_lazyinit_task);
+		ext4_clear_request_list();
+		kfree(ext4_li_info);
+		ext4_li_info = NULL;
+		printk(KERN_CRIT "EXT4-fs: error %d creating inode table "
+				 "initialization thread\n",
+				 err);
+		return err;
+	}
+	ext4_li_info->li_state |= EXT4_LAZYINIT_RUNNING;
 	return 0;
 }
 
@@ -2001,11 +2103,12 @@ int ext4_alloc_flex_bg_array(struct super_block *sb, ext4_group_t ngroup)
 			 "not enough memory for %d flex group pointers", size);
 		return -ENOMEM;
 	}
-	// 分配各flex_group元素
+	// 只分配已分配后面的flex_group元素
 	for (i = sbi->s_flex_groups_allocated; i < size; i++) {
 		new_groups[i] = kvzalloc(roundup_pow_of_two(
 					 sizeof(struct flex_groups)),
 					 GFP_KERNEL);
+		// 若分配失败，则释放之前的
 		if (!new_groups[i]) {
 			for (j = sbi->s_flex_groups_allocated; j < i; j++)
 				kvfree(new_groups[j]);
@@ -2016,14 +2119,18 @@ int ext4_alloc_flex_bg_array(struct super_block *sb, ext4_group_t ngroup)
 		}
 	}
 	rcu_read_lock();
+	// 把老组里的元素复制到新组里
 	old_groups = rcu_dereference(sbi->s_flex_groups);
 	if (old_groups)
 		memcpy(new_groups, old_groups,
 		       (sbi->s_flex_groups_allocated *
 			sizeof(struct flex_groups *)));
 	rcu_read_unlock();
+	// 设置新组指针
 	rcu_assign_pointer(sbi->s_flex_groups, new_groups);
+	// 设置新的已分配大小
 	sbi->s_flex_groups_allocated = size;
+	// 释放老组
 	if (old_groups)
 		ext4_kvfree_array_rcu(old_groups);
 	return 0;
