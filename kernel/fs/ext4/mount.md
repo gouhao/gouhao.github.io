@@ -1478,7 +1478,7 @@ no_journal:
 		goto failed_mount4;
 	}
 
-	// 设置超级块
+	// 设置超级块, 会保存到磁盘里
 	ret = ext4_setup_super(sb, es, sb_rdonly(sb));
 	if (ret == -EROFS) {
 		sb->s_flags |= SB_RDONLY;
@@ -1772,44 +1772,58 @@ static int ext4_setup_super(struct super_block *sb, struct ext4_super_block *es,
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	int err = 0;
 
+	// 超过最大支持的版本
 	if (le32_to_cpu(es->s_rev_level) > EXT4_MAX_SUPP_REV) {
 		ext4_msg(sb, KERN_ERR, "revision level too high, "
 			 "forcing read-only mode");
 		err = -EROFS;
 		goto done;
 	}
+	// 只读
 	if (read_only)
 		goto done;
+	
+	// 无效fs
 	if (!(sbi->s_mount_state & EXT4_VALID_FS))
 		ext4_msg(sb, KERN_WARNING, "warning: mounting unchecked fs, "
 			 "running e2fsck is recommended");
+	// 错误fs
 	else if (sbi->s_mount_state & EXT4_ERROR_FS)
 		ext4_msg(sb, KERN_WARNING,
 			 "warning: mounting fs with errors, "
 			 "running e2fsck is recommended");
+	// 超过最大挂载次数
 	else if ((__s16) le16_to_cpu(es->s_max_mnt_count) > 0 &&
 		 le16_to_cpu(es->s_mnt_count) >=
 		 (unsigned short) (__s16) le16_to_cpu(es->s_max_mnt_count))
 		ext4_msg(sb, KERN_WARNING,
 			 "warning: maximal mount count reached, "
 			 "running e2fsck is recommended");
+	// 超过检查间隔
 	else if (le32_to_cpu(es->s_checkinterval) &&
 		 (ext4_get_tstamp(es, s_lastcheck) +
 		  le32_to_cpu(es->s_checkinterval) <= ktime_get_real_seconds()))
 		ext4_msg(sb, KERN_WARNING,
 			 "warning: checktime reached, "
 			 "running e2fsck is recommended");
+	// 没有journal则设置日志
 	if (!sbi->s_journal)
 		es->s_state &= cpu_to_le16(~EXT4_VALID_FS);
+	// 若最大挂载次数为0, 则设置默认值(20)
 	if (!(__s16) le16_to_cpu(es->s_max_mnt_count))
 		es->s_max_mnt_count = cpu_to_le16(EXT4_DFL_MAX_MNT_COUNT);
+	// 增加一次挂载次数
 	le16_add_cpu(&es->s_mnt_count, 1);
+	// s_mtime时间戳为当前时间
 	ext4_update_tstamp(es, s_mtime);
+	// 设置日志需要恢复
 	if (sbi->s_journal)
 		ext4_set_feature_journal_needs_recovery(sb);
 
-	err = ext4_commit_super(sb, 1);
+	// 提交超级块
+	err = ext4_commit_super(sb, 1/*同步*/);
 done:
+	// debug时打印
 	if (test_opt(sb, DEBUG))
 		printk(KERN_INFO "[EXT4 FS bs=%lu, gc=%u, "
 				"bpg=%lu, ipg=%lu, mo=%04x, mo2=%04x]\n",
@@ -1819,6 +1833,7 @@ done:
 			EXT4_INODES_PER_GROUP(sb),
 			sbi->s_mount_opt, sbi->s_mount_opt2);
 
+	// shim相关
 	cleancache_init_fs(sb);
 	return err;
 }
@@ -2147,24 +2162,27 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 	int quota_update = 0;
 	int i;
 #endif
+	// 没有孤儿inode
 	if (!es->s_last_orphan) {
 		jbd_debug(4, "no orphan inodes to clean up\n");
 		return;
 	}
 
+	// 设备只读
 	if (bdev_read_only(sb->s_bdev)) {
 		ext4_msg(sb, KERN_ERR, "write access "
 			"unavailable, skipping orphan cleanup");
 		return;
 	}
 
-	/* Check if feature set would not allow a r/w mount */
+	// 检查特性是否合法
 	if (!ext4_feature_set_ok(sb, 0)) {
 		ext4_msg(sb, KERN_INFO, "Skipping orphan cleanup due to "
 			 "unknown ROCOMPAT features");
 		return;
 	}
 
+	// 挂载出错
 	if (EXT4_SB(sb)->s_mount_state & EXT4_ERROR_FS) {
 		/* don't clear list on RO mount w/ errors */
 		if (es->s_last_orphan && !(s_flags & SB_RDONLY)) {
@@ -2176,10 +2194,13 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 		return;
 	}
 
+	// 以只读的方式挂载的
 	if (s_flags & SB_RDONLY) {
 		ext4_msg(sb, KERN_INFO, "orphan cleanup on readonly fs");
 		sb->s_flags &= ~SB_RDONLY;
 	}
+
+	// 配额相关
 #ifdef CONFIG_QUOTA
 	/*
 	 * Turn on quotas which were not enabled for read-only mounts if
@@ -2210,6 +2231,7 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 	}
 #endif
 
+	// 走到这儿就表示要清理孤儿了. todo: 后面看
 	while (es->s_last_orphan) {
 		struct inode *inode;
 
