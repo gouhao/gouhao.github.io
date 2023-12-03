@@ -59,11 +59,14 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 	ei = EXT4_I(inode);
 	iloc.bh = NULL;
 
+	// 从磁盘上读取inode的信息
 	ret = __ext4_get_inode_loc_noinmem(inode, &iloc);
 	if (ret < 0)
 		goto bad_inode;
+	// 获取磁盘上的inode
 	raw_inode = ext4_raw_inode(&iloc);
 
+	// root的link为0, root是在创建文件系统的时候就创建好的, 所以link不能为0
 	if ((ino == EXT4_ROOT_INO) && (raw_inode->i_links_count == 0)) {
 		ext4_error_inode(inode, function, line, 0,
 				 "iget: root inode unallocated");
@@ -71,14 +74,21 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 		goto bad_inode;
 	}
 
+	// ?
 	if ((flags & EXT4_IGET_HANDLE) &&
 	    (raw_inode->i_links_count == 0) && (raw_inode->i_mode == 0)) {
 		ret = -ESTALE;
 		goto bad_inode;
 	}
 
+	// 根据inode大小来判断是新的inode还是老的
 	if (EXT4_INODE_SIZE(inode->i_sb) > EXT4_GOOD_OLD_INODE_SIZE) {
+		// 新的inode支持额外空间
+
+		// 设置额外空间
 		ei->i_extra_isize = le16_to_cpu(raw_inode->i_extra_isize);
+
+		// 判断是否合法, 空间是4字节对齐的
 		if (EXT4_GOOD_OLD_INODE_SIZE + ei->i_extra_isize >
 			EXT4_INODE_SIZE(inode->i_sb) ||
 		    (ei->i_extra_isize & 3)) {
@@ -93,18 +103,21 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 	} else
 		ei->i_extra_isize = 0;
 
-	/* Precompute checksum seed for inode metadata */
+	// 如果有元数据校验, 则先计算种子
 	if (ext4_has_metadata_csum(sb)) {
 		struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
 		__u32 csum;
 		__le32 inum = cpu_to_le32(inode->i_ino);
 		__le32 gen = raw_inode->i_generation;
+		// 计算ino的校验和
 		csum = ext4_chksum(sbi, sbi->s_csum_seed, (__u8 *)&inum,
 				   sizeof(inum));
+		// 根据年代的校验和生成种子
 		ei->i_csum_seed = ext4_chksum(sbi, csum, (__u8 *)&gen,
 					      sizeof(gen));
 	}
 
+	// 计算校验和
 	if ((!ext4_inode_csum_verify(inode, raw_inode, ei) ||
 	    ext4_simulate_fail(sb, EXT4_SIM_INODE_CRC)) &&
 	     (!(EXT4_SB(sb)->s_mount_state & EXT4_FC_REPLAY))) {
@@ -114,9 +127,18 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 		goto bad_inode;
 	}
 
+	// 下面是从磁盘上的inode给内存里的inode设置信息
+
+	// mode
 	inode->i_mode = le16_to_cpu(raw_inode->i_mode);
+
+	// uid
 	i_uid = (uid_t)le16_to_cpu(raw_inode->i_uid_low);
+
+	// gid
 	i_gid = (gid_t)le16_to_cpu(raw_inode->i_gid_low);
+
+	// project是一种配额特性. todo: 后面看
 	if (ext4_has_feature_project(sb) &&
 	    EXT4_INODE_SIZE(sb) > EXT4_GOOD_OLD_INODE_SIZE &&
 	    EXT4_FITS_IN_INODE(raw_inode, ei, i_projid))
@@ -124,19 +146,31 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 	else
 		i_projid = EXT4_DEF_PROJID;
 
+	// 有uid32
 	if (!(test_opt(inode->i_sb, NO_UID32))) {
 		i_uid |= le16_to_cpu(raw_inode->i_uid_high) << 16;
 		i_gid |= le16_to_cpu(raw_inode->i_gid_high) << 16;
 	}
+
+	// 给inode设置uid, gid
 	i_uid_write(inode, i_uid);
 	i_gid_write(inode, i_gid);
+
+	// 设置project id
 	ei->i_projid = make_kprojid(&init_user_ns, i_projid);
+	// 链接数
 	set_nlink(inode, le16_to_cpu(raw_inode->i_links_count));
 
+	// 清除i_state_flags
 	ext4_clear_state_flags(ei);	/* Only relevant on 32-bit archs */
 	ei->i_inline_off = 0;
 	ei->i_dir_start_lookup = 0;
+
+	// 删除dtime
 	ei->i_dtime = le32_to_cpu(raw_inode->i_dtime);
+
+
+	// nfs做的一些检查
 	/* We now have enough fields to check if the inode was active or not.
 	 * This is needed because nfsd might try to access dead inodes
 	 * the test is that same one that e2fsck uses
@@ -157,13 +191,19 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 		 * OR it is the EXT4_BOOT_LOADER_INO which is
 		 * not initialized on a new filesystem. */
 	}
+	// 设置flag
 	ei->i_flags = le32_to_cpu(raw_inode->i_flags);
 	ext4_set_inode_flags(inode, true);
+
+	// inode的块数
 	inode->i_blocks = ext4_inode_blocks(raw_inode, ei);
+
+	// acl值
 	ei->i_file_acl = le32_to_cpu(raw_inode->i_file_acl_lo);
 	if (ext4_has_feature_64bit(sb))
 		ei->i_file_acl |=
 			((__u64)le16_to_cpu(raw_inode->i_file_acl_high)) << 32;
+	// 文件大小
 	inode->i_size = ext4_isize(sb, raw_inode);
 	if ((size = i_size_read(inode)) < 0) {
 		ext4_error_inode(inode, function, line, 0,
@@ -171,11 +211,7 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 		ret = -EFSCORRUPTED;
 		goto bad_inode;
 	}
-	/*
-	 * If dir_index is not enabled but there's dir with INDEX flag set,
-	 * we'd normally treat htree data as empty space. But with metadata
-	 * checksumming that corrupts checksums so forbid that.
-	 */
+	// 没有dir_index特性,但是inode却有dir_index标志
 	if (!ext4_has_feature_dir_index(sb) && ext4_has_metadata_csum(sb) &&
 	    ext4_test_inode_flag(inode, EXT4_INODE_INDEX)) {
 		ext4_error_inode(inode, function, line, 0,
@@ -183,29 +219,30 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 		ret = -EFSCORRUPTED;
 		goto bad_inode;
 	}
+
+	// 盘上大小
 	ei->i_disksize = inode->i_size;
+
+	// 配额
 #ifdef CONFIG_QUOTA
 	ei->i_reserved_quota = 0;
 #endif
+	// 年代
 	inode->i_generation = le32_to_cpu(raw_inode->i_generation);
+	// 所在组
 	ei->i_block_group = iloc.block_group;
+
+	// 上次分配的组设置为所有
 	ei->i_last_alloc_group = ~0;
-	/*
-	 * NOTE! The in-memory inode i_data array is in little-endian order
-	 * even on big-endian machines: we do NOT byteswap the block numbers!
-	 */
+	// 在内存里的inode里保存的块号也是小端序的
 	for (block = 0; block < EXT4_N_BLOCKS; block++)
 		ei->i_data[block] = raw_inode->i_block[block];
+	// 孤儿列表
 	INIT_LIST_HEAD(&ei->i_orphan);
+	// 初始化fast_commit相关字段
 	ext4_fc_init_inode(&ei->vfs_inode);
 
-	/*
-	 * Set transaction id's of transactions that have to be committed
-	 * to finish f[data]sync. We set them to currently running transaction
-	 * as we cannot be sure that the inode or some of its metadata isn't
-	 * part of the transaction - the inode could have been reclaimed and
-	 * now it is reread from disk.
-	 */
+	// 如果有事务, 则设置事务id
 	if (journal) {
 		transaction_t *transaction;
 		tid_t tid;
@@ -226,22 +263,25 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 
 	if (EXT4_INODE_SIZE(inode->i_sb) > EXT4_GOOD_OLD_INODE_SIZE) {
 		if (ei->i_extra_isize == 0) {
-			/* The extra space is currently unused. Use it. */
+			// 额外空间还没用
 			BUILD_BUG_ON(sizeof(struct ext4_inode) & 3);
 			ei->i_extra_isize = sizeof(struct ext4_inode) -
 					    EXT4_GOOD_OLD_INODE_SIZE;
 		} else {
+			// 额外空间用了, 则获取相应数据(扩展属性) 
 			ret = ext4_iget_extra_inode(inode, raw_inode, ei);
 			if (ret)
 				goto bad_inode;
 		}
 	}
 
+	// 设置各种时间
 	EXT4_INODE_GET_XTIME(i_ctime, inode, raw_inode);
 	EXT4_INODE_GET_XTIME(i_mtime, inode, raw_inode);
 	EXT4_INODE_GET_XTIME(i_atime, inode, raw_inode);
 	EXT4_EINODE_GET_XTIME(i_crtime, ei, raw_inode);
 
+	// todo: hurd?
 	if (likely(!test_opt2(inode->i_sb, HURD_COMPAT))) {
 		u64 ivers = le32_to_cpu(raw_inode->i_disk_version);
 
@@ -254,6 +294,8 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 	}
 
 	ret = 0;
+
+	// acl检查
 	if (ei->i_file_acl &&
 	    !ext4_inode_block_valid(inode, ei->i_file_acl, 1)) {
 		ext4_error_inode(inode, function, line, 0,
@@ -261,6 +303,8 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 				 ei->i_file_acl);
 		ret = -EFSCORRUPTED;
 		goto bad_inode;
+	
+	// 检查inode的extent或者间接块的有效性?
 	} else if (!ext4_has_inline_data(inode)) {
 		/* validate the block references in the inode */
 		if (!(EXT4_SB(sb)->s_mount_state & EXT4_FC_REPLAY) &&
@@ -273,18 +317,28 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 				ret = ext4_ind_check_inode(inode);
 		}
 	}
+	// 上面的检查出错
 	if (ret)
 		goto bad_inode;
 
+	// 根据文件类型设置不同函数表
 	if (S_ISREG(inode->i_mode)) {
+		// 普通文件
+
+		// inode op
 		inode->i_op = &ext4_file_inode_operations;
+		// file op
 		inode->i_fop = &ext4_file_operations;
+		// mapping op
 		ext4_set_aops(inode);
 	} else if (S_ISDIR(inode->i_mode)) {
+		// 目录
 		inode->i_op = &ext4_dir_inode_operations;
 		inode->i_fop = &ext4_dir_operations;
 	} else if (S_ISLNK(inode->i_mode)) {
-		/* VFS does not allow setting these so must be corruption */
+		// 链接文件
+
+		// vfs不允许设置这两个属性给链接
 		if (IS_APPEND(inode) || IS_IMMUTABLE(inode)) {
 			ext4_error_inode(inode, function, line, 0,
 					 "iget: immutable or append flags "
@@ -293,35 +347,45 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
 			goto bad_inode;
 		}
 		if (IS_ENCRYPTED(inode)) {
+			// 已加密
 			inode->i_op = &ext4_encrypted_symlink_inode_operations;
 			ext4_set_aops(inode);
 		} else if (ext4_inode_is_fast_symlink(inode)) {
+			// 快速软链接
 			inode->i_link = (char *)ei->i_data;
 			inode->i_op = &ext4_fast_symlink_inode_operations;
 			nd_terminate_link(ei->i_data, inode->i_size,
 				sizeof(ei->i_data) - 1);
 		} else {
+			// 普通软链接
 			inode->i_op = &ext4_symlink_inode_operations;
 			ext4_set_aops(inode);
 		}
+		// 设置mapping分配内存的标志为GFP_USER
 		inode_nohighmem(inode);
+
+	// 特殊文件
 	} else if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode) ||
 	      S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
 		inode->i_op = &ext4_special_inode_operations;
+		// 老文件系统用block[0]存设备号, 新的用block[1]
 		if (raw_inode->i_block[0])
 			init_special_inode(inode, inode->i_mode,
 			   old_decode_dev(le32_to_cpu(raw_inode->i_block[0])));
 		else
 			init_special_inode(inode, inode->i_mode,
 			   new_decode_dev(le32_to_cpu(raw_inode->i_block[1])));
+	// boot_loader
 	} else if (ino == EXT4_BOOT_LOADER_INO) {
 		make_bad_inode(inode);
 	} else {
+		// 其他都是错的
 		ret = -EFSCORRUPTED;
 		ext4_error_inode(inode, function, line, 0,
 				 "iget: bogus i_mode (%o)", inode->i_mode);
 		goto bad_inode;
 	}
+	// 有casefolded标志, 却没这个特性
 	if (IS_CASEFOLDED(inode) && !ext4_has_feature_casefold(inode->i_sb))
 		ext4_error_inode(inode, function, line, 0,
 				 "casefold flag without casefold feature");
