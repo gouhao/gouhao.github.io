@@ -293,7 +293,7 @@ again:
 	entries = frame->entries;
 	// 小于文件名哈希的entry
 	at = frame->at;
-	// at的块
+	// 读at的块
 	bh = ext4_read_dirblock(dir, dx_get_block(frame->at), DIRENT_HTREE);
 	if (IS_ERR(bh)) {
 		err = PTR_ERR(bh);
@@ -589,7 +589,7 @@ dx_probe(struct ext4_filename *fname, struct inode *dir,
 		p = entries + 1;
 		// q是最后一个entry
 		q = entries + count - 1;
-		// 使用二分法查找
+		// 使用二分法查找哈希值最近的
 		while (p <= q) {
 
 			// 取中间值
@@ -626,12 +626,12 @@ dx_probe(struct ext4_filename *fname, struct inode *dir,
 			       dx_get_block(at)));
 		// 设置该层的entry头
 		frame->entries = entries;
-		// 设置entry所在的链头(小于目标哈希的节点)
+		// 设置entry所在的链头(小于目标哈希的节点), 也就是要插入的地方
 		frame->at = at;
 		// 如果所有层都已读取,则返回
 		if (!indirect--)
 			// 这里返回的frame是最后一层的指针
-			return frame;最接近目标的
+			return frame;//最接近目标的
 		// 指向下个frame
 		frame++;
 		// 读取at所在的块

@@ -433,6 +433,7 @@ static struct buffer_head *__ext4_read_dirblock(struct inode *inode,
 	struct ext4_dir_entry *dirent;
 	int is_dx_block = 0;
 
+	// 读出bh
 	if (ext4_simulate_fail(inode->i_sb, EXT4_SIM_DIRBLOCK_EIO))
 		bh = ERR_PTR(-EIO);
 	else
@@ -446,6 +447,7 @@ static struct buffer_head *__ext4_read_dirblock(struct inode *inode,
 
 		return bh;
 	}
+	// 目录中间不能有洞
 	if (!bh && (type == INDEX || type == DIRENT_HTREE)) {
 		ext4_error_inode(inode, func, line, block,
 				 "Directory hole found for htree %s block",
@@ -455,30 +457,32 @@ static struct buffer_head *__ext4_read_dirblock(struct inode *inode,
 	if (!bh)
 		return NULL;
 	dirent = (struct ext4_dir_entry *) bh->b_data;
-	/* Determine whether or not we have an index block */
+	// 有index特性
 	if (is_dx(inode)) {
+		// 第0块是dirindex
 		if (block == 0)
 			is_dx_block = 1;
+		// 是空块
 		else if (ext4_rec_len_from_disk(dirent->rec_len,
 						inode->i_sb->s_blocksize) ==
 			 inode->i_sb->s_blocksize)
 			is_dx_block = 1;
 	}
+
+	// 没有找到dxblock
 	if (!is_dx_block && type == INDEX) {
 		ext4_error_inode(inode, func, line, block,
 		       "directory leaf block found instead of index block");
 		brelse(bh);
 		return ERR_PTR(-EFSCORRUPTED);
 	}
+
+	// 没有元数据检验和, 或者bh校验失败
 	if (!ext4_has_metadata_csum(inode->i_sb) ||
 	    buffer_verified(bh))
 		return bh;
 
-	/*
-	 * An empty leaf block can get mistaken for a index block; for
-	 * this reason, we can only check the index checksum when the
-	 * caller is sure it should be an index block.
-	 */
+	// 如果是dir_info, 则校验dx是否合法
 	if (is_dx_block && type == INDEX) {
 		if (ext4_dx_csum_verify(inode, dirent) &&
 		    !ext4_simulate_fail(inode->i_sb, EXT4_SIM_DIRBLOCK_CRC))
@@ -491,6 +495,7 @@ static struct buffer_head *__ext4_read_dirblock(struct inode *inode,
 			return ERR_PTR(-EFSBADCRC);
 		}
 	}
+	// 否则校验dir_block
 	if (!is_dx_block) {
 		if (ext4_dirblock_csum_verify(inode, bh) &&
 		    !ext4_simulate_fail(inode->i_sb, EXT4_SIM_DIRBLOCK_CRC))

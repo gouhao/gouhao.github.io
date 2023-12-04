@@ -25,7 +25,7 @@ static int ext4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	credits = (EXT4_DATA_TRANS_BLOCKS(dir->i_sb) +
 		   EXT4_INDEX_EXTRA_TRANS_BLOCKS + 3);
 retry:
-	// 创建inode
+	// 分配一个新的inode
 	inode = ext4_new_inode_start_handle(dir, mode, &dentry->d_name, 0,
 					    NULL, EXT4_HT_DIR, credits);
 	// 获取日志handle
@@ -406,7 +406,7 @@ got:
 		down_read(&grp->alloc_sem); /* protect vs itable lazyinit */
 		ext4_lock_group(sb, group); /* while we modify the bg desc */
 
-		// todo: 总共的减未使用的, 为什么是空闲的? 不应该是已使用的吗?
+		// 未使用的起点
 		free = EXT4_INODES_PER_GROUP(sb) -
 			ext4_itable_unused_count(sb, gdp);
 		// 需要初始化inode
@@ -414,7 +414,7 @@ got:
 			gdp->bg_flags &= cpu_to_le16(~EXT4_BG_INODE_UNINIT);
 			free = 0;
 		}
-		// todo?
+		// 新分配的inode大于空闲起点, 则重新设置空闲起点
 		if (ino > free)
 			ext4_itable_unused_set(sb, gdp,
 					(EXT4_INODES_PER_GROUP(sb) - ino));
@@ -464,7 +464,9 @@ got:
 	if (S_ISDIR(mode))
 		percpu_counter_inc(&sbi->s_dirs_counter);
 
+	// 若开启了flex
 	if (sbi->s_log_groups_per_flex) {
+		// 计算所属的flex组
 		flex_group = ext4_flex_group(sbi, group);
 		atomic_dec(&sbi_array_rcu_deref(sbi, s_flex_groups,
 						flex_group)->free_inodes);
@@ -602,6 +604,63 @@ out:
 	iput(inode);
 	brelse(inode_bitmap_bh);
 	return ERR_PTR(err);
+}
+
+void ext4_ext_tree_init(handle_t *handle, struct inode *inode)
+{
+	struct ext4_extent_header *eh;
+
+	// 初始化extent header
+	eh = ext_inode_hdr(inode);
+	eh->eh_depth = 0;
+	eh->eh_entries = 0;
+	eh->eh_magic = EXT4_EXT_MAGIC;
+	eh->eh_max = cpu_to_le16(ext4_ext_space_root(inode, 0));
+	eh->eh_generation = 0;
+
+	// 标脏
+	ext4_mark_inode_dirty(handle, inode);
+}
+
+static int find_inode_bit(struct super_block *sb, ext4_group_t group,
+			  struct buffer_head *bitmap, unsigned long *ino)
+{
+	bool check_recently_deleted = EXT4_SB(sb)->s_journal == NULL;
+	unsigned long recently_deleted_ino = EXT4_INODES_PER_GROUP(sb);
+
+next:
+	// 从位图里找一个空闲的位
+	*ino = ext4_find_next_zero_bit((unsigned long *)
+				       bitmap->b_data,
+				       EXT4_INODES_PER_GROUP(sb), *ino);
+	// 大于组的最大inode值
+	if (*ino >= EXT4_INODES_PER_GROUP(sb))
+		goto not_found;
+
+	// 判断是否是最近删除的, 最近指的是一分钟
+	if (check_recently_deleted && recently_deleted(sb, group, *ino)) {
+		// 如果是一分钏之内删除的,就从下一个ino开始重新找
+		recently_deleted_ino = *ino;
+		*ino = *ino + 1;
+		if (*ino < EXT4_INODES_PER_GROUP(sb))
+			goto next;
+		goto not_found;
+	}
+	return 1;
+not_found:
+	// 最近删除的大于组inode数
+	if (recently_deleted_ino >= EXT4_INODES_PER_GROUP(sb))
+		return 0;
+	
+	// 没有大于就使用最近删除的
+	/*
+	 * Not reusing recently deleted inodes is mostly a preference. We don't
+	 * want to report ENOSPC or skew allocation patterns because of that.
+	 * So return even recently deleted inode if we could find better in the
+	 * given range.
+	 */
+	*ino = recently_deleted_ino;
+	return 1;
 }
 ```
 ### 2.1 ext4_alloc_inode
@@ -819,6 +878,7 @@ static int find_group_other(struct super_block *sb, struct inode *parent,
 	// ngroups：组数
 	ext4_group_t i, last, ngroups = ext4_get_groups_count(sb);
 	struct ext4_group_desc *desc;
+	// flex_group大小
 	int flex_size = ext4_flex_bg_size(EXT4_SB(sb));
 
 	/*
@@ -937,6 +997,7 @@ static int ext4_add_nondir(handle_t *handle,
 	// 走到这儿表示出错了，要释放资源
 
 	drop_nlink(inode);
+	// 添加到sbi的孤儿列表
 	ext4_orphan_add(handle, inode);
 	unlock_new_inode(inode);
 	return err;
