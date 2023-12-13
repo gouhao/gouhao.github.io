@@ -1058,7 +1058,8 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		}
 	}
 
-	// 如果当前目录是dir_index
+	// 如果当前目录是dir_index, 如果是个新目录,则开始是没有这标志的
+	// 新目录在第一个块写满之后才会转化成dir_index
 	if (is_dx(dir)) {
 		// 添加目录
 		retval = ext4_dx_add_entry(handle, &fname, dir, inode);
@@ -1089,7 +1090,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		// 读取目录数据块, 这个函数在读块时,还会对块的校验和进行校验
 		bh = ext4_read_dirblock(dir, block, DIRENT);
 
-		// 如果块为空，分配一个块。todo: bh为什么会为NULL?
+		// 如果块为空，分配一个块。
 		if (bh == NULL) {
 			bh = ext4_bread(handle, dir, block,
 					EXT4_GET_BLOCKS_CREATE);

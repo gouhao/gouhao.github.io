@@ -98,10 +98,11 @@ ext4_find_extent(struct inode *inode, ext4_lblk_t block,
 
 		// 找到块对应的索引结点, 找的是小于等于目标块的
 		ext4_ext_binsearch_idx(inode, path + ppos, block);
-		// 对应的下一层的物理块号
+		// 对应的下一层的物理块号, p_idx在上面的binsearch里已经设置
 		path[ppos].p_block = ext4_idx_pblock(path[ppos].p_idx);
 		// 以当前节点为根的深度, 越靠上的节点深度越大
 		path[ppos].p_depth = i;
+		// 索引结点没有extent
 		path[ppos].p_ext = NULL;
 
 		// 读出下一层的物理块
@@ -113,7 +114,7 @@ ext4_find_extent(struct inode *inode, ext4_lblk_t block,
 			goto err;
 		}
 
-		// eh指向下一层的头
+		// eh指向下一层的头, 中间节点不存header, bh里所有的数据都用来存idx/extent
 		eh = ext_block_hdr(bh);
                 // 增加下标
 		ppos++;
@@ -135,7 +136,7 @@ ext4_find_extent(struct inode *inode, ext4_lblk_t block,
 
 	// 找到了extent
 	if (path[ppos].p_ext)
-		// 设置物理块
+		// 设置extent物理块
 		path[ppos].p_block = ext4_ext_pblock(path[ppos].p_ext);
 
 	// 在调试模式下打印状态

@@ -1,6 +1,90 @@
 # ext4_get_block
 源码基于5.10
 
+## ext4_bread
+```c
+struct buffer_head *ext4_bread(handle_t *handle, struct inode *inode,
+			       ext4_lblk_t block, int map_flags)
+{
+	struct buffer_head *bh;
+	int ret;
+
+	bh = ext4_getblk(handle, inode, block, map_flags);
+	if (IS_ERR(bh))
+		return bh;
+	if (!bh || ext4_buffer_uptodate(bh))
+		return bh;
+
+	ret = ext4_read_bh_lock(bh, REQ_META | REQ_PRIO, true);
+	if (ret) {
+		put_bh(bh);
+		return ERR_PTR(ret);
+	}
+	return bh;
+}
+
+struct buffer_head *ext4_getblk(handle_t *handle, struct inode *inode,
+				ext4_lblk_t block, int map_flags)
+{
+	struct ext4_map_blocks map;
+	struct buffer_head *bh;
+	int create = map_flags & EXT4_GET_BLOCKS_CREATE;
+	int err;
+
+	J_ASSERT((EXT4_SB(inode->i_sb)->s_mount_state & EXT4_FC_REPLAY)
+		 || handle != NULL || create == 0);
+
+	// 逻辑块
+	map.m_lblk = block;
+	// 块数
+	map.m_len = 1;
+	// 映射块
+	err = ext4_map_blocks(handle, inode, &map, map_flags);
+
+	if (err == 0)
+		return create ? ERR_PTR(-ENOSPC) : NULL;
+	if (err < 0)
+		return ERR_PTR(err);
+
+	bh = sb_getblk(inode->i_sb, map.m_pblk);
+	if (unlikely(!bh))
+		return ERR_PTR(-ENOMEM);
+	if (map.m_flags & EXT4_MAP_NEW) {
+		J_ASSERT(create != 0);
+		J_ASSERT((EXT4_SB(inode->i_sb)->s_mount_state & EXT4_FC_REPLAY)
+			 || (handle != NULL));
+
+		/*
+		 * Now that we do not always journal data, we should
+		 * keep in mind whether this should always journal the
+		 * new buffer as metadata.  For now, regular file
+		 * writes use ext4_get_block instead, so it's not a
+		 * problem.
+		 */
+		lock_buffer(bh);
+		BUFFER_TRACE(bh, "call get_create_access");
+		err = ext4_journal_get_create_access(handle, bh);
+		if (unlikely(err)) {
+			unlock_buffer(bh);
+			goto errout;
+		}
+		if (!buffer_uptodate(bh)) {
+			memset(bh->b_data, 0, inode->i_sb->s_blocksize);
+			set_buffer_uptodate(bh);
+		}
+		unlock_buffer(bh);
+		BUFFER_TRACE(bh, "call ext4_handle_dirty_metadata");
+		err = ext4_handle_dirty_metadata(handle, inode, bh);
+		if (unlikely(err))
+			goto errout;
+	} else
+		BUFFER_TRACE(bh, "not a new buffer");
+	return bh;
+errout:
+	brelse(bh);
+	return ERR_PTR(err);
+}
+```
 ## 1. ext4_get_block
 ```c
 /*
@@ -170,7 +254,7 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
 
 	down_read(&EXT4_I(inode)->i_data_sem);
 
-	// 根据是否有extent特性来决定使用哪种方式来映射块, 这一次flag传的是0, 表示如果找不到,则不创建
+	// 根据是否有extent特性来决定使用哪种方式来映射块, 这里flag传的是0, 表示如果找不到,则不创建
 	if (ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)) {
 		// extent映射
 		retval = ext4_ext_map_blocks(handle, inode, map, 0);
@@ -411,6 +495,7 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 		goto out;
 	}
 
+	// 最后一个extent
 	ex = path[depth].p_ext;
 	// 找到了extent
 	if (ex) {
@@ -456,7 +541,7 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 				// extent里剩余的块比要求的多,则已要求的为主
 				if (allocated > map->m_len)
 					allocated = map->m_len;
-				// 设置已分配数量
+				// 设置已映射数量
 				map->m_len = allocated;
 				// 调试打印
 				ext4_ext_show_leaf(inode, path);
@@ -970,8 +1055,7 @@ ext4_ext_handle_unwritten_extents(handle_t *handle, struct inode *inode,
 	ext4_ext_show_leaf(inode, path);
 
 	/*
-	 * When writing into unwritten space, we should not fail to
-	 * allocate metadata blocks for the new extent block if needed.
+	 * 当向unwritten空间写时,我们如果要给新extent分配元数据块时,不允许失败
 	 */
 	flags |= EXT4_GET_BLOCKS_METADATA_NOFAIL;
 
@@ -1000,7 +1084,7 @@ ext4_ext_handle_unwritten_extents(handle_t *handle, struct inode *inode,
 		map->m_flags |= EXT4_MAP_UNWRITTEN;
 		goto out;
 	}
-	/* IO end_io complete, convert the filled extent to written */
+	/* IO 结束后,把已填充的extent转成writen */
 	if (flags & EXT4_GET_BLOCKS_CONVERT) {
 		err = ext4_convert_unwritten_extents_endio(handle, inode, map,
 							   ppath);
