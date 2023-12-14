@@ -269,7 +269,7 @@ static int ext4_ext_search_left(struct inode *inode,
 	depth = path->p_depth;
 	*phys = 0;
 
-	// 如果深度是0, extent为空, 那就不用搜索了
+	// 如果深度是0, extent为空, 那就不用搜索了,说明是空文件
 	if (depth == 0 && path->p_ext == NULL)
 		return 0;
 
@@ -341,7 +341,7 @@ static int ext4_ext_search_right(struct inode *inode,
 	int depth;	/* Note, NOT eh_depth; depth from top of tree */
 	int ee_len;
 
-	// path不能等于NULL. todo: why?
+	// path不能等于NULL.
 	if (unlikely(path == NULL)) {
 		EXT4_ERROR_INODE(inode, "path == NULL *logical %d!", *logical);
 		return -EFSCORRUPTED;

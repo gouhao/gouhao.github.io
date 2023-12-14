@@ -593,7 +593,7 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 	
 	// 起始块
 	newex.ee_block = cpu_to_le32(map->m_lblk);
-	// 起始块在一个cluster里的偏移. todo: cluster是多少个块?
+	// 起始块在一个cluster里的偏移.
 	cluster_offset = EXT4_LBLK_COFF(sbi, map->m_lblk);
 
 	// 如果之前找到ex. todo: what?
@@ -607,6 +607,7 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 	// 分配起点
 	ar.lleft = map->m_lblk;
 	// 找最靠近左边的块, 经过这个函数后lleft指向左边最近的逻辑块, pleft指向物理块
+	// 大多数情况下取的都是path[depth].p_ext的逻辑块及物理块
 	err = ext4_ext_search_left(inode, path, &ar.lleft, &ar.pleft);
 	if (err)
 		goto out;
@@ -617,7 +618,7 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 	if (err < 0)
 		goto out;
 
-	// cluster相关,后面再看
+	// 从cluster里分配,后面再看
 	if ((sbi->s_cluster_ratio > 1) && err &&
 	    get_implied_cluster_alloc(inode->i_sb, map, &ex2, path)) {
 		ar.len = allocated = map->m_len;
@@ -651,11 +652,11 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 	ar.goal = ext4_ext_find_goal(inode, path, map->m_lblk);
 	// 逻辑块号
 	ar.logical = map->m_lblk;
-	// 偏移
+	// cluster内的偏移
 	offset = EXT4_LBLK_COFF(sbi, map->m_lblk);
-	// 最终的长度
+	// 最终的长度, 转换成cluster的数量
 	ar.len = EXT4_NUM_B2C(sbi, offset+allocated);
-	// 目标
+	// 目标转成cluster号
 	ar.goal -= offset;
 	// 逻辑块偏移
 	ar.logical -= offset;
