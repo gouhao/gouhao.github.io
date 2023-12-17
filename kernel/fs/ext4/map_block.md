@@ -1385,7 +1385,7 @@ static int ext4_can_extents_be_merged(struct inode *inode,
 		return 0;
 #endif
 
-	// 物理块是连续的才可合并. 所以合并的条件是: 1. written状态相关; 2. 逻辑块
+	// 物理块是连续的才可合并. 所以合并的条件是: 1. written状态相同; 2. 逻辑块
 	// 连续; 3. 合并后长度没有超过最大值; 4. 物理块连续
 	if (ext4_ext_pblock(ex1) + ext1_ee_len == ext4_ext_pblock(ex2))
 		return 1;

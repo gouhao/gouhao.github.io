@@ -597,17 +597,23 @@ prepend:
 	// newext比最后一个extent起点还大, 则获取下一个叶子节点
 	if (le32_to_cpu(newext->ee_block) > le32_to_cpu(fex->ee_block))
 		next = ext4_ext_next_leaf_block(path);
+	
+	// next不等于EXT_MAX_BLOCKS说明返回了正常的块号
 	if (next != EXT_MAX_BLOCKS) {
 		ext_debug(inode, "next leaf block - %u\n", next);
 		BUG_ON(npath != NULL);
+		// 找下一个块的path
 		npath = ext4_find_extent(inode, next, NULL, gb_flags);
 		if (IS_ERR(npath))
 			return PTR_ERR(npath);
 		BUG_ON(npath->p_depth != path->p_depth);
 		eh = npath[depth].p_hdr;
+
+		// 下一个叶节点还有空闲
 		if (le16_to_cpu(eh->eh_entries) < le16_to_cpu(eh->eh_max)) {
 			ext_debug(inode, "next leaf isn't full(%d)\n",
 				  le16_to_cpu(eh->eh_entries));
+			// 使用下个叶结点
 			path = npath;
 			goto has_space;
 		}
@@ -615,7 +621,8 @@ prepend:
 			  le16_to_cpu(eh->eh_entries), le16_to_cpu(eh->eh_max));
 	}
 
-	// 走到这儿说明 next == EXT_MAX_BLOCKS, 获取下一个叶子节点失败
+	// 走到这儿说明 next == EXT_MAX_BLOCKS, 获取下一个叶子节点失败, 要对extent层级进行
+	// 扩充或者重新添加一个叶子节点
 
 	// 如果有nofail标志, 要使用保留的
 	if (gb_flags & EXT4_GET_BLOCKS_METADATA_NOFAIL)
@@ -727,6 +734,35 @@ cleanup:
 	kfree(npath);
 	return err;
 }
+static ext4_lblk_t ext4_ext_next_leaf_block(struct ext4_ext_path *path)
+{
+	int depth;
+
+	BUG_ON(path == NULL);
+	// 层数
+	depth = path->p_depth;
+
+	/* 0层的没有叶子block */
+	if (depth == 0)
+		return EXT_MAX_BLOCKS;
+
+	// 走到这儿说明层数大于0, 则递减1,肯定是索引块
+	depth--;
+
+	while (depth >= 0) {
+		// 不是最后一个索引块,说明还有空间
+		if (path[depth].p_idx !=
+				EXT_LAST_INDEX(path[depth].p_hdr))
+			// 返回下一个索引的块
+			return (ext4_lblk_t)
+				le32_to_cpu(path[depth].p_idx[1].ei_block);
+		// 走到这儿说明没空间了
+		depth--;
+	}
+
+	return EXT_MAX_BLOCKS;
+}
+
 ```
 insert的主要流程:  
 1. 先判断与前后extent能否合并, 如果可以则直接跳到第5步  
