@@ -47,16 +47,16 @@ struct ext4_allocation_context {
 	struct inode *ac_inode;
 	struct super_block *ac_sb;
 
-	/* original request */
+	/* 原始请求 */
 	struct ext4_free_extent ac_o_ex;
 
-	/* goal request (normalized ac_o_ex) */
+	/* 目标请求 (标准化的 ac_o_ex) */
 	struct ext4_free_extent ac_g_ex;
 
-	/* the best found extent */
+	/* 找到的最好的extent */
 	struct ext4_free_extent ac_b_ex;
 
-	/* copy of the best found extent taken before preallocation efforts */
+	/* 在预分配之前复制找到的最好的extent */
 	struct ext4_free_extent ac_f_ex;
 
 	__u16 ac_groups_scanned;

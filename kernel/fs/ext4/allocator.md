@@ -2411,10 +2411,10 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	if (goal < le32_to_cpu(es->s_first_data_block) ||
 			goal >= ext4_blocks_count(es))
 		goal = le32_to_cpu(es->s_first_data_block);
-	// 找到goal所在的组及组内块偏移
+	// 找到goal所在的组及cluster号
 	ext4_get_group_no_and_offset(sb, goal, &group, &block);
 
-	// 设置best的起始逻辑块
+	// 把逻辑块转成cluster号,再设置给best
 	ac->ac_b_ex.fe_logical = EXT4_LBLK_CMASK(sbi, ar->logical);
 
 	// 初始状态置为还没分配到
@@ -2433,7 +2433,7 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 
 	ac->ac_flags = ar->flags;
 
-	// 决定使用lg或per-inode预分配
+	// 决定使用lg或per-inode预分配, 大文件使用per-inode, 小文件使用per-group
 	ext4_mb_group_or_file(ac);
 
 	mb_debug(sb, "init ac: %u blocks @ %u, goal %u, flags 0x%x, 2^%d, "
@@ -2453,7 +2453,7 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
 	int bsbits = ac->ac_sb->s_blocksize_bits;
 	loff_t size, isize;
 
-	// 文件没有数据则返回, 一般文件会有这个标志
+	// 文件没有数据则返回, 一般文件会有这个标志, 所以只对文件进行优化
 	if (!(ac->ac_flags & EXT4_MB_HINT_DATA))
 		return;
 
@@ -2461,7 +2461,7 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
 	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
 		return;
 
-	// 新的结尾，单位是块数
+	// 新的结尾，单位是块数.EXT4_C2B是把cluster的数量转成块数
 	size = ac->ac_o_ex.fe_logical + EXT4_C2B(sbi, ac->ac_o_ex.fe_len);
 	// 当前文件块数 
 	isize = (i_size_read(ac->ac_inode) + ac->ac_sb->s_blocksize - 1)
@@ -2481,6 +2481,7 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
 		return;
 	}
 
+	// size是经过分配之后的文件大小
 	size = max(size, isize);
 
 	// s_mb_stream_request是区分大文件与小文件的界线,单位是块
@@ -2590,8 +2591,8 @@ void ext4_get_group_no_and_offset(struct super_block *sb, ext4_fsblk_t blocknr,
 
 	// 距离第1个数据块的偏移
 	blocknr = blocknr - le32_to_cpu(es->s_first_data_block);
-	// do_div的效果: blocknr/=blocks_per_group, offset=blocknr % blocks_per_group
-	// 并将找到的块号对齐到cluster
+	// do_div的效果: blocknr/=blocks_per_group, offset=blocknr % blocks_per_group, 返回值是offset
+	// 最后把offset转成cluster的号
 	offset = do_div(blocknr, EXT4_BLOCKS_PER_GROUP(sb)) >>
 		EXT4_SB(sb)->s_cluster_bits;
 	if (offsetp)
@@ -2764,7 +2765,7 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 	// 遍历inode的per-inode表
 	list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
 
-		// 不在pa范围
+		// 不在pa范围.todo: fe_logical的单位是cluster, 这里却把pa_len转换成了块数
 		if (ac->ac_o_ex.fe_logical < pa->pa_lstart ||
 		    ac->ac_o_ex.fe_logical >= (pa->pa_lstart +
 					       EXT4_C2B(sbi, pa->pa_len)))
@@ -2796,7 +2797,7 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 
 	// 走到这儿表示在pa-inode里没找到
 
-	// 不能使用组预分配, 直接返回
+	// 不能使用组预分配, 直接返回. 组预分配是小文件
 	if (!(ac->ac_flags & EXT4_MB_HINT_GROUP_ALLOC))
 		return false;
 
@@ -2814,7 +2815,7 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 		/* The max size of hash table is PREALLOC_TB_SIZE */
 		order = PREALLOC_TB_SIZE - 1;
 
-	// 找到对应的块
+	// 找到goal对应的块
 	goal_block = ext4_grp_offs_to_block(ac->ac_sb, &ac->ac_g_ex);
 	// 找一个离目标块最近的pa
 	for (i = order; i < PREALLOC_TB_SIZE; i++) {
@@ -2843,10 +2844,12 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 	return false;
 }
 
+// 算出fex->fe_start在全局的块号
 static inline ext4_fsblk_t ext4_grp_offs_to_block(struct super_block *sb,
 					struct ext4_free_extent *fex)
 {
 	// 最终要转成cluster
+	// ext4_group_first_block_no 组的第一个块号在全局的号, 再加上cluster转成块号
 	return ext4_group_first_block_no(sb, fex->fe_group) +
 		(fex->fe_start << EXT4_SB(sb)->s_cluster_bits);
 }
