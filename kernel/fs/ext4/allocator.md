@@ -621,10 +621,9 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 		// 获取组信息
 		grinfo = ext4_get_group_info(sb, group);
 		/*
-		 * If page is uptodate then we came here after online resize
-		 * which added some new uninitialized group info structs, so
-		 * we must skip all initialized uptodate buddies on the page,
-		 * which may be currently in use by an allocating task.
+		 * 如果page是最新的,当有人添加了新的未初始化的组时我们会到这儿是在在线
+		 * resize之后, 所以我们必须跳过所有已初始化的buddy也许正在被分配的task
+		 * 使用.
 		 */
 		// 页是最新的，且当前group不需要初始化，则继续
 		if (PageUptodate(page) && !EXT4_MB_GRP_NEED_INIT(grinfo)) {
@@ -647,15 +646,17 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 
 		if (!bh[i])
 			continue;
+		// 这个函数返回0表示错误
 		err2 = ext4_wait_block_bitmap(sb, group, bh[i]);
+
 		if (!err)
 			err = err2;
 	}
 
-	// 页里面第一个块号
+	// 页里面第一个块号, 初始化页里所有的块
 	first_block = page->index * blocks_per_page;
 	for (i = 0; i < blocks_per_page; i++) {
-		// 块号对应的组
+		// 块号对应的组, 一组有2个块, 所以要除以2
 		group = (first_block + i) >> 1;
 		// 超过最大组
 		if (group >= ngroups)
@@ -670,7 +671,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 			continue;
 		err = 0;
 
-		// 对应的块起始地址
+		// i对应的块起始地址
 		data = page_address(page) + (i * blocksize);
 		// 第1个块是位图
 		bitmap = bh[group - first_group]->b_data;
@@ -684,6 +685,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 			trace_ext4_mb_buddy_bitmap_load(sb, group);
 			// 组信息
 			grinfo = ext4_get_group_info(sb, group);
+			// 片段归0
 			grinfo->bb_fragments = 0;
 
 			// 把所有的counter清0
@@ -694,7 +696,7 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 			ext4_lock_group(sb, group);
 			// 把块全部设成1
 			memset(data, 0xff, blocksize);
-			// 生成buddy信息
+			// 根据位图生成buddy信息
 			ext4_mb_generate_buddy(sb, data, incore, group);
 			ext4_unlock_group(sb, group);
 			incore = NULL;
@@ -710,8 +712,9 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 			// 把位图复制到页里
 			memcpy(data, bitmap, blocksize);
 
-			// 把预分配的标记为使用
+			// 把组内预分配的标记为使用
 			ext4_mb_generate_from_pa(sb, data, group);
+			// 把组内空闲块标记为已使用
 			ext4_mb_generate_from_freelist(sb, data, group);
 			ext4_unlock_group(sb, group);
 
@@ -719,9 +722,11 @@ static int ext4_mb_init_cache(struct page *page, char *incore, gfp_t gfp)
 			incore = data;
 		}
 	}
+	// 设置页为最新
 	SetPageUptodate(page);
 
 out:
+	// 释放bh
 	if (bh) {
 		for (i = 0; i < groups_per_page; i++)
 			brelse(bh[i]);
@@ -744,13 +749,10 @@ void ext4_mb_generate_from_pa(struct super_block *sb, void *bitmap,
 	int preallocated = 0;
 	int len;
 
-	/* all form of preallocation discards first load group,
-	 * so the only competing code is preallocation use.
-	 * we don't need any locking here
-	 * notice we do NOT ignore preallocations with pa_deleted
-	 * otherwise we could leave used blocks available for
-	 * allocation in buddy when concurrent ext4_mb_put_pa()
-	 * is dropping preallocation
+	/* 所有形式的预分配都会丢弃第一次加载的组, 所以竞争的代码只有预分配,
+	 * 在这里我们不需要任何锁. 注意: 我们不要忽略pa_deleted的预分配,否则
+	 * 当并行执行ext4_mb_put_pa丢弃预分配时,我们可以在buddy中保留已使用
+	 * 的块已供使用.
 	 */
 	// 遍历预分配列表
 	list_for_each(cur, &grp->bb_prealloc_list) {
@@ -1367,7 +1369,7 @@ static int ext4_mb_pa_alloc(struct ext4_allocation_context *ac)
 	return 0;
 }
 ```
-## 11. ext4_mb_regular_allocator
+## 4. ext4_mb_regular_allocator
 ```c
 static noinline_for_stack int
 ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
@@ -1569,7 +1571,12 @@ out:
 
 	return err;
 }
+```
+1. 找目标处能否分配
+2. 尝试从其他地方开始分配
 
+
+```c
 static noinline_for_stack
 void ext4_mb_scan_aligned(struct ext4_allocation_context *ac,
 				 struct ext4_buddy *e4b)
@@ -1948,7 +1955,11 @@ static bool ext4_mb_good_group(struct ext4_allocation_context *ac,
 
 	return false;
 }
+```
 
+
+## ext4_mb_find_by_goal
+```c
 static noinline_for_stack
 int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 				struct ext4_buddy *e4b)
@@ -2033,7 +2044,10 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 
 	return 0;
 }
+```
 
+### ext4_mb_load_buddy
+```c
 static int ext4_mb_load_buddy(struct super_block *sb, ext4_group_t group,
 			      struct ext4_buddy *e4b)
 {
@@ -2063,6 +2077,8 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 	// 组信息
 	grp = ext4_get_group_info(sb, group);
 
+	// 初始化e4b
+
 	// 块大小
 	e4b->bd_blkbits = sb->s_blocksize_bits;
 	// group info
@@ -2074,11 +2090,10 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 	e4b->bd_buddy_page = NULL;
 	e4b->bd_bitmap_page = NULL;
 
-	// 组需要先初始化
+	// 组需要先初始化, 第一次有这个标志,会直接初始化
 	if (unlikely(EXT4_MB_GRP_NEED_INIT(grp))) {
 		/*
-		 * we need full data about the group
-		 * to make a good selection
+		 * 我们需要组完整的数据,来做一个好的选择
 		 */
 		ret = ext4_mb_init_group(sb, group, gfp);
 		if (ret)
@@ -2087,12 +2102,12 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 
 	/*
 	 * 每个组有2个位图块, 第一块是位图信息,第二块是buddy信息,
-	 * 所以组号*2就是该组的起始块号
+	 * 所以组号*2就是该组的起始块号, 这个块号是想对于inode来说的
 	 */
 	block = group * 2;
 	// 页号
 	pnum = block / blocks_per_page;
-	// 块在页内偏移, 因为有可能一页里放多个块
+	// 块在页内偏移, 因为有可能一页里放多个块, 这个偏移的单位是块号
 	poff = block % blocks_per_page;
 
 	// 获取对应的页
@@ -2101,19 +2116,17 @@ ext4_mb_load_buddy_gfp(struct super_block *sb, ext4_group_t group,
 		// 如果page为空或者不是最新的，则重新创建一个
 		if (page)
 			/*
-			 * drop the page reference and try
-			 * to get the page with lock. If we
-			 * are not uptodate that implies
-			 * somebody just created the page but
-			 * is yet to initialize the same. So
-			 * wait for it to initialize.
+			 * 丢弃页引用, 尝试在持有锁时获取页. 如果我们不是最新的,则暗示其他人创建
+			 * 了初始化相同的页, 所以等它初始化
 			 */
 			put_page(page);
+		// 获取pnum对应的页
 		page = find_or_create_page(inode->i_mapping, pnum, gfp);
 		if (page) {
 			// 什么情况下会有这种?
 			BUG_ON(page->mapping != inode->i_mapping);
 			// 页面不是最新的,则初始化该组的buddy, 对于位图传的是NULL
+			// 新创建的page也会走这个分支
 			if (!PageUptodate(page)) {
 				ret = ext4_mb_init_cache(page, NULL, gfp);
 				if (ret) {
