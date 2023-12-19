@@ -1115,6 +1115,242 @@ out:
 
 	return block;
 }
+```
+1. 检查配额相关  
+2. 分配并初始化分配上下文
+3. 使用预分配，分配成功就返回
+4. 正常分配，分配成功了就返回
+
+## 3. 正常分配
+正常分配：
+1. 首先将请求标准化
+2. 然后给ac分配一个pa对象
+3. 分配块
+4. 如果分配成功就将块标记为已使用
+
+### 3.1 ext4_mb_normalize_request
+```c
+static noinline_for_stack void
+ext4_mb_normalize_request(struct ext4_allocation_context *ac,
+				struct ext4_allocation_request *ar)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	int bsbits, max;
+	ext4_lblk_t end;
+	loff_t size, start_off;
+	loff_t orig_size __maybe_unused;
+	ext4_lblk_t start;
+	struct ext4_inode_info *ei = EXT4_I(ac->ac_inode);
+	struct ext4_prealloc_space *pa;
+
+	/* 只对数据请求进行标准化, 元数据请求不需要 */
+	if (!(ac->ac_flags & EXT4_MB_HINT_DATA))
+		return;
+
+	/* 调用者只想要精确的块 */
+	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
+		return;
+
+	/* 调用者不想要预分配 (比如结尾) */
+	if (ac->ac_flags & EXT4_MB_HINT_NOPREALLOC)
+		return;
+
+	// 使用组分配，则进行组标准化
+	if (ac->ac_flags & EXT4_MB_HINT_GROUP_ALLOC) {
+		ext4_mb_normalize_group_request(ac);
+		return ;
+	}
+
+	// 走到这儿就是使用stream预分配
+
+	// 块大小
+	bsbits = ac->ac_sb->s_blocksize_bits;
+
+	// 分配后文件大小（以块为单位）
+	size = ac->ac_o_ex.fe_logical + EXT4_C2B(sbi, ac->ac_o_ex.fe_len);
+	// 转成byte
+	size = size << bsbits;
+	// 如果比当前文件小，则以当前文件大小为准
+	if (size < i_size_read(ac->ac_inode))
+		size = i_size_read(ac->ac_inode);
+	orig_size = size;
+
+	// 一次分配的最大为块大小4倍
+	max = 2 << bsbits;
+
+#define NRL_CHECK_SIZE(req, size, max, chunk_size)	\
+		(req <= (size) || max <= (chunk_size))
+
+	start_off = 0;
+
+	// 这是干什么？
+	if (size <= 16 * 1024) {
+		size = 16 * 1024;
+	} else if (size <= 32 * 1024) {
+		size = 32 * 1024;
+	} else if (size <= 64 * 1024) {
+		size = 64 * 1024;
+	} else if (size <= 128 * 1024) {
+		size = 128 * 1024;
+	} else if (size <= 256 * 1024) {
+		size = 256 * 1024;
+	} else if (size <= 512 * 1024) {
+		size = 512 * 1024;
+	} else if (size <= 1024 * 1024) {
+		size = 1024 * 1024;
+	} else if (NRL_CHECK_SIZE(size, 4 * 1024 * 1024, max, 2 * 1024)) {
+		start_off = ((loff_t)ac->ac_o_ex.fe_logical >>
+						(21 - bsbits)) << 21;
+		size = 2 * 1024 * 1024;
+	} else if (NRL_CHECK_SIZE(size, 8 * 1024 * 1024, max, 4 * 1024)) {
+		start_off = ((loff_t)ac->ac_o_ex.fe_logical >>
+							(22 - bsbits)) << 22;
+		size = 4 * 1024 * 1024;
+	} else if (NRL_CHECK_SIZE(ac->ac_o_ex.fe_len,
+					(8<<20)>>bsbits, max, 8 * 1024)) {
+		start_off = ((loff_t)ac->ac_o_ex.fe_logical >>
+							(23 - bsbits)) << 23;
+		size = 8 * 1024 * 1024;
+	} else {
+		start_off = (loff_t) ac->ac_o_ex.fe_logical << bsbits;
+		size	  = (loff_t) EXT4_C2B(EXT4_SB(ac->ac_sb),
+					      ac->ac_o_ex.fe_len) << bsbits;
+	}
+
+	// 把规范后的size转成块
+	size = size >> bsbits;
+	start = start_off >> bsbits;
+
+	/* 在选择的范围内不要覆盖已经配的块 */
+	// 把start限制在left的左边
+	if (ar->pleft && start <= ar->lleft) {
+		size -= ar->lleft + 1 - start;
+		start = ar->lleft + 1;
+	}
+
+	// size限制到start的右边
+	if (ar->pright && start + size - 1 >= ar->lright)
+		size -= start + size - ar->lright;
+
+	/*
+	 * 把请求规范到组大小里
+	 */
+	if (size > EXT4_BLOCKS_PER_GROUP(ac->ac_sb))
+		size = EXT4_BLOCKS_PER_GROUP(ac->ac_sb);
+
+	// start是标准化后的起点
+	end = start + size;
+
+	
+	rcu_read_lock();
+
+	/* 先检查预分配的块 */
+	list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
+		ext4_lblk_t pa_end;
+
+		// 已删除
+		if (pa->pa_deleted)
+			continue;
+
+		spin_lock(&pa->pa_lock);
+		// 加锁之后情况可能改变, 所以再判断一次
+		if (pa->pa_deleted) {
+			spin_unlock(&pa->pa_lock);
+			continue;
+		}
+
+		// 物理结束块
+		pa_end = pa->pa_lstart + EXT4_C2B(EXT4_SB(ac->ac_sb),
+						  pa->pa_len);
+
+		// pa不应该与原始请求重叠
+		BUG_ON(!(ac->ac_o_ex.fe_logical >= pa_end ||
+			ac->ac_o_ex.fe_logical < pa->pa_lstart));
+
+		/* 物理块不在想要的范围内 */
+		if (pa->pa_lstart >= end || pa_end <= start) {
+			spin_unlock(&pa->pa_lock);
+			continue;
+		}
+		// todo： 为什么不能在pa的范围内
+		BUG_ON(pa->pa_lstart <= start && pa_end >= end);
+
+		/* 把start或end限制到这个pa的位置 */
+		if (pa_end <= ac->ac_o_ex.fe_logical) {
+			BUG_ON(pa_end < start);
+			start = pa_end;
+		} else if (pa->pa_lstart > ac->ac_o_ex.fe_logical) {
+			BUG_ON(pa->pa_lstart > end);
+			end = pa->pa_lstart;
+		}
+		spin_unlock(&pa->pa_lock);
+	}
+	rcu_read_unlock();
+
+	// 最终大小
+	size = end - start;
+
+	/* XXX: 再循环一遍检查我们真的没有重叠 */
+	rcu_read_lock();
+	list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
+		ext4_lblk_t pa_end;
+
+		spin_lock(&pa->pa_lock);
+		// pa没有删除
+		if (pa->pa_deleted == 0) {
+			pa_end = pa->pa_lstart + EXT4_C2B(EXT4_SB(ac->ac_sb),
+							  pa->pa_len);
+			BUG_ON(!(start >= pa_end || end <= pa->pa_lstart));
+		}
+		spin_unlock(&pa->pa_lock);
+	}
+	rcu_read_unlock();
+
+	// size为负
+	if (start + size <= ac->ac_o_ex.fe_logical &&
+			start > ac->ac_o_ex.fe_logical) {
+		ext4_msg(ac->ac_sb, KERN_ERR,
+			 "start %lu, size %lu, fe_logical %lu",
+			 (unsigned long) start, (unsigned long) size,
+			 (unsigned long) ac->ac_o_ex.fe_logical);
+		BUG();
+	}
+
+	// size不能为0
+	BUG_ON(size <= 0 || size > EXT4_BLOCKS_PER_GROUP(ac->ac_sb));
+
+	/* 准备目标请求 */
+
+	/* XXX: 尽量对齐块或范围大分配的请求 */
+	ac->ac_g_ex.fe_logical = start;
+	// cluster数量
+	ac->ac_g_ex.fe_len = EXT4_NUM_B2C(sbi, size);
+
+	// 把目标对齐到右边界上方便合并
+	if (ar->pright && (ar->lright == (start + size))) {
+		/* merge to the right */
+		ext4_get_group_no_and_offset(ac->ac_sb, ar->pright - size,
+						&ac->ac_f_ex.fe_group,
+						&ac->ac_f_ex.fe_start);
+		ac->ac_flags |= EXT4_MB_HINT_TRY_GOAL;
+	}
+
+	// 把目标对齐到左边界上方便合并
+	if (ar->pleft && (ar->lleft + 1 == start)) {
+		/* merge to the left */
+		ext4_get_group_no_and_offset(ac->ac_sb, ar->pleft + 1,
+						&ac->ac_f_ex.fe_group,
+						&ac->ac_f_ex.fe_start);
+		ac->ac_flags |= EXT4_MB_HINT_TRY_GOAL;
+	}
+
+	mb_debug(ac->ac_sb, "goal: %lld(was %lld) blocks at %u\n", size,
+		 orig_size, start);
+}
+```
+
+### 3.2 ext4_mb_pa_alloc
+```c
 
 static int ext4_mb_pa_alloc(struct ext4_allocation_context *ac)
 {
@@ -1131,7 +1367,6 @@ static int ext4_mb_pa_alloc(struct ext4_allocation_context *ac)
 	return 0;
 }
 ```
-
 ## 11. ext4_mb_regular_allocator
 ```c
 static noinline_for_stack int
@@ -2941,227 +3176,6 @@ static void ext4_mb_use_group_pa(struct ext4_allocation_context *ac,
 		 pa->pa_lstart-len, len, pa);
 }
 
-```
-
-## 1.3 ext4_mb_normalize_request
-```c
-static noinline_for_stack void
-ext4_mb_normalize_request(struct ext4_allocation_context *ac,
-				struct ext4_allocation_request *ar)
-{
-	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
-	int bsbits, max;
-	ext4_lblk_t end;
-	loff_t size, start_off;
-	loff_t orig_size __maybe_unused;
-	ext4_lblk_t start;
-	struct ext4_inode_info *ei = EXT4_I(ac->ac_inode);
-	struct ext4_prealloc_space *pa;
-
-	/* 只对数据请求进行标准化, 元数据请求不需要 */
-	if (!(ac->ac_flags & EXT4_MB_HINT_DATA))
-		return;
-
-	/* 调用者只想要精确的块 */
-	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
-		return;
-
-	/* 调用者不想要预分配 (比如结尾) */
-	if (ac->ac_flags & EXT4_MB_HINT_NOPREALLOC)
-		return;
-
-	// 使用组分配，则进行组标准化
-	if (ac->ac_flags & EXT4_MB_HINT_GROUP_ALLOC) {
-		ext4_mb_normalize_group_request(ac);
-		return ;
-	}
-
-	// 走到这儿就是使用stream预分配
-
-	// 块大小
-	bsbits = ac->ac_sb->s_blocksize_bits;
-
-	// 分配后文件大小（以块为单位）
-	size = ac->ac_o_ex.fe_logical + EXT4_C2B(sbi, ac->ac_o_ex.fe_len);
-	// 转成byte
-	size = size << bsbits;
-	// 如果比当前文件小，则以当前文件大小为准
-	if (size < i_size_read(ac->ac_inode))
-		size = i_size_read(ac->ac_inode);
-	orig_size = size;
-
-	// 一次分配的最大为块大小4倍
-	max = 2 << bsbits;
-
-#define NRL_CHECK_SIZE(req, size, max, chunk_size)	\
-		(req <= (size) || max <= (chunk_size))
-
-	start_off = 0;
-
-	// 这是干什么？
-	if (size <= 16 * 1024) {
-		size = 16 * 1024;
-	} else if (size <= 32 * 1024) {
-		size = 32 * 1024;
-	} else if (size <= 64 * 1024) {
-		size = 64 * 1024;
-	} else if (size <= 128 * 1024) {
-		size = 128 * 1024;
-	} else if (size <= 256 * 1024) {
-		size = 256 * 1024;
-	} else if (size <= 512 * 1024) {
-		size = 512 * 1024;
-	} else if (size <= 1024 * 1024) {
-		size = 1024 * 1024;
-	} else if (NRL_CHECK_SIZE(size, 4 * 1024 * 1024, max, 2 * 1024)) {
-		start_off = ((loff_t)ac->ac_o_ex.fe_logical >>
-						(21 - bsbits)) << 21;
-		size = 2 * 1024 * 1024;
-	} else if (NRL_CHECK_SIZE(size, 8 * 1024 * 1024, max, 4 * 1024)) {
-		start_off = ((loff_t)ac->ac_o_ex.fe_logical >>
-							(22 - bsbits)) << 22;
-		size = 4 * 1024 * 1024;
-	} else if (NRL_CHECK_SIZE(ac->ac_o_ex.fe_len,
-					(8<<20)>>bsbits, max, 8 * 1024)) {
-		start_off = ((loff_t)ac->ac_o_ex.fe_logical >>
-							(23 - bsbits)) << 23;
-		size = 8 * 1024 * 1024;
-	} else {
-		start_off = (loff_t) ac->ac_o_ex.fe_logical << bsbits;
-		size	  = (loff_t) EXT4_C2B(EXT4_SB(ac->ac_sb),
-					      ac->ac_o_ex.fe_len) << bsbits;
-	}
-
-	// 把规范后的size转成块
-	size = size >> bsbits;
-	start = start_off >> bsbits;
-
-	/* 在选择的范围内不要覆盖已经配的块 */
-	// 把start限制在left的左边
-	if (ar->pleft && start <= ar->lleft) {
-		size -= ar->lleft + 1 - start;
-		start = ar->lleft + 1;
-	}
-
-	// size限制到start的右边
-	if (ar->pright && start + size - 1 >= ar->lright)
-		size -= start + size - ar->lright;
-
-	/*
-	 * 把请求规范到组大小里
-	 */
-	if (size > EXT4_BLOCKS_PER_GROUP(ac->ac_sb))
-		size = EXT4_BLOCKS_PER_GROUP(ac->ac_sb);
-
-	// start是标准化后的起点
-	end = start + size;
-
-	
-	rcu_read_lock();
-
-	/* 先检查预分配的块 */
-	list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
-		ext4_lblk_t pa_end;
-
-		// 已删除
-		if (pa->pa_deleted)
-			continue;
-
-		spin_lock(&pa->pa_lock);
-		// 加锁之后情况可能改变, 所以再判断一次
-		if (pa->pa_deleted) {
-			spin_unlock(&pa->pa_lock);
-			continue;
-		}
-
-		// 物理结束块
-		pa_end = pa->pa_lstart + EXT4_C2B(EXT4_SB(ac->ac_sb),
-						  pa->pa_len);
-
-		// pa不应该与原始请求重叠
-		BUG_ON(!(ac->ac_o_ex.fe_logical >= pa_end ||
-			ac->ac_o_ex.fe_logical < pa->pa_lstart));
-
-		/* 物理块不在想要的范围内 */
-		if (pa->pa_lstart >= end || pa_end <= start) {
-			spin_unlock(&pa->pa_lock);
-			continue;
-		}
-		// todo： 为什么不能在pa的范围内
-		BUG_ON(pa->pa_lstart <= start && pa_end >= end);
-
-		/* 把start或end限制到这个pa的位置 */
-		if (pa_end <= ac->ac_o_ex.fe_logical) {
-			BUG_ON(pa_end < start);
-			start = pa_end;
-		} else if (pa->pa_lstart > ac->ac_o_ex.fe_logical) {
-			BUG_ON(pa->pa_lstart > end);
-			end = pa->pa_lstart;
-		}
-		spin_unlock(&pa->pa_lock);
-	}
-	rcu_read_unlock();
-
-	// 最终大小
-	size = end - start;
-
-	/* XXX: 再循环一遍检查我们真的没有重叠 */
-	rcu_read_lock();
-	list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
-		ext4_lblk_t pa_end;
-
-		spin_lock(&pa->pa_lock);
-		// pa没有删除
-		if (pa->pa_deleted == 0) {
-			pa_end = pa->pa_lstart + EXT4_C2B(EXT4_SB(ac->ac_sb),
-							  pa->pa_len);
-			BUG_ON(!(start >= pa_end || end <= pa->pa_lstart));
-		}
-		spin_unlock(&pa->pa_lock);
-	}
-	rcu_read_unlock();
-
-	// size为负
-	if (start + size <= ac->ac_o_ex.fe_logical &&
-			start > ac->ac_o_ex.fe_logical) {
-		ext4_msg(ac->ac_sb, KERN_ERR,
-			 "start %lu, size %lu, fe_logical %lu",
-			 (unsigned long) start, (unsigned long) size,
-			 (unsigned long) ac->ac_o_ex.fe_logical);
-		BUG();
-	}
-
-	// size不能为0
-	BUG_ON(size <= 0 || size > EXT4_BLOCKS_PER_GROUP(ac->ac_sb));
-
-	/* 准备目标请求 */
-
-	/* XXX: 尽量对齐块或范围大分配的请求 */
-	ac->ac_g_ex.fe_logical = start;
-	// cluster数量
-	ac->ac_g_ex.fe_len = EXT4_NUM_B2C(sbi, size);
-
-	// 把目标对齐到右边界上方便合并
-	if (ar->pright && (ar->lright == (start + size))) {
-		/* merge to the right */
-		ext4_get_group_no_and_offset(ac->ac_sb, ar->pright - size,
-						&ac->ac_f_ex.fe_group,
-						&ac->ac_f_ex.fe_start);
-		ac->ac_flags |= EXT4_MB_HINT_TRY_GOAL;
-	}
-
-	// 把目标对齐到左边界上方便合并
-	if (ar->pleft && (ar->lleft + 1 == start)) {
-		/* merge to the left */
-		ext4_get_group_no_and_offset(ac->ac_sb, ar->pleft + 1,
-						&ac->ac_f_ex.fe_group,
-						&ac->ac_f_ex.fe_start);
-		ac->ac_flags |= EXT4_MB_HINT_TRY_GOAL;
-	}
-
-	mb_debug(ac->ac_sb, "goal: %lld(was %lld) blocks at %u\n", size,
-		 orig_size, start);
-}
 ```
 
 ## 预分配
