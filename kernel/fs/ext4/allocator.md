@@ -1999,6 +1999,7 @@ int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
 	ex.fe_logical = 0xDEADFA11; /* debug value */
 
 	
+	// 可分配的长度大于需要的长度 && 需要的长度与raid的stipe对齐
 	if (max >= ac->ac_g_ex.fe_len && ac->ac_g_ex.fe_len == sbi->s_stripe) {
 		// 对raid的优化. todo: raid后面看	
 		ext4_fsblk_t start;
@@ -2219,7 +2220,7 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 	BUG_ON(ex == NULL);
 
 	// 获取最大可分配的值
-	// 因为这里传的是0, 所以返回的是位图
+	// 因为这里order传的是0, 所以返回的是位图的起点
 	buddy = mb_find_buddy(e4b, 0, &max);
 	BUG_ON(buddy == NULL);
 	BUG_ON(block >= max);
@@ -2230,6 +2231,7 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 		ex->fe_group = 0;
 		return 0;
 	}
+	// 走到这儿,表示块还没被分配
 
 	// 找从block开始的位置有空闲块的order，这里的block表示要分配的块号
 	order = mb_find_order_for_block(e4b, block);
@@ -2308,7 +2310,7 @@ static void *mb_find_buddy(struct ext4_buddy *e4b, int order, int *max)
 	BUG_ON(e4b->bd_bitmap == e4b->bd_buddy);
 	BUG_ON(max == NULL);
 
-	// order最大只能是块大小+1次幂
+	// order最大只能是块大小+1次幂. todo: why?
 	if (order > e4b->bd_blkbits + 1) {
 		*max = 0;
 		return NULL;
@@ -2317,15 +2319,15 @@ static void *mb_find_buddy(struct ext4_buddy *e4b, int order, int *max)
 	// 0阶时可以分配所有的块
 	if (order == 0) {
 		// blkbits是块大小, +3是一字节有8位, 这样算出来就是一个块能存多少位
-		// 如果块大小是4k, 则max是32768
+		// 如果块大小是4k, 则max是32768个块
 		*max = 1 << (e4b->bd_blkbits + 3);
 		// 返回的是位图地址. 因为只需要一个块,所以从位图里直接分配就好了
 		return e4b->bd_bitmap;
 	}
 
-	// bb为对应阶数的buddy地址
+	// bb为对应阶数的buddy地址, 提前算好的
 	bb = e4b->bd_buddy + EXT4_SB(e4b->bd_sb)->s_mb_offsets[order];
-	// order对应的最大比特位的数量
+	// order对应的最大比特位的数量, 提前算好的
 	*max = EXT4_SB(e4b->bd_sb)->s_mb_maxs[order];
 
 	return bb;
@@ -2336,12 +2338,12 @@ static int mb_find_order_for_block(struct ext4_buddy *e4b, int block)
 {
 	// 从order-1开始找
 	int order = 1;
-	// 步长为块长度一半，因为开始是从1开始找
+	// 步长为块长度一半，因为开始是从1开始找, 1的buddy位图是一半
 	int bb_incr = 1 << (e4b->bd_blkbits - 1);
 	void *bb;
 
 	BUG_ON(e4b->bd_bitmap == e4b->bd_buddy);
-	// 块号超过了本组最大的块数
+	// 块号超过了本组最大的块数, +3是因为一字节有8位
 	BUG_ON(block >= (1 << (e4b->bd_blkbits + 3)));
 
 	// buddy起点
@@ -2351,12 +2353,14 @@ static int mb_find_order_for_block(struct ext4_buddy *e4b, int block)
 	while (order <= e4b->bd_blkbits + 1) {
 		// 这里的block当做buddy位图里的下标看，
 		// 每上升一个阶，位图里的1位所表示的块长度就增加1倍，所对应的在位图里的下标就减半
-		// 刚进来的块号相应于是0阶的, 所以这里先除以2
+		// 刚进来的块号相当于是0阶的, 所以这里先除以2, 除以2之后就是在buddy里的下标
 		block = block >> 1;
 		// 当前位没设置，则返回这个order
 		if (!mb_test_bit(block, bb)) {
 			return order;
 		}
+		// 走到这儿表示当前位已经设置
+	
 		// 位图起点增加到下一阶
 		bb += bb_incr;
 		// 高阶位图长度是低阶的一半
